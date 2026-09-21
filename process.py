@@ -145,3 +145,61 @@ def build_child_env(isolated_home: Path | str) -> dict[str, str]:
     if "HOMEPATH" in env:
         env["HOMEPATH"] = home_str
     return env
+
+
+def _check_early_quota_error(
+    gemini_dir: Path | str | None,
+    min_mtime: float | None = None,
+) -> str | None:
+    """Check isolated agy logs for early RESOURCE_EXHAUSTED / 429 quota exhaustion.
+
+    agy internally retries 429s up to 8 times with exponential backoff (~140s)
+    without emitting anything to stdout. Detecting this early allows fast failover.
+    """
+    if not gemini_dir:
+        return None
+    log_dir = Path(gemini_dir) / "log"
+    if not log_dir.is_dir():
+        return None
+
+    try:
+        log_files = sorted(
+            log_dir.glob("cli-*.log"),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+        if not log_files:
+            return None
+
+        latest_log = log_files[0]
+        if min_mtime is not None:
+            # Allow 2.0s margin for filesystem timestamp resolution
+            if latest_log.stat().st_mtime < (min_mtime - 2.0):
+                return None
+
+        with open(latest_log, "r", encoding="utf-8", errors="ignore") as f:
+            f.seek(0, 2)
+            size = f.tell()
+            f.seek(max(0, size - 16384))
+            content = f.read()
+
+        for line in reversed(content.splitlines()):
+            if "RESOURCE_EXHAUSTED" in line and (
+                "Individual quota reached" in line
+                or "quota exceeded" in line.lower()
+                or "code 429" in line
+            ):
+                start = line.find("RESOURCE_EXHAUSTED")
+                if start != -1:
+                    detail = line[start:]
+                    retrying_idx = detail.rfind("), retrying in")
+                    if retrying_idx != -1:
+                        detail = detail[:retrying_idx]
+                    if detail.count("(") < detail.count(")"):
+                        detail = detail.rstrip(")")
+                    return detail.strip()
+                return line.strip()
+    except Exception:
+        pass
+    return None
+

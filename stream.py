@@ -12,8 +12,10 @@ from types import SimpleNamespace
 from typing import Any, Iterator
 
 try:
+    from .process import _check_early_quota_error
     from .prompt import _longest_tool_call_prefix_match, _parse_tool_block
 except ImportError:
+    from process import _check_early_quota_error
     from prompt import _longest_tool_call_prefix_match, _parse_tool_block
 
 logger = logging.getLogger(__name__)
@@ -48,6 +50,7 @@ class AntigravityStream(Iterator[Any]):
         self._closed = False
         self._interrupted = False
         self._finished = False
+        self._early_error: str | None = None
         self._generator = self._stream_generator()
 
     def __iter__(self) -> "AntigravityStream":
@@ -119,10 +122,43 @@ class AntigravityStream(Iterator[Any]):
         error_msg = ""
         status = ""
         success = False
+        start_time = time.monotonic()
+
+        gemini_dir = getattr(self.client, "_isolated_gemini_dir", None)
+        watchdog_stop = threading.Event()
+        watchdog_thread: threading.Thread | None = None
+
+        if gemini_dir:
+            def _watchdog_loop() -> None:
+                while not watchdog_stop.wait(timeout=0.3):
+                    if time.monotonic() - start_time < 1.0:
+                        continue
+                    quota_err = _check_early_quota_error(gemini_dir, min_mtime=start_time)
+                    if quota_err:
+                        self._early_error = quota_err
+                        logger.warning(
+                            "Antigravity process hit early quota limit: %s; terminating to prevent hang.",
+                            quota_err,
+                        )
+                        self.client._terminate_process(self.proc)
+                        break
+
+            watchdog_thread = threading.Thread(
+                target=_watchdog_loop,
+                name="agy-quota-watchdog",
+                daemon=True,
+            )
+            watchdog_thread.start()
 
         try:
             while time.monotonic() < deadline:
+                if self._early_error:
+                    raise RuntimeError(f"Antigravity model error: {self._early_error}")
+
                 line = self.proc.stdout.readline() if self.proc.stdout else ""
+                if self._early_error:
+                    raise RuntimeError(f"Antigravity model error: {self._early_error}")
+
                 if not line:
                     if self.proc.poll() is not None:
                         break
@@ -137,6 +173,8 @@ class AntigravityStream(Iterator[Any]):
                     event = json.loads(line)
                 except Exception:
                     continue
+
+                watchdog_stop.set()
 
                 event_type = event.get("event")
                 if not self.conversation_id:
@@ -250,15 +288,29 @@ class AntigravityStream(Iterator[Any]):
                 stderr_out = self.proc.stderr.read() if self.proc.stderr else ""
                 returncode = self.proc.poll() or 0
 
+                if self._early_error:
+                    raise RuntimeError(f"Antigravity model error: {self._early_error}")
+
                 if status == "ERROR":
                     raise RuntimeError(f"Antigravity model error: {error_msg}")
 
                 if not has_tool_calls and not has_content and returncode != 0:
+                    quota_err = _check_early_quota_error(gemini_dir, min_mtime=start_time)
+                    if quota_err:
+                        raise RuntimeError(f"Antigravity model error: {quota_err}")
                     err_detail = error_msg or stderr_out.strip() or f"Process exited with return code {returncode}"
                     raise RuntimeError(f"Antigravity execution failed: {err_detail}")
             else:
+                if self._early_error:
+                    raise RuntimeError(f"Antigravity model error: {self._early_error}")
                 if status == "ERROR":
                     raise RuntimeError(f"Antigravity model error: {error_msg}")
+                if not has_tool_calls and not has_content and self.proc.poll() not in (None, 0):
+                    quota_err = _check_early_quota_error(gemini_dir, min_mtime=start_time)
+                    if quota_err:
+                        raise RuntimeError(f"Antigravity model error: {quota_err}")
+                    returncode = self.proc.poll()
+                    raise RuntimeError(f"Antigravity execution failed: worker process exited with return code {returncode}")
 
             finish_reason = "tool_calls" if has_tool_calls else "stop"
             yield self._make_chunk(finish_reason=finish_reason)
@@ -282,6 +334,9 @@ class AntigravityStream(Iterator[Any]):
             )
             self._finished = True
         finally:
+            watchdog_stop.set()
+            if watchdog_thread and watchdog_thread.is_alive():
+                watchdog_thread.join(timeout=0.2)
             if self.is_worker:
                 if success and not self._interrupted:
                     self.client._update_worker_history(self.messages)

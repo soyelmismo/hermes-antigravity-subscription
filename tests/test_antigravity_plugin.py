@@ -3,6 +3,7 @@ import json
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -16,11 +17,13 @@ if str(plugin_dir) not in sys.path:
 from providers import get_provider_profile
 from client import (
     AntigravityClient,
+    AntigravityStream,
     _format_messages_as_prompt,
     _render_message_content,
     is_authenticated,
     resolve_agy_command,
 )
+from process import _check_early_quota_error
 
 
 class AntigravityPluginTests(unittest.TestCase):
@@ -469,6 +472,74 @@ class AntigravityPluginTests(unittest.TestCase):
                     client = AntigravityClient(cwd=tmp)
                     mock_copy.assert_called_once()
                     client.close()
+
+    def test_check_early_quota_error_parsing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            log_dir = tmp_path / "log"
+            log_dir.mkdir()
+            log_file = log_dir / "cli-20260921_211950.log"
+            sample_line = (
+                "I0921 21:19:51.264799     299 run.go:395] Run: attempt 1 failed "
+                "(RESOURCE_EXHAUSTED (code 429): Individual quota reached. "
+                "Please upgrade your subscription to increase your limits. Resets in 1h49m22s.), retrying in 4s\n"
+            )
+            log_file.write_text(sample_line, encoding="utf-8")
+
+            # Verify extraction
+            err = _check_early_quota_error(tmp_path)
+            self.assertIsNotNone(err)
+            self.assertIn("RESOURCE_EXHAUSTED (code 429)", err)
+            self.assertIn("Individual quota reached", err)
+            self.assertIn("Resets in 1h49m22s.", err)
+            self.assertNotIn("retrying in", err)
+
+            # Check min_mtime filter: future timestamp ignores old log
+            err_future = _check_early_quota_error(tmp_path, min_mtime=time.time() + 100)
+            self.assertIsNone(err_future)
+
+    def test_early_quota_watchdog_abort(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            log_dir = tmp_path / "log"
+            log_dir.mkdir()
+            log_file = log_dir / "cli-20260921_999999.log"
+            sample_line = (
+                "I0921 21:19:51.264799     299 run.go:395] Run: attempt 1 failed "
+                "(RESOURCE_EXHAUSTED (code 429): Individual quota reached. "
+                "Please upgrade your subscription to increase your limits. Resets in 1h49m22s.), retrying in 4s\n"
+            )
+            log_file.write_text(sample_line, encoding="utf-8")
+
+            mock_client = MagicMock()
+            mock_client._isolated_gemini_dir = tmp_path
+            mock_client._terminate_process = MagicMock()
+
+            # Pipe that blocks or returns nothing until terminated
+            mock_proc = MagicMock()
+            def fake_readline():
+                for _ in range(50):
+                    if mock_client._terminate_process.called:
+                        return ""
+                    time.sleep(0.05)
+                return ""
+
+            mock_proc.stdout.readline = fake_readline
+            mock_proc.poll.return_value = None
+
+            stream = AntigravityStream(
+                proc=mock_proc,
+                client=mock_client,
+                model="gemini-3.8-flash",
+                timeout=5.0,
+            )
+
+            with self.assertRaises(RuntimeError) as ctx:
+                list(stream)
+
+            self.assertIn("RESOURCE_EXHAUSTED", str(ctx.exception))
+            self.assertIn("Individual quota reached", str(ctx.exception))
+            mock_client._terminate_process.assert_called_with(mock_proc)
 
 
 if __name__ == "__main__":
