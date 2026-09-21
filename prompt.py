@@ -23,6 +23,8 @@ _PROMPT_PREAMBLE = (
     "- Each tool call must be a JSON object containing 'id', 'type': 'function', and 'function': {'name': '...', 'arguments': '...'}.",
     "- 'arguments' must be a JSON-encoded string containing the function arguments.",
     "- Do NOT execute local shell commands or file operations directly; only output <tool_call> tags so Hermes can execute them safely.",
+    "- NEVER simulate or hallucinate Tool Results (e.g. 'Tool Result (...):'). Hermes Agent executes tools externally and will supply real results in subsequent turns.",
+    "- After emitting tool calls, STOP generating immediately. Do NOT generate results, execution output, or commentary after tool calls.",
     "- If no tool is needed, respond naturally with standard text.",
 )
 
@@ -74,7 +76,11 @@ def _format_messages_as_prompt(
     sections: list[str] = [*_PROMPT_PREAMBLE, *tool_sections]
     transcript: list[str] = []
 
-    for message in (m for m in messages if isinstance(m, dict)):
+    valid_messages = [m for m in messages if isinstance(m, dict)]
+    last_msg = valid_messages[-1] if valid_messages else None
+    last_role = str(last_msg.get("role") or "").strip().lower() if last_msg else ""
+
+    for message in valid_messages:
         role = str(message.get("role") or "unknown").strip().lower()
         rendered_content = _render_message_content(message.get("content"))
 
@@ -85,6 +91,8 @@ def _format_messages_as_prompt(
 
         if role == "assistant":
             parts = []
+            if "Tool Result (" in rendered_content:
+                rendered_content = rendered_content.split("Tool Result (")[0].strip()
             if rendered_content:
                 parts.append(rendered_content)
             if tool_calls := message.get("tool_calls"):
@@ -111,7 +119,22 @@ def _format_messages_as_prompt(
     if transcript:
         sections.append("Conversation transcript:\n\n" + "\n\n".join(transcript))
 
-    sections.append("Continue the conversation from the latest user request.")
+    if last_role == "tool":
+        sections.append(
+            "### LATEST TOOL RESULTS RECEIVED.\n"
+            "INSTRUCTION: Evaluate the latest tool results in the transcript above and continue the task. "
+            "If more tools are needed, emit <tool_call> tags. If you have enough information, "
+            "respond clearly to the user without repeating prior summaries."
+        )
+    elif last_role == "user" and last_msg is not None:
+        user_text = _render_message_content(last_msg.get("content"))
+        sections.append(
+            f"### LATEST USER REQUEST TO ANSWER:\n{user_text}\n\n"
+            "INSTRUCTION: Respond directly and specifically to the LATEST USER REQUEST above. "
+            "Do NOT repeat previous architectural summaries, code reviews, or overview boilerplate unless explicitly asked."
+        )
+    else:
+        sections.append("Continue the conversation from the latest message.")
     return "\n\n".join(s.strip() for s in sections if s and s.strip())
 
 
@@ -127,16 +150,20 @@ def _messages_match_prefix(history: Sequence[dict[str, Any]], incoming: Sequence
             return False
         if inc_msg.get("content") != h_msg.get("content"):
             return False
+        if inc_msg.get("tool_calls") != h_msg.get("tool_calls"):
+            return False
     return True
 
 
 def _format_delta_prompt(new_messages: Sequence[dict[str, Any]]) -> str:
     """Format only the incremental messages in an ongoing multi-turn interaction."""
     parts: list[str] = []
+    last_role = ""
     for msg in new_messages:
         if not isinstance(msg, dict):
             continue
         role = str(msg.get("role") or "").strip().lower()
+        last_role = role
         rendered_content = _render_message_content(msg.get("content"))
         if role == "tool":
             tool_id = str(msg.get("tool_call_id") or msg.get("name") or "tool").strip()
@@ -144,6 +171,8 @@ def _format_delta_prompt(new_messages: Sequence[dict[str, Any]]) -> str:
             continue
         if role == "assistant":
             subparts = []
+            if "Tool Result (" in rendered_content:
+                rendered_content = rendered_content.split("Tool Result (")[0].strip()
             if rendered_content:
                 subparts.append(rendered_content)
             if tool_calls := msg.get("tool_calls"):
@@ -166,7 +195,15 @@ def _format_delta_prompt(new_messages: Sequence[dict[str, Any]]) -> str:
         if rendered_content:
             parts.append(f"{label}:\n{rendered_content}")
 
-    parts.append("Continue the conversation from the latest tool result.")
+    if last_role == "tool":
+        parts.append("Continue the conversation from the latest tool result.")
+    elif last_role == "user":
+        parts.append(
+            "Respond directly and specifically to the latest user request above. "
+            "Do NOT repeat previous architectural summaries or boilerplate."
+        )
+    else:
+        parts.append("Continue the conversation from the latest message above.")
     return "\n\n".join(s.strip() for s in parts if s and s.strip())
 
 

@@ -95,6 +95,99 @@ class AntigravityPluginTests(unittest.TestCase):
         self.assertIn("call_123", prompt)
         self.assertIn("Tool Result (call_123):\n4", prompt)
 
+    def test_format_messages_strips_hallucinated_tool_results_and_emphasizes_user_query(self):
+        corrupted_messages = [
+            {"role": "user", "content": "Initial query"},
+            {
+                "role": "assistant",
+                "content": "Tool Result (call_1):\nfake data\nHere is fake summary",
+                "tool_calls": [{"id": "call_1", "function": {"name": "read_file", "arguments": "{}"}}],
+            },
+            {"role": "tool", "tool_call_id": "call_1", "content": "real data"},
+            {"role": "assistant", "content": "Real summary"},
+            {"role": "user", "content": "Why is this not following thread?"},
+        ]
+        prompt = _format_messages_as_prompt(corrupted_messages)
+        # Verify hallucinated tool result in assistant content was stripped
+        self.assertNotIn("fake data", prompt)
+        self.assertNotIn("Here is fake summary", prompt)
+        # Verify real tool result is present
+        self.assertIn("Tool Result (call_1):\nreal data", prompt)
+        # Verify latest user request is highlighted at tail
+        self.assertIn("### LATEST USER REQUEST TO ANSWER:\nWhy is this not following thread?", prompt)
+        self.assertIn("Do NOT repeat previous architectural summaries", prompt)
+
+    def test_format_messages_latest_tool_results(self):
+        messages = [
+            {"role": "user", "content": "Do work"},
+            {"role": "assistant", "content": None, "tool_calls": [{"id": "c1", "function": {"name": "f", "arguments": "{}"}}]},
+            {"role": "tool", "tool_call_id": "c1", "content": "result 1"},
+        ]
+        prompt = _format_messages_as_prompt(messages)
+        self.assertIn("### LATEST TOOL RESULTS RECEIVED.", prompt)
+        self.assertIn("Tool Result (c1):\nresult 1", prompt)
+
+    def test_format_delta_prompt_user_vs_tool(self):
+        from client import _format_delta_prompt
+        # Delta ending with user
+        user_delta = [{"role": "user", "content": "new user query"}]
+        d_prompt = _format_delta_prompt(user_delta)
+        self.assertIn("Respond directly and specifically to the latest user request above.", d_prompt)
+
+        # Delta ending with tool
+        tool_delta = [{"role": "tool", "tool_call_id": "t1", "content": "output"}]
+        d_prompt2 = _format_delta_prompt(tool_delta)
+        self.assertIn("Continue the conversation from the latest tool result.", d_prompt2)
+
+    def test_mock_stream_tool_call_suppresses_trailing_hallucination(self):
+        client = AntigravityClient(cwd="/tmp")
+        tool_call_obj = {"id": "call_stream_1", "type": "function", "function": {"name": "stream_tool", "arguments": json.dumps({"q": 42})}}
+        fake_events = [
+            json.dumps({"event": "init", "conversation_id": "stream-tool-hallucination"}),
+            json.dumps({"event": "step_update", "step_update": {"text_delta": f"<tool_call>{json.dumps(tool_call_obj)}</tool_call>"}}),
+            # Model continues generating hallucinated tool output in the same turn
+            json.dumps({"event": "step_update", "step_update": {"text_delta": "\nTool Result (call_stream_1):\n{\"fake\": true}\nI am already done!"}}),
+            json.dumps({
+                "event": "result",
+                "result": {
+                    "status": "SUCCESS",
+                    "response": f"<tool_call>{json.dumps(tool_call_obj)}</tool_call>\nTool Result (call_stream_1):\n{{\"fake\": true}}\nI am already done!",
+                    "usage": {"input_tokens": 80, "output_tokens": 50, "total_tokens": 130},
+                },
+            }),
+        ]
+
+        mock_proc = MagicMock()
+        mock_proc.stdin = MagicMock()
+        mock_proc.stdout = io.StringIO("\n".join(fake_events) + "\n")
+        mock_proc.stderr = io.StringIO("")
+        mock_proc.poll.return_value = 0
+        mock_proc.wait.return_value = 0
+
+        tools = [{"type": "function", "function": {"name": "stream_tool"}}]
+
+        with patch("subprocess.Popen", return_value=mock_proc):
+            stream = client.chat.completions.create(
+                model="gemini-3.8-flash-high",
+                messages=[{"role": "user", "content": "call stream_tool"}],
+                tools=tools,
+                stream=True,
+            )
+
+            chunks = list(stream)
+            # Verify tool chunk is yielded
+            tool_chunks = [c for c in chunks if c.choices and c.choices[0].delta.tool_calls]
+            self.assertEqual(len(tool_chunks), 1)
+            self.assertEqual(tool_chunks[0].choices[0].delta.tool_calls[0].id, "call_stream_1")
+
+            # Verify finish reason is tool_calls
+            finish_chunks = [c for c in chunks if c.choices and c.choices[0].finish_reason]
+            self.assertEqual(finish_chunks[0].choices[0].finish_reason, "tool_calls")
+
+            # Verify hallucinated content after tool_call was NOT yielded in any chunk
+            content_chunks = [c for c in chunks if c.choices and c.choices[0].delta.content]
+            self.assertEqual(len(content_chunks), 0)
+
     def test_create_client_and_mock_turn(self):
         client = AntigravityClient(cwd="/tmp")
         fake_events = [

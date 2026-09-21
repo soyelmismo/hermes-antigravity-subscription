@@ -219,7 +219,7 @@ class AntigravityStream(Iterator[Any]):
                                             has_tool_calls = True
                                             for call_delta in parsed_calls:
                                                 yield self._make_chunk(tool_calls=[call_delta])
-                                        if extra_text:
+                                        if extra_text and not has_tool_calls:
                                             has_content = True
                                             yield self._make_chunk(content=extra_text)
                                     else:
@@ -227,7 +227,7 @@ class AntigravityStream(Iterator[Any]):
                                 else:
                                     idx = text_buffer.find("<tool_call")
                                     if idx != -1:
-                                        if idx > 0:
+                                        if idx > 0 and not has_tool_calls:
                                             safe_text = text_buffer[:idx]
                                             has_content = True
                                             yield self._make_chunk(content=safe_text)
@@ -237,14 +237,15 @@ class AntigravityStream(Iterator[Any]):
                                         k = _longest_tool_call_prefix_match(text_buffer)
                                         if k > 0:
                                             safe_text = text_buffer[:-k]
-                                            if safe_text:
+                                            if safe_text and not has_tool_calls:
                                                 has_content = True
                                                 yield self._make_chunk(content=safe_text)
                                             text_buffer = text_buffer[-k:]
                                             break
                                         else:
-                                            has_content = True
-                                            yield self._make_chunk(content=text_buffer)
+                                            if not has_tool_calls:
+                                                has_content = True
+                                                yield self._make_chunk(content=text_buffer)
                                             text_buffer = ""
 
                 elif event_type == "result":
@@ -262,14 +263,14 @@ class AntigravityStream(Iterator[Any]):
                         text_buffer = final_resp
                     break
 
-            if text_buffer:
+            if text_buffer and not has_tool_calls:
                 if self.has_tools or "<tool_call>" in text_buffer:
                     parsed_calls, extra_text = _parse_tool_block(text_buffer)
                     if parsed_calls:
                         has_tool_calls = True
                         for call_delta in parsed_calls:
                             yield self._make_chunk(tool_calls=[call_delta])
-                    if extra_text:
+                    if extra_text and not has_tool_calls:
                         has_content = True
                         yield self._make_chunk(content=extra_text)
                     elif not parsed_calls:
