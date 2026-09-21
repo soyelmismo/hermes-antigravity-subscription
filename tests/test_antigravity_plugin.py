@@ -1,6 +1,8 @@
 import io
 import json
+import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -412,6 +414,61 @@ class AntigravityPluginTests(unittest.TestCase):
         temp_dir = client._cwd
         client.close()
         self.assertFalse(Path(temp_dir).exists())
+
+    def test_windows_process_group_creation(self):
+        from client import _own_process_group
+        with patch("os.name", "nt"):
+            flags = _own_process_group()
+            self.assertEqual(flags, {"creationflags": 0x00000200})
+        with patch("os.name", "posix"):
+            flags = _own_process_group()
+            self.assertEqual(flags, {"start_new_session": True})
+
+    def test_windows_kill_process_tree(self):
+        from client import _kill_process_tree
+        mock_proc = MagicMock()
+        mock_proc.poll.return_value = None
+        mock_proc.pid = 4321
+
+        with patch("os.name", "nt"), patch("subprocess.run") as mock_run:
+            _kill_process_tree(mock_proc)
+            mock_run.assert_called_once_with(
+                ["taskkill", "/F", "/T", "/PID", "4321"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+
+    def test_child_env_windows_userprofile(self):
+        client = AntigravityClient(cwd="/tmp")
+        env = client._child_env()
+        self.assertIn("HOME", env)
+        self.assertIn("USERPROFILE", env)
+        self.assertEqual(env["HOME"], str(client._isolated_home))
+        self.assertEqual(env["USERPROFILE"], str(client._isolated_home))
+        client.close()
+
+    def test_token_linking_fallback_chain(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            token_src = tmp_path / "src_token"
+            token_src.write_text("token-content-123456", encoding="utf-8")
+
+            # Simulate os.symlink failing (WinError 1314) and falling back to os.link
+            with patch.object(AntigravityClient, "_resolve_real_token_path", return_value=token_src):
+                with patch("os.symlink", side_effect=OSError("privilege not held")), patch("os.link") as mock_link:
+                    client = AntigravityClient(cwd=tmp)
+                    mock_link.assert_called_once()
+                    client.close()
+
+            # Simulate both symlink and hardlink failing (cross-device/filesystem), falling back to copy2
+            with patch.object(AntigravityClient, "_resolve_real_token_path", return_value=token_src):
+                with patch("os.symlink", side_effect=OSError("privilege not held")), \
+                     patch("os.link", side_effect=OSError("cross-device link")), \
+                     patch("shutil.copy2") as mock_copy:
+                    client = AntigravityClient(cwd=tmp)
+                    mock_copy.assert_called_once()
+                    client.close()
 
 
 if __name__ == "__main__":

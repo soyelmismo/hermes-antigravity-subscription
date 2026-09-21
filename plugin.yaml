@@ -9,6 +9,7 @@ homepage: https://github.com/soyelmismo/hermes-antigravity-subscription
 platforms:
   - linux
   - macos
+  - windows
 requires_hermes: ">=0.21.0"
 external_dependencies:
   - command: agy

@@ -87,26 +87,60 @@ def _normalize_effort(effort: str | None) -> str | None:
 
 
 
+def _own_process_group() -> dict[str, Any]:
+    """Popen kwargs that put native (and any child processes it spawns) in a group we can kill cleanly."""
+    if os.name == "nt":
+        return {"creationflags": getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)}
+    return {"start_new_session": True}
+
+
+def _kill_process_tree(proc: subprocess.Popen) -> None:
+    """Kill process and every descendant: taskkill /F /T on Windows, killpg on POSIX."""
+    if proc.poll() is not None:
+        return
+    if os.name == "nt":
+        with contextlib.suppress(Exception):
+            subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+        return
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)  # windows-footgun: ok — the nt branch above never reaches this line
+    except (ProcessLookupError, PermissionError, AttributeError):
+        with contextlib.suppress(Exception):
+            proc.kill()
+
+
 def resolve_agy_command() -> str:
     """Find the path to the official `agy` binary."""
     for var in ("ANTIGRAVITY_COMMAND", "AGY_CLI_PATH", "ANTIGRAVITY_CLI_PATH"):
         if val := os.getenv(var, "").strip():
-            if Path(val).is_file() and os.access(val, os.X_OK):
+            p = Path(val)
+            if p.is_file() and (os.name == "nt" or os.access(val, os.X_OK)):
                 return val
 
-    # Check PATH
+    # Check PATH (shutil.which checks PATHEXT on Windows, e.g. agy.exe)
     if path := shutil.which("agy"):
         return path
 
-    # Check standard install paths
+    binary_name = "agy.exe" if os.name == "nt" else "agy"
     candidates = [
-        Path.home() / ".local" / "bin" / "agy",
-        Path("/root/.local/bin/agy"),
-        Path("/usr/local/bin/agy"),
-        Path("/usr/bin/agy"),
+        Path.home() / ".gemini" / "antigravity-cli" / "bin" / binary_name,
+        Path.home() / ".local" / "bin" / binary_name,
+        Path("/root/.local/bin") / binary_name,
+        Path("/usr/local/bin") / binary_name,
+        Path("/usr/bin") / binary_name,
     ]
+    if os.name == "nt":
+        if localappdata := os.getenv("LOCALAPPDATA"):
+            candidates.append(Path(localappdata) / "Programs" / "agy" / binary_name)
+            candidates.append(Path(localappdata) / "Microsoft" / "WinGet" / "Links" / binary_name)
+
     for candidate in candidates:
-        if candidate.is_file() and os.access(candidate, os.X_OK):
+        if candidate.is_file() and (os.name == "nt" or os.access(candidate, os.X_OK)):
             return str(candidate)
 
     return "agy"
@@ -648,8 +682,14 @@ class AntigravityClient:
         if real_token and real_token.is_file():
             isolated_token = self._isolated_gemini_dir / "antigravity-oauth-token"
             if not isolated_token.exists():
-                with contextlib.suppress(OSError):
+                try:
                     os.symlink(real_token, isolated_token)
+                except OSError:
+                    try:
+                        os.link(real_token, isolated_token)
+                    except OSError:
+                        with contextlib.suppress(OSError):
+                            shutil.copy2(real_token, isolated_token)
 
         self.chat = SimpleNamespace(completions=SimpleNamespace(create=self._create_chat_completion))
         self.is_closed = False
@@ -726,14 +766,24 @@ class AntigravityClient:
         else:
             return m, effort
 
+    def _child_env(self) -> dict[str, str]:
+        """Construct child environment isolating home and session storage on POSIX and Windows."""
+        env = dict(os.environ)
+        home_str = str(self._isolated_home)
+        env["HOME"] = home_str
+        # Windows: Go's os.UserHomeDir() reads USERPROFILE then HOMEDRIVE+HOMEPATH
+        env["USERPROFILE"] = home_str
+        if "HOMEPATH" in env:
+            env["HOMEPATH"] = home_str
+        return env
+
     @staticmethod
     def _terminate_process(proc: subprocess.Popen) -> None:
         try:
             proc.terminate()
             proc.wait(timeout=2)
         except Exception:
-            with contextlib.suppress(Exception):
-                proc.kill()
+            _kill_process_tree(proc)
 
     def __enter__(self) -> "AntigravityClient":
         return self
@@ -790,9 +840,6 @@ class AntigravityClient:
             if effort:
                 cmd_args.extend(["--effort", effort])
 
-            env = dict(os.environ)
-            env["HOME"] = str(self._isolated_home)
-
             proc = subprocess.Popen(
                 cmd_args,
                 stdin=subprocess.PIPE,
@@ -803,8 +850,8 @@ class AntigravityClient:
                 errors="replace",
                 bufsize=1,
                 cwd=self._cwd,
-                start_new_session=True,
-                env=env,
+                env=self._child_env(),
+                **_own_process_group(),
             )
             self._worker_proc = proc
             self._worker_model = model
@@ -1004,9 +1051,6 @@ class AntigravityClient:
         if effort:
             cmd_args.extend(["--effort", effort])
 
-        env = dict(os.environ)
-        env["HOME"] = str(self._isolated_home)
-
         proc = subprocess.Popen(
             cmd_args,
             stdin=subprocess.PIPE,
@@ -1017,8 +1061,8 @@ class AntigravityClient:
             errors="replace",
             bufsize=1,
             cwd=self._cwd,
-            start_new_session=True,
-            env=env,
+            env=self._child_env(),
+            **_own_process_group(),
         )
 
         try:

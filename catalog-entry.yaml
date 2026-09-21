@@ -11,6 +11,7 @@ version: 1.0.0
 platforms:
 - linux
 - macos
+- windows
 capabilities:
   provides_tools: []
   provides_hooks: []
