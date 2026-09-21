@@ -17,7 +17,7 @@ This plugin lets Hermes use Gemini and Claude models through your existing Antig
 - **Tool execution guard**: `agy` registers local system tools by default. This plugin runs `agy` in headless mode without permissions skip flags. If `agy` attempts to execute an internal tool step, the stream closes and terminates the child process.
 - **Thinking effort mapping**: Maps Hermes reasoning effort settings (`low`, `medium`, `high`) directly to backend model variants (`gemini-3.8-flash-low`, `gemini-3.8-flash-high`).
 - **Subagent concurrency**: Each completion turn runs in its own process group (`start_new_session=True`). Multiple Hermes subagents can request completions concurrently without shared state.
-- **Filesystem isolation**: Subprocesses run with working directory set to `/tmp` and slash commands disabled. Local `GEMINI.md` and `AGENTS.md` project files are not read.
+- **Filesystem isolation**: Subprocesses run in an isolated, private temporary working directory per client and slash commands are disabled. Local `GEMINI.md` and `AGENTS.md` project files are not read.
 
 ---
 
@@ -52,7 +52,7 @@ This plugin lets Hermes use Gemini and Claude models through your existing Antig
 │  1. Preamble tells the model to emit tool tags in text.     │
 │  2. Omits --dangerously-skip-permissions to deny agy tools. │
 │  3. Stream watcher kills agy if it emits a tool step.       │
-│  4. Runs in /tmp to ignore workspace rules files.           │
+│  4. Runs in private temp dir to ignore rules files.         │
 └──────────────────────────────┬──────────────────────────────┘
                                │ Stdin / stdout (NDJSON pipes)
 ┌──────────────────────────────▼──────────────────────────────┐

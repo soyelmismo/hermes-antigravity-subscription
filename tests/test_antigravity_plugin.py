@@ -319,6 +319,14 @@ class AntigravityPluginTests(unittest.TestCase):
             chunks = list(stream)
             mock_term.assert_called_once_with(mock_proc)
 
+    def test_temp_directory_isolation_and_cleanup(self):
+        client = AntigravityClient()
+        temp_dir = client._cwd
+        self.assertTrue(Path(temp_dir).is_dir())
+        self.assertIn("hermes_agy_", temp_dir)
+        client.close()
+        self.assertFalse(Path(temp_dir).exists())
+
 
 if __name__ == "__main__":
     unittest.main()

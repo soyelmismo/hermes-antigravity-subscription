@@ -543,7 +543,12 @@ class AntigravityClient:
         self.base_url = base_url or AGY_MARKER_BASE_URL
         self._command = command or resolve_agy_command()
         self._args = list(args or ["--output-format", "stream-json", "--disable-slash-commands"])
-        self._cwd = cwd or tempfile.gettempdir()
+        self._temp_dir = None
+        if cwd:
+            self._cwd = cwd
+        else:
+            self._temp_dir = tempfile.TemporaryDirectory(prefix="hermes_agy_")
+            self._cwd = self._temp_dir.name
         self.chat = SimpleNamespace(completions=SimpleNamespace(create=self._create_chat_completion))
         self.is_closed = False
         self._active_processes: set[subprocess.Popen] = set()
@@ -607,6 +612,12 @@ class AntigravityClient:
             with contextlib.suppress(Exception):
                 proc.kill()
 
+    def __enter__(self) -> "AntigravityClient":
+        return self
+
+    def __exit__(self, *args: Any) -> None:
+        self.close()
+
     def close(self) -> None:
         with self._lock:
             procs = tuple(self._active_processes)
@@ -614,6 +625,10 @@ class AntigravityClient:
             self.is_closed = True
         for proc in procs:
             self._terminate_process(proc)
+        if self._temp_dir is not None:
+            with contextlib.suppress(Exception):
+                self._temp_dir.cleanup()
+            self._temp_dir = None
 
     def _create_chat_completion(
         self,
