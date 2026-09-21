@@ -215,6 +215,61 @@ def _format_messages_as_prompt(
     return "\n\n".join(s.strip() for s in sections if s and s.strip())
 
 
+def _messages_match_prefix(history: Sequence[dict[str, Any]], incoming: Sequence[dict[str, Any]]) -> bool:
+    """Return True if incoming messages strictly extend history as a continuation."""
+    if not history or len(incoming) <= len(history):
+        return False
+    for i, h_msg in enumerate(history):
+        inc_msg = incoming[i]
+        if not isinstance(inc_msg, dict) or not isinstance(h_msg, dict):
+            return False
+        if inc_msg.get("role") != h_msg.get("role"):
+            return False
+        if inc_msg.get("content") != h_msg.get("content"):
+            return False
+    return True
+
+
+def _format_delta_prompt(new_messages: Sequence[dict[str, Any]]) -> str:
+    """Format only the incremental messages in an ongoing multi-turn interaction."""
+    parts: list[str] = []
+    for msg in new_messages:
+        if not isinstance(msg, dict):
+            continue
+        role = str(msg.get("role") or "").strip().lower()
+        rendered_content = _render_message_content(msg.get("content"))
+        if role == "tool":
+            tool_id = str(msg.get("tool_call_id") or msg.get("name") or "tool").strip()
+            parts.append(f"Tool Result ({tool_id}):\n{rendered_content}")
+            continue
+        if role == "assistant":
+            subparts = []
+            if rendered_content:
+                subparts.append(rendered_content)
+            if tool_calls := msg.get("tool_calls"):
+                for tc in tool_calls:
+                    if isinstance(tc, dict):
+                        fn = tc.get("function") or {}
+                        call_obj = {
+                            "id": tc.get("id") or "call_1",
+                            "type": "function",
+                            "function": {
+                                "name": fn.get("name", ""),
+                                "arguments": fn.get("arguments", "{}") if isinstance(fn.get("arguments"), str) else json.dumps(fn.get("arguments", {}), ensure_ascii=False)
+                            }
+                        }
+                        subparts.append(f"<tool_call>{json.dumps(call_obj, ensure_ascii=False)}</tool_call>")
+            if subparts:
+                parts.append(f"Assistant:\n" + "\n".join(subparts))
+            continue
+        label = _ROLE_LABELS.get(role, "Context")
+        if rendered_content:
+            parts.append(f"{label}:\n{rendered_content}")
+
+    parts.append("Continue the conversation from the latest tool result.")
+    return "\n\n".join(s.strip() for s in parts if s and s.strip())
+
+
 _TOOL_CALL_PREFIXES = tuple(
     "<tool_call>"[:i] for i in range(len("<tool_call>"), 0, -1)
 )
@@ -292,14 +347,22 @@ class AntigravityStream(Iterator[Any]):
         model: str,
         timeout: float,
         tools: list[dict[str, Any]] | None = None,
+        is_worker: bool = False,
+        worker_lock: threading.Lock | None = None,
+        messages: list[dict[str, Any]] | None = None,
     ):
         self.proc = proc
         self.client = client
         self.model = model
         self.timeout = timeout
         self.has_tools = bool(tools)
+        self.is_worker = is_worker
+        self.worker_lock = worker_lock
+        self.messages = messages
         self.conversation_id = ""
         self._closed = False
+        self._interrupted = False
+        self._finished = False
         self._generator = self._stream_generator()
 
     def __iter__(self) -> "AntigravityStream":
@@ -311,7 +374,9 @@ class AntigravityStream(Iterator[Any]):
         try:
             return next(self._generator)
         except StopIteration:
-            self.close()
+            self._closed = True
+            if not self.is_worker:
+                self.close()
             raise
         except Exception:
             self.close()
@@ -321,9 +386,17 @@ class AntigravityStream(Iterator[Any]):
         if self._closed:
             return
         self._closed = True
-        with self.client._lock:
-            self.client._active_processes.discard(self.proc)
-        self.client._terminate_process(self.proc)
+        if self.is_worker:
+            if not self._finished:
+                self._interrupted = True
+                self.client._terminate_worker()
+            if self.worker_lock and self.worker_lock.locked():
+                with contextlib.suppress(Exception):
+                    self.worker_lock.release()
+        else:
+            with self.client._lock:
+                self.client._active_processes.discard(self.proc)
+            self.client._terminate_process(self.proc)
 
     def _make_chunk(
         self,
@@ -360,6 +433,7 @@ class AntigravityStream(Iterator[Any]):
         in_tool_call = False
         error_msg = ""
         status = ""
+        success = False
 
         try:
             while time.monotonic() < deadline:
@@ -460,6 +534,7 @@ class AntigravityStream(Iterator[Any]):
                         usage_data = res["usage"]
                     if "error" in res:
                         error_msg = res["error"]
+                    success = (status != "ERROR")
                     break
 
             # Handle remaining buffer at stream end
@@ -480,21 +555,25 @@ class AntigravityStream(Iterator[Any]):
                     has_content = True
                     yield self._make_chunk(content=text_buffer)
 
-            # Wait for process exit cleanly
-            try:
-                self.proc.wait(timeout=3.0)
-            except subprocess.TimeoutExpired:
-                self.client._terminate_process(self.proc)
+            if not self.is_worker:
+                # Wait for process exit cleanly
+                try:
+                    self.proc.wait(timeout=3.0)
+                except subprocess.TimeoutExpired:
+                    self.client._terminate_process(self.proc)
 
-            stderr_out = self.proc.stderr.read() if self.proc.stderr else ""
-            returncode = self.proc.poll() or 0
+                stderr_out = self.proc.stderr.read() if self.proc.stderr else ""
+                returncode = self.proc.poll() or 0
 
-            if status == "ERROR":
-                raise RuntimeError(f"Antigravity model error: {error_msg}")
+                if status == "ERROR":
+                    raise RuntimeError(f"Antigravity model error: {error_msg}")
 
-            if not has_tool_calls and not has_content and returncode != 0:
-                err_detail = error_msg or stderr_out.strip() or f"Process exited with return code {returncode}"
-                raise RuntimeError(f"Antigravity execution failed: {err_detail}")
+                if not has_tool_calls and not has_content and returncode != 0:
+                    err_detail = error_msg or stderr_out.strip() or f"Process exited with return code {returncode}"
+                    raise RuntimeError(f"Antigravity execution failed: {err_detail}")
+            else:
+                if status == "ERROR":
+                    raise RuntimeError(f"Antigravity model error: {error_msg}")
 
             # Yield finish reason chunk
             finish_reason = "tool_calls" if has_tool_calls else "stop"
@@ -518,8 +597,18 @@ class AntigravityStream(Iterator[Any]):
                 model=self.model,
                 usage=usage,
             )
+            self._finished = True
         finally:
-            self.close()
+            if self.is_worker:
+                if success and not self._interrupted:
+                    self.client._update_worker_history(self.messages)
+                    if self.worker_lock and self.worker_lock.locked():
+                        with contextlib.suppress(Exception):
+                            self.worker_lock.release()
+                else:
+                    self.close()
+            else:
+                self.close()
 
 
 class AntigravityClient:
@@ -549,10 +638,44 @@ class AntigravityClient:
         else:
             self._temp_dir = tempfile.TemporaryDirectory(prefix="hermes_agy_")
             self._cwd = self._temp_dir.name
+
+        # Isolate agy state and session index from the user's real ~/.gemini/antigravity-cli
+        self._isolated_home = Path(self._cwd) / "home"
+        self._isolated_gemini_dir = self._isolated_home / ".gemini" / "antigravity-cli"
+        self._isolated_gemini_dir.mkdir(parents=True, exist_ok=True)
+
+        real_token = self._resolve_real_token_path()
+        if real_token and real_token.is_file():
+            isolated_token = self._isolated_gemini_dir / "antigravity-oauth-token"
+            if not isolated_token.exists():
+                with contextlib.suppress(OSError):
+                    os.symlink(real_token, isolated_token)
+
         self.chat = SimpleNamespace(completions=SimpleNamespace(create=self._create_chat_completion))
         self.is_closed = False
         self._active_processes: set[subprocess.Popen] = set()
         self._lock = threading.Lock()
+        self._worker_proc: subprocess.Popen | None = None
+        self._worker_model: str | None = None
+        self._worker_effort: str | None = None
+        self._worker_history: list[dict[str, Any]] = []
+        self._worker_lock = threading.Lock()
+
+    @staticmethod
+    def _resolve_real_token_path() -> Path | None:
+        """Locate the authentic Antigravity OAuth token on the host."""
+        token_dir = os.getenv("ANTIGRAVITY_CONFIG_DIR", "").strip()
+        if token_dir:
+            p = Path(token_dir) / "antigravity-oauth-token"
+            if p.is_file():
+                return p
+        p = Path.home() / ".gemini" / "antigravity-cli" / "antigravity-oauth-token"
+        if p.is_file():
+            return p
+        fallback = Path("/root/.gemini/antigravity-cli/antigravity-oauth-token")
+        if fallback.is_file():
+            return fallback
+        return None
 
     def _resolve_model_and_effort(
         self,
@@ -620,9 +743,10 @@ class AntigravityClient:
 
     def close(self) -> None:
         with self._lock:
+            self.is_closed = True
+            self._terminate_worker_locked()
             procs = tuple(self._active_processes)
             self._active_processes.clear()
-            self.is_closed = True
         for proc in procs:
             self._terminate_process(proc)
         if self._temp_dir is not None:
@@ -630,42 +754,45 @@ class AntigravityClient:
                 self._temp_dir.cleanup()
             self._temp_dir = None
 
-    def _create_chat_completion(
-        self,
-        *,
-        model: str | None = None,
-        messages: list[dict[str, Any]] | None = None,
-        timeout: float | None = None,
-        tools: list[dict[str, Any]] | None = None,
-        tool_choice: Any = None,
-        stream: bool = False,
-        reasoning_effort: str | None = None,
-        **extra_kwargs: Any,
-    ) -> Any:
-        if self.is_closed:
-            raise RuntimeError("AntigravityClient is closed.")
+    def _terminate_worker_locked(self) -> None:
+        if self._worker_proc is not None:
+            proc = self._worker_proc
+            self._worker_proc = None
+            self._worker_model = None
+            self._worker_effort = None
+            self._worker_history = []
+            self._active_processes.discard(proc)
+            self._terminate_process(proc)
 
-        if not is_authenticated():
-            raise RuntimeError(
-                "Antigravity CLI is not authenticated. Please run 'agy' in your terminal "
-                "to log in with your Google account."
-            )
+    def _terminate_worker(self) -> None:
+        with self._lock:
+            self._terminate_worker_locked()
 
-        effort_param = reasoning_effort or extra_kwargs.get("reasoning_effort")
-        resolved_model, effort = self._resolve_model_and_effort(model, effort_param)
-        prompt_text = _format_messages_as_prompt(
-            messages or [], model=resolved_model, tools=tools, tool_choice=tool_choice
-        )
+    def _update_worker_history(self, messages: list[dict[str, Any]] | None) -> None:
+        with self._lock:
+            self._worker_history = list(messages or [])
 
-        effective_timeout = float(timeout) if isinstance(timeout, (int, float)) and timeout > 0 else _DEFAULT_TIMEOUT_SECONDS
+    def _get_or_spawn_worker(self, model: str, effort: str | None) -> subprocess.Popen:
+        with self._lock:
+            if (
+                self._worker_proc is not None
+                and self._worker_proc.poll() is None
+                and self._worker_model == model
+                and self._worker_effort == effort
+            ):
+                return self._worker_proc
 
-        cmd_args = [self._command, *self._args]
-        if resolved_model:
-            cmd_args.extend(["--model", resolved_model])
-        if effort:
-            cmd_args.extend(["--effort", effort])
+            self._terminate_worker_locked()
 
-        try:
+            cmd_args = [self._command, "--input-format", "stream-json", *self._args]
+            if model:
+                cmd_args.extend(["--model", model])
+            if effort:
+                cmd_args.extend(["--effort", effort])
+
+            env = dict(os.environ)
+            env["HOME"] = str(self._isolated_home)
+
             proc = subprocess.Popen(
                 cmd_args,
                 stdin=subprocess.PIPE,
@@ -676,45 +803,36 @@ class AntigravityClient:
                 errors="replace",
                 bufsize=1,
                 cwd=self._cwd,
-                start_new_session=True,  # Isolate in a new POSIX process group for clean cancellation
+                start_new_session=True,
+                env=env,
             )
-        except FileNotFoundError as exc:
-            raise RuntimeError(
-                f"Could not execute Antigravity binary '{self._command}'. "
-                "Please verify that 'agy' is installed and available in PATH."
-            ) from exc
-
-        # Send prompt via stdin and close stdin so agy begins turn execution
-        try:
-            if proc.stdin:
-                proc.stdin.write(prompt_text + "\n")
-                proc.stdin.flush()
-                proc.stdin.close()
-        except OSError:
-            pass
-
-        with self._lock:
+            self._worker_proc = proc
+            self._worker_model = model
+            self._worker_effort = effort
+            self._worker_history = []
             self._active_processes.add(proc)
+            return proc
 
-        if stream:
-            return AntigravityStream(
-                proc=proc,
-                client=self,
-                model=resolved_model,
-                timeout=effective_timeout,
-                tools=tools,
-            )
-
+    def _collect_completion(
+        self,
+        *,
+        proc: subprocess.Popen,
+        model: str,
+        timeout: float,
+        tools: list[dict[str, Any]] | None = None,
+        is_worker: bool = False,
+        messages: list[dict[str, Any]] | None = None,
+    ) -> Any:
         text_deltas: list[str] = []
         final_response: str = ""
         conversation_id: str = ""
         usage_data: dict[str, Any] = {}
         error_msg: str = ""
         status: str = ""
+        success = False
 
         try:
-            # Read stdout events
-            deadline = time.monotonic() + effective_timeout
+            deadline = time.monotonic() + timeout
             while time.monotonic() < deadline:
                 line = proc.stdout.readline() if proc.stdout else ""
                 if not line:
@@ -749,7 +867,10 @@ class AntigravityClient:
                             "Antigravity attempted native tool invocation '%s'; neutralizing to prevent host execution.",
                             step.get("tool_name"),
                         )
-                        self._terminate_process(proc)
+                        if is_worker:
+                            self._terminate_worker()
+                        else:
+                            self._terminate_process(proc)
                         break
                     if "text_delta" in step:
                         text_deltas.append(step["text_delta"])
@@ -765,41 +886,49 @@ class AntigravityClient:
                         usage_data = res["usage"]
                     if "error" in res:
                         error_msg = res["error"]
+                    success = (status != "ERROR")
                     break
 
-            # If result was not received and deadline expired
             if not final_response and time.monotonic() >= deadline:
-                self._terminate_process(proc)
-                raise TimeoutError(f"Antigravity CLI timed out after {effective_timeout}s.")
+                if is_worker:
+                    self._terminate_worker()
+                else:
+                    self._terminate_process(proc)
+                raise TimeoutError(f"Antigravity CLI timed out after {timeout}s.")
 
-            # Wait for process to exit cleanly
-            try:
-                proc.wait(timeout=5.0)
-            except subprocess.TimeoutExpired:
-                self._terminate_process(proc)
+            if not is_worker:
+                try:
+                    proc.wait(timeout=5.0)
+                except subprocess.TimeoutExpired:
+                    self._terminate_process(proc)
 
-            stderr_out = proc.stderr.read() if proc.stderr else ""
-            returncode = proc.poll() or 0
+                stderr_out = proc.stderr.read() if proc.stderr else ""
+                returncode = proc.poll() or 0
 
-            if returncode != 0 and not final_response:
-                err_detail = error_msg or stderr_out.strip() or f"Process exited with return code {returncode}"
-                raise RuntimeError(f"Antigravity execution failed: {err_detail}")
+                if returncode != 0 and not final_response:
+                    err_detail = error_msg or stderr_out.strip() or f"Process exited with return code {returncode}"
+                    raise RuntimeError(f"Antigravity execution failed: {err_detail}")
 
             if status == "ERROR":
                 raise RuntimeError(f"Antigravity model error: {error_msg}")
 
+            if is_worker and success:
+                self._update_worker_history(messages)
+
         finally:
-            with self._lock:
-                self._active_processes.discard(proc)
-            self._terminate_process(proc)
+            if not is_worker:
+                with self._lock:
+                    self._active_processes.discard(proc)
+                self._terminate_process(proc)
+            elif not success:
+                self._terminate_worker()
 
         response_text = final_response if final_response else "".join(text_deltas)
 
         try:
-            from agent.acp_openai_bridge import extract_tool_calls_from_text, completion_to_stream_chunks
+            from agent.acp_openai_bridge import extract_tool_calls_from_text
             tool_calls, cleaned_text = extract_tool_calls_from_text(response_text)
         except Exception:
-            # Fallback simple extractor
             tool_calls = []
             cleaned_text = response_text
             m = re.search(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", response_text, re.DOTALL)
@@ -848,12 +977,175 @@ class AntigravityClient:
             prompt_tokens_details=SimpleNamespace(cached_tokens=cached_tokens),
         )
 
-        completion = SimpleNamespace(
+        return SimpleNamespace(
             id=conversation_id or f"agy-{int(time.time()*1000)}",
             choices=[choice],
             usage=usage,
-            model=resolved_model,
+            model=model,
         )
 
-        return completion
+    def _run_oneshot_completion(
+        self,
+        *,
+        model: str,
+        effort: str | None,
+        messages: list[dict[str, Any]],
+        timeout: float,
+        tools: list[dict[str, Any]] | None,
+        tool_choice: Any,
+        stream: bool,
+    ) -> Any:
+        prompt_text = _format_messages_as_prompt(
+            messages, model=model, tools=tools, tool_choice=tool_choice
+        )
+        cmd_args = [self._command, *self._args]
+        if model:
+            cmd_args.extend(["--model", model])
+        if effort:
+            cmd_args.extend(["--effort", effort])
+
+        env = dict(os.environ)
+        env["HOME"] = str(self._isolated_home)
+
+        proc = subprocess.Popen(
+            cmd_args,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            bufsize=1,
+            cwd=self._cwd,
+            start_new_session=True,
+            env=env,
+        )
+
+        try:
+            if proc.stdin:
+                proc.stdin.write(prompt_text + "\n")
+                proc.stdin.flush()
+                proc.stdin.close()
+        except OSError:
+            pass
+
+        with self._lock:
+            self._active_processes.add(proc)
+
+        if stream:
+            return AntigravityStream(
+                proc=proc,
+                client=self,
+                model=model,
+                timeout=timeout,
+                tools=tools,
+                is_worker=False,
+            )
+        else:
+            return self._collect_completion(
+                proc=proc,
+                model=model,
+                timeout=timeout,
+                tools=tools,
+                is_worker=False,
+                messages=messages,
+            )
+
+    def _create_chat_completion(
+        self,
+        *,
+        model: str | None = None,
+        messages: list[dict[str, Any]] | None = None,
+        timeout: float | None = None,
+        tools: list[dict[str, Any]] | None = None,
+        tool_choice: Any = None,
+        stream: bool = False,
+        reasoning_effort: str | None = None,
+        **extra_kwargs: Any,
+    ) -> Any:
+        if self.is_closed:
+            raise RuntimeError("AntigravityClient is closed.")
+
+        if not is_authenticated():
+            raise RuntimeError(
+                "Antigravity CLI is not authenticated. Please run 'agy' in your terminal "
+                "to log in with your Google account."
+            )
+
+        effort_param = reasoning_effort or extra_kwargs.get("reasoning_effort")
+        resolved_model, effort = self._resolve_model_and_effort(model, effort_param)
+        messages_list = list(messages or [])
+        effective_timeout = float(timeout) if isinstance(timeout, (int, float)) and timeout > 0 else _DEFAULT_TIMEOUT_SECONDS
+
+        worker_acquired = self._worker_lock.acquire(blocking=False)
+        if worker_acquired:
+            try:
+                proc = self._get_or_spawn_worker(resolved_model, effort)
+                with self._lock:
+                    is_continuation = _messages_match_prefix(self._worker_history, messages_list)
+
+                if is_continuation:
+                    delta_msgs = messages_list[len(self._worker_history):]
+                    prompt_payload = _format_delta_prompt(delta_msgs)
+                else:
+                    if self._worker_history:
+                        self._terminate_worker()
+                        proc = self._get_or_spawn_worker(resolved_model, effort)
+                    prompt_payload = _format_messages_as_prompt(
+                        messages_list, model=resolved_model, tools=tools, tool_choice=tool_choice
+                    )
+
+                event_msg = {"event": "user", "message": {"content": prompt_payload}}
+                try:
+                    proc.stdin.write(json.dumps(event_msg) + "\n")
+                    proc.stdin.flush()
+                except (BrokenPipeError, OSError):
+                    self._terminate_worker()
+                    proc = self._get_or_spawn_worker(resolved_model, effort)
+                    prompt_payload = _format_messages_as_prompt(
+                        messages_list, model=resolved_model, tools=tools, tool_choice=tool_choice
+                    )
+                    event_msg = {"event": "user", "message": {"content": prompt_payload}}
+                    proc.stdin.write(json.dumps(event_msg) + "\n")
+                    proc.stdin.flush()
+
+                if stream:
+                    return AntigravityStream(
+                        proc=proc,
+                        client=self,
+                        model=resolved_model,
+                        timeout=effective_timeout,
+                        tools=tools,
+                        is_worker=True,
+                        worker_lock=self._worker_lock,
+                        messages=messages_list,
+                    )
+                else:
+                    try:
+                        return self._collect_completion(
+                            proc=proc,
+                            model=resolved_model,
+                            timeout=effective_timeout,
+                            tools=tools,
+                            is_worker=True,
+                            messages=messages_list,
+                        )
+                    finally:
+                        if self._worker_lock.locked():
+                            self._worker_lock.release()
+            except Exception:
+                self._terminate_worker()
+                if self._worker_lock.locked():
+                    self._worker_lock.release()
+                raise
+        else:
+            return self._run_oneshot_completion(
+                model=resolved_model,
+                effort=effort,
+                messages=messages_list,
+                timeout=effective_timeout,
+                tools=tools,
+                tool_choice=tool_choice,
+                stream=stream,
+            )
 

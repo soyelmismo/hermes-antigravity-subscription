@@ -327,6 +327,92 @@ class AntigravityPluginTests(unittest.TestCase):
         client.close()
         self.assertFalse(Path(temp_dir).exists())
 
+    def test_messages_match_prefix_and_delta(self):
+        from client import _messages_match_prefix, _format_delta_prompt
+
+        history = [
+            {"role": "system", "content": "You are Hermes"},
+            {"role": "user", "content": "Run command"},
+        ]
+        incoming_same = list(history)
+        self.assertFalse(_messages_match_prefix(history, incoming_same))
+
+        incoming_extended = list(history) + [
+            {"role": "assistant", "content": None, "tool_calls": [{"id": "c1", "function": {"name": "sh", "arguments": "{}"}}]},
+            {"role": "tool", "tool_call_id": "c1", "content": "ok"},
+        ]
+        self.assertTrue(_messages_match_prefix(history, incoming_extended))
+
+        delta = _format_delta_prompt(incoming_extended[2:])
+        self.assertIn("<tool_call>", delta)
+        self.assertIn("Tool Result (c1):\nok", delta)
+        self.assertIn("Continue the conversation from the latest tool result.", delta)
+
+    def test_session_worker_reuse_on_continuation(self):
+        client = AntigravityClient(cwd="/tmp")
+        mock_proc = MagicMock()
+        mock_proc.poll.return_value = None
+        mock_proc.stdin = MagicMock()
+        fake_events = [
+            json.dumps({"event": "init", "conversation_id": "conv-worker"}),
+            json.dumps({"event": "result", "result": {"status": "SUCCESS", "response": "done", "usage": {}}}),
+        ]
+        mock_proc.stdout.readline.side_effect = [f"{line}\n" for line in fake_events] * 2 + [""]
+
+        with patch("subprocess.Popen", return_value=mock_proc):
+            # Turn 1
+            msgs1 = [{"role": "user", "content": "first turn"}]
+            stream1 = client.chat.completions.create(model="gemini-3.8-flash", messages=msgs1, stream=True)
+            list(stream1)
+            self.assertEqual(len(client._worker_history), 1)
+
+            # Turn 2: continuation
+            msgs2 = msgs1 + [{"role": "tool", "tool_call_id": "t1", "content": "res"}]
+            stream2 = client.chat.completions.create(model="gemini-3.8-flash", messages=msgs2, stream=True)
+            list(stream2)
+            self.assertEqual(len(client._worker_history), 2)
+            # Proc was not terminated between turns
+            mock_proc.terminate.assert_not_called()
+
+        client.close()
+        mock_proc.terminate.assert_called()
+
+    def test_concurrent_fallback_to_oneshot(self):
+        client = AntigravityClient(cwd="/tmp")
+        # Acquire worker lock manually to simulate an in-progress stream
+        self.assertTrue(client._worker_lock.acquire(blocking=False))
+
+        mock_oneshot_proc = MagicMock()
+        mock_oneshot_proc.poll.return_value = 0
+        mock_oneshot_proc.stdin = MagicMock()
+        mock_oneshot_proc.stderr = io.StringIO("")
+        fake_events = [
+            json.dumps({"event": "init", "conversation_id": "oneshot-conv"}),
+            json.dumps({"event": "result", "result": {"status": "SUCCESS", "response": "oneshot response"}}),
+        ]
+        mock_oneshot_proc.stdout = io.StringIO("\n".join(fake_events) + "\n")
+
+        with patch("subprocess.Popen", return_value=mock_oneshot_proc):
+            res = client.chat.completions.create(
+                model="gemini-3.8-flash",
+                messages=[{"role": "user", "content": "concurrent"}],
+                stream=False,
+            )
+            self.assertEqual(res.choices[0].message.content, "oneshot response")
+
+        client._worker_lock.release()
+        client.close()
+
+    def test_isolated_home_and_token_symlink(self):
+        client = AntigravityClient()
+        self.assertTrue(client._isolated_home.is_dir())
+        self.assertTrue(client._isolated_gemini_dir.is_dir())
+        symlinked_token = client._isolated_gemini_dir / "antigravity-oauth-token"
+        self.assertTrue(symlinked_token.exists())
+        temp_dir = client._cwd
+        client.close()
+        self.assertFalse(Path(temp_dir).exists())
+
 
 if __name__ == "__main__":
     unittest.main()
