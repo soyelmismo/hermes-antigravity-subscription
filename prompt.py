@@ -74,13 +74,30 @@ def _format_messages_as_prompt(
             )
 
     sections: list[str] = [*_PROMPT_PREAMBLE, *tool_sections]
-    transcript: list[str] = []
 
     valid_messages = [m for m in messages if isinstance(m, dict)]
     last_msg = valid_messages[-1] if valid_messages else None
     last_role = str(last_msg.get("role") or "").strip().lower() if last_msg else ""
 
-    for message in valid_messages:
+    system_parts: list[str] = []
+    history_messages: list[dict[str, Any]] = []
+
+    for msg in valid_messages:
+        role = str(msg.get("role") or "unknown").strip().lower()
+        if role == "system":
+            rendered = _render_message_content(msg.get("content"))
+            if rendered:
+                system_parts.append(rendered)
+        else:
+            history_messages.append(msg)
+
+    if system_parts:
+        sections.append("### SYSTEM INSTRUCTIONS (HERMES AGENT):\n" + "\n\n".join(f"System:\n{p}" for p in system_parts))
+
+    transcript: list[str] = []
+    prior_messages = history_messages[:-1] if last_role == "user" and len(history_messages) > 1 else history_messages
+
+    for message in prior_messages:
         role = str(message.get("role") or "unknown").strip().lower()
         rendered_content = _render_message_content(message.get("content"))
 
@@ -129,7 +146,7 @@ def _format_messages_as_prompt(
     elif last_role == "user" and last_msg is not None:
         user_text = _render_message_content(last_msg.get("content"))
         sections.append(
-            f"### LATEST USER REQUEST TO ANSWER:\n{user_text}\n\n"
+            f"### LATEST USER REQUEST TO ANSWER:\nUser:\n{user_text}\n\n"
             "INSTRUCTION: Respond directly and specifically to the LATEST USER REQUEST above. "
             "Do NOT repeat previous architectural summaries, code reviews, or overview boilerplate unless explicitly asked."
         )

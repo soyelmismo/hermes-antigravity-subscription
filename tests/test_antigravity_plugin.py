@@ -114,7 +114,7 @@ class AntigravityPluginTests(unittest.TestCase):
         # Verify real tool result is present
         self.assertIn("Tool Result (call_1):\nreal data", prompt)
         # Verify latest user request is highlighted at tail
-        self.assertIn("### LATEST USER REQUEST TO ANSWER:\nWhy is this not following thread?", prompt)
+        self.assertIn("### LATEST USER REQUEST TO ANSWER:\nUser:\nWhy is this not following thread?", prompt)
         self.assertIn("Do NOT repeat previous architectural summaries", prompt)
 
     def test_format_messages_latest_tool_results(self):
