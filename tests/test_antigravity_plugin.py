@@ -396,6 +396,10 @@ class AntigravityPluginTests(unittest.TestCase):
         self.assertNotIn("--dangerously-skip-permissions", client._args)
         self.assertIn("--disable-slash-commands", client._args)
         self.assertIn("--output-format", client._args)
+        profile = get_provider_profile("antigravity-subscription-directsdk")
+        self.assertNotIn("--dangerously-skip-permissions", profile.process_args)
+        self.assertIn("--disable-slash-commands", profile.process_args)
+        self.assertIn("--output-format", profile.process_args)
 
     def test_native_tool_step_neutralization_in_stream(self):
         client = AntigravityClient(cwd="/tmp")
