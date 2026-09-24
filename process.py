@@ -98,18 +98,28 @@ def resolve_agy_command() -> str:
 
 
 def resolve_real_token_path() -> Path | None:
-    """Locate the authentic Antigravity OAuth token on the host."""
+    """Locate the authentic Antigravity OAuth token on the host.
+
+    ANTIGRAVITY_CONFIG_DIR is an override, not a hint: when it is set to a
+    directory without a token, the explicit configuration wins and the
+    implicit locations are not consulted. Falling through anyway would let a
+    stray /root token satisfy auth for a user who deliberately pointed
+    ANTIGRAVITY_CONFIG_DIR somewhere else.
+    """
     token_dir = os.getenv("ANTIGRAVITY_CONFIG_DIR", "").strip()
     if token_dir:
-        p = Path(token_dir) / "antigravity-oauth-token"
-        if _is_existing_file(p):
-            return p
-    p = Path.home() / ".gemini" / "antigravity-cli" / "antigravity-oauth-token"
-    if _is_existing_file(p):
-        return p
-    fallback = Path("/root/.gemini/antigravity-cli/antigravity-oauth-token")
-    if _is_existing_file(fallback):
-        return fallback
+        explicit = Path(token_dir) / "antigravity-oauth-token"
+        return explicit if _is_existing_file(explicit) else None
+
+    candidates = [
+        Path.home() / ".gemini" / "antigravity-cli" / "antigravity-oauth-token",
+        # Last resort for containers/sudo contexts where HOME does not point
+        # at the account that ran `agy`.
+        Path("/root/.gemini/antigravity-cli/antigravity-oauth-token"),
+    ]
+    for candidate in candidates:
+        if _is_existing_file(candidate):
+            return candidate
     return None
 
 

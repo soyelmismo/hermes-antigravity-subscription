@@ -1,5 +1,6 @@
 import io
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -24,9 +25,34 @@ from client import (
     resolve_agy_command,
 )
 from process import _check_early_quota_error
+# Imported for its module-level register_provider() side effect. Hermes only
+# discovers a provider plugin through $HERMES_HOME/plugins/model-providers/,
+# so a suite running against a bare source tree would find the profile
+# unregistered and every get_provider_profile() call would return None.
+import __init__ as plugin_entry  # noqa: F401  (side-effect import)
 
 
 class AntigravityPluginTests(unittest.TestCase):
+    def setUp(self):
+        # The suite must not depend on host state. Two host facts leak in
+        # otherwise: a real ~/.gemini auth token (present on a dev box, absent
+        # on CI) and the resolved agy binary, whose candidate scan stats
+        # paths under another account's home. Pin both for every test.
+        patcher_auth = patch("client.is_authenticated", return_value=True)
+        patcher_token = patch("client.resolve_real_token_path", return_value=None)
+        patcher_cmd = patch("client.resolve_agy_command", return_value="agy")
+        patcher_auth.start()
+        patcher_token.start()
+        patcher_cmd.start()
+        self.addCleanup(patcher_auth.stop)
+        self.addCleanup(patcher_token.stop)
+        self.addCleanup(patcher_cmd.stop)
+
+    @staticmethod
+    def _write_token(tmp_dir: str) -> Path:
+        token = Path(tmp_dir) / "antigravity-oauth-token"
+        token.write_text("token-content-123456", encoding="utf-8")
+        return token
     def test_provider_registration(self):
         profile = get_provider_profile("antigravity-subscription-directsdk")
         self.assertIsNotNone(profile)
@@ -46,8 +72,16 @@ class AntigravityPluginTests(unittest.TestCase):
         self.assertTrue(cmd.endswith("agy"))
 
     def test_auth_check(self):
-        # On this environment, agy is logged in
-        self.assertTrue(is_authenticated())
+        # Auth must be determined by the token directory, not by host state.
+        # Exercise both ends of the gate with a real temp token file: absent
+        # (empty dir, the CI shape) and present (a token file, the dev shape).
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.dict(os.environ, {"ANTIGRAVITY_CONFIG_DIR": tmp}, clear=False):
+                self.assertFalse(is_authenticated())
+        with tempfile.TemporaryDirectory() as tmp:
+            self._write_token(tmp)
+            with patch.dict(os.environ, {"ANTIGRAVITY_CONFIG_DIR": tmp}, clear=False):
+                self.assertTrue(is_authenticated())
 
     def test_format_messages_prompt(self):
         messages = [
@@ -506,14 +540,16 @@ class AntigravityPluginTests(unittest.TestCase):
         client.close()
 
     def test_isolated_home_and_token_symlink(self):
-        client = AntigravityClient()
-        self.assertTrue(client._isolated_home.is_dir())
-        self.assertTrue(client._isolated_gemini_dir.is_dir())
-        symlinked_token = client._isolated_gemini_dir / "antigravity-oauth-token"
-        self.assertTrue(symlinked_token.exists())
-        temp_dir = client._cwd
-        client.close()
-        self.assertFalse(Path(temp_dir).exists())
+        token = self._write_token(tempfile.mkdtemp())
+        with patch.object(AntigravityClient, "_resolve_real_token_path", return_value=token):
+            client = AntigravityClient()
+            self.assertTrue(client._isolated_home.is_dir())
+            self.assertTrue(client._isolated_gemini_dir.is_dir())
+            symlinked_token = client._isolated_gemini_dir / "antigravity-oauth-token"
+            self.assertTrue(symlinked_token.exists())
+            temp_dir = client._cwd
+            client.close()
+            self.assertFalse(Path(temp_dir).exists())
 
     def test_windows_process_group_creation(self):
         from client import _own_process_group
