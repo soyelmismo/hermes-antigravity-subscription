@@ -84,7 +84,12 @@ class AntigravitySubscriptionDirectSDKProfile(ProviderProfile):
         becomes `gemini-3.8-flash`), allowing Hermes' native reasoning effort picker to handle
         the thinking depth cleanly.
         """
-        from .client import resolve_agy_command
+        try:
+            from .client import resolve_agy_command
+        except ImportError:
+            # Loaded outside a package (e.g. a flat source tree under test):
+            # the absolute name is the same module.
+            from client import resolve_agy_command
 
         cmd = resolve_agy_command()
         try:
