@@ -25,11 +25,23 @@ from client import (
     resolve_agy_command,
 )
 from process import _check_early_quota_error
-# Imported for its module-level register_provider() side effect. Hermes only
-# discovers a provider plugin through $HERMES_HOME/plugins/model-providers/,
-# so a suite running against a bare source tree would find the profile
-# unregistered and every get_provider_profile() call would return None.
-import __init__ as plugin_entry  # noqa: F401  (side-effect import)
+
+# Load the plugin's package entry as a real package (not a plain module) so its
+# `from .client import ...` relative imports resolve. Hermes itself discovers a
+# provider plugin only via $HERMES_HOME/plugins/model-providers/, so a suite
+# run against a bare source tree would otherwise never call register_provider()
+# and every get_provider_profile() lookup would return None.
+import importlib.util as _ilu
+
+_pkg_spec = _ilu.spec_from_file_location(
+    "antigravity_plugin_entry",
+    plugin_dir / "__init__.py",
+    submodule_search_locations=[str(plugin_dir)],
+)
+assert _pkg_spec and _pkg_spec.loader  # noqa: S101 — test bootstrap, not production
+_pkg = _ilu.module_from_spec(_pkg_spec)
+sys.modules["antigravity_plugin_entry"] = _pkg
+_pkg_spec.loader.exec_module(_pkg)
 
 
 class AntigravityPluginTests(unittest.TestCase):
@@ -541,7 +553,9 @@ class AntigravityPluginTests(unittest.TestCase):
 
     def test_isolated_home_and_token_symlink(self):
         token = self._write_token(tempfile.mkdtemp())
-        with patch.object(AntigravityClient, "_resolve_real_token_path", return_value=token):
+        # setup_isolated_home() resolves the token via the process module,
+        # not through the client's static seam, so patch it where it is read.
+        with patch("process.resolve_real_token_path", return_value=token):
             client = AntigravityClient()
             self.assertTrue(client._isolated_home.is_dir())
             self.assertTrue(client._isolated_gemini_dir.is_dir())
@@ -591,17 +605,18 @@ class AntigravityPluginTests(unittest.TestCase):
             token_src.write_text("token-content-123456", encoding="utf-8")
 
             # Simulate os.symlink failing (WinError 1314) and falling back to os.link
-            with patch.object(AntigravityClient, "_resolve_real_token_path", return_value=token_src):
-                with patch("os.symlink", side_effect=OSError("privilege not held")), patch("os.link") as mock_link:
+            with patch("process.resolve_real_token_path", return_value=token_src):
+                with patch("process.os.symlink", side_effect=OSError("privilege not held")), \
+                     patch("process.os.link") as mock_link:
                     client = AntigravityClient(cwd=tmp)
                     mock_link.assert_called_once()
                     client.close()
 
             # Simulate both symlink and hardlink failing (cross-device/filesystem), falling back to copy2
-            with patch.object(AntigravityClient, "_resolve_real_token_path", return_value=token_src):
-                with patch("os.symlink", side_effect=OSError("privilege not held")), \
-                     patch("os.link", side_effect=OSError("cross-device link")), \
-                     patch("shutil.copy2") as mock_copy:
+            with patch("process.resolve_real_token_path", return_value=token_src):
+                with patch("process.os.symlink", side_effect=OSError("privilege not held")), \
+                     patch("process.os.link", side_effect=OSError("cross-device link")), \
+                     patch("process.shutil.copy2") as mock_copy:
                     client = AntigravityClient(cwd=tmp)
                     mock_copy.assert_called_once()
                     client.close()
