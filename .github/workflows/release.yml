@@ -1,0 +1,211 @@
+name: Release
+
+# Release automation for the Hermes plugin catalog.
+#
+# The catalog's Admission policy (hermes-agent/plugin-catalog/README.md)
+# requires "real releases/tags, not just a default branch" and pins every
+# entry to an exact 40-hex commit sha. This workflow is the source of those
+# releases: it fires only on a pushed v*.*.* tag, re-validates the pinned
+# commit from scratch, and publishes the GitHub Release that gives the
+# catalog its "Released" evidence.
+#
+# Deliberately NOT run on push to branches: a branch build tells the catalog
+# nothing. Tag-only keeps this a release gate, not a duplicate of tests CI.
+#
+# Hermes is built from the upstream source at a pinned tag, NOT from PyPI:
+# the PyPI wheel lags (0.19.0) below the plugin's requires_hermes floor
+# (>=0.21.0), so `pip install hermes-agent` would fail the version check.
+
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to (re)publish a release for"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  # Upstream Hermes tag whose pyproject version satisfies the plugin's
+  # requires_hermes floor (0.21.4). Bump this when the plugin raises its
+  # floor or when a newer upstream release is wanted.
+  HERMES_REF: v2026.9.21
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Gate 1: the tag must be strict semver, point at a commit on main, and its
+  # version must match the manifest's version: field.
+  # ---------------------------------------------------------------------------
+  check-tag:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      version: ${{ steps.parse.outputs.version }}
+      tag_sha: ${{ steps.parse.outputs.tag_sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Parse and validate the release tag
+        id: parse
+        env:
+          EVENT: ${{ github.event_name }}
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT" = "workflow_dispatch" ]; then
+            TAG="$INPUT_TAG"
+          else
+            TAG="${GITHUB_REF_NAME}"
+          fi
+
+          # Strict semver only: v1.2.3, optionally with prerelease/build
+          # metadata. A bare "v1.2" is not a release the catalog can pin.
+          # Each numeric identifier is 0 or non-zero-leading digits only,
+          # so leading zeros ("v1.0.01") are rejected.
+          if ! [[ "$TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error file=$TAG::not strict semver (expected vMAJOR.MINOR.PATCH, got '$TAG')"
+            exit 1
+          fi
+          VERSION="${TAG#v}"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+          # The tag must point at a commit reachable from main. A tag on a
+          # side branch would ship code the catalog never reviewed.
+          if ! git merge-base --is-ancestor "$TAG" origin/main; then
+            echo "::error file=$TAG::tag commit is not an ancestor of origin/main; tag main, not a side branch"
+            exit 1
+          fi
+          SHA=$(git rev-parse "$TAG^{commit}")
+          echo "tag_sha=$SHA" >> "$GITHUB_OUTPUT"
+          echo "Tag $TAG -> $SHA"
+
+          # The tag version must match the manifest version at that commit,
+          # so the label users see on the catalog card matches the code.
+          MANIFEST_VERSION=$(git show "$SHA:plugin.yaml" | python3 -c "import sys, yaml; print(yaml.safe_load(sys.stdin).get('version',''))")
+          if [ "$MANIFEST_VERSION" != "$VERSION" ]; then
+            echo "::error file=$TAG::plugin.yaml version '$MANIFEST_VERSION' does not match tag version '$VERSION' — bump version: in the same commit"
+            exit 1
+          fi
+          echo "manifest version matches: $MANIFEST_VERSION"
+
+  # ---------------------------------------------------------------------------
+  # Gate 2: the plugin at that exact commit must validate and pass its tests.
+  # Mirrors the catalog's pinned-source-validate gate so a release can never
+  # publish code the catalog would reject.
+  # ---------------------------------------------------------------------------
+  verify-at-tag:
+    needs: check-tag
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.check-tag.outputs.tag_sha }}
+          fetch-depth: 0
+          fetch-tags: true
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Hermes from upstream source at ${{ env.HERMES_REF }}
+        # Not from PyPI: the published wheel (0.19.0) is below the plugin's
+        # requires_hermes floor, so the manifest check would fail even
+        # though the pinned upstream tag satisfies it.
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          git clone --depth 1 --branch "$HERMES_REF" \
+            https://github.com/NousResearch/hermes-agent.git "$RUNNER_TEMP/hermes-src"
+          pip install -e "$RUNNER_TEMP/hermes-src"
+          echo "$RUNNER_TEMP/hermes-src" >> "$GITHUB_PATH"
+          hermes --version
+
+      - name: Validate the plugin manifest at the pinned commit
+        run: hermes plugins validate "$GITHUB_WORKSPACE"
+
+      - name: Run the plugin test suite
+        # PYTHONPATH must include the Hermes tree: the plugin's tests import
+        # `providers` from it, so the suite only runs against Hermes source.
+        run: |
+          set -euo pipefail
+          PYTHONPATH="$RUNNER_TEMP/hermes-src:$GITHUB_WORKSPACE" \
+            python -m pytest tests/ -q
+
+  # ---------------------------------------------------------------------------
+  # Gate 3: publish. Reached only when both gates above are green.
+  # ---------------------------------------------------------------------------
+  release:
+    needs: [check-tag, verify-at-tag]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.check-tag.outputs.tag_sha }}
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Resolve the tag name
+        id: tag
+        env:
+          EVENT: ${{ github.event_name }}
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT" = "workflow_dispatch" ]; then
+            echo "name=$INPUT_TAG" >> "$GITHUB_OUTPUT"
+          else
+            echo "name=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build the changelog since the previous release
+        env:
+          TAG: ${{ steps.tag.outputs.name }}
+          TAG_SHA: ${{ needs.check-tag.outputs.tag_sha }}
+        run: |
+          set -euo pipefail
+          PREV=$(git describe --tags --abbrev=0 --match 'v[0-9]+.[0-9]+.[0-9]+' \
+            "${TAG}^{commit}^" 2>/dev/null || true)
+          {
+            echo "## What changed"
+            echo
+            if [ -n "$PREV" ]; then
+              echo "Changes since $PREV:"
+              echo
+              git log --pretty='- %h %s' "$PREV".."$TAG"
+            else
+              echo "First tagged release."
+            fi
+            echo
+            echo "Pinned commit: \`$TAG_SHA\`"
+            echo
+            echo "Hermes catalog entry: \`plugin-catalog/antigravity-subscription-directsdk.yaml\`"
+          } > "$RUNNER_TEMP/notes.md"
+
+      - name: Publish the GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.tag.outputs.name }}
+        run: |
+          set -euo pipefail
+          gh release create "$TAG" \
+            --title "$TAG" \
+            --notes-file "$RUNNER_TEMP/notes.md" \
+            --verify-tag \
+            --latest \
+          || gh release edit "$TAG" --title "$TAG" --notes-file "$RUNNER_TEMP/notes.md"
