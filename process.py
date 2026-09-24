@@ -14,6 +14,21 @@ from typing import Any
 AGY_MARKER_BASE_URL = "agy://local"
 
 
+def _is_existing_file(path: str | Path) -> bool:
+    """True if path is a regular file, treating any OS error as absent.
+
+    Candidate discovery walks directories that may be unreadable to the
+    current user (Path.home() of another account, /root under a
+    non-root runner). pathlib's is_file() only swallows part of the
+    OSError family, so a PermissionError on stat() escaped and aborted
+    the whole scan instead of just skipping that candidate.
+    """
+    try:
+        return Path(path).is_file()
+    except OSError:
+        return False
+
+
 def _own_process_group() -> dict[str, Any]:
     """Popen kwargs that put native (and any child processes it spawns) in a group we can kill cleanly."""
     if os.name == "nt":
@@ -55,7 +70,7 @@ def resolve_agy_command() -> str:
     for var in ("ANTIGRAVITY_COMMAND", "AGY_CLI_PATH", "ANTIGRAVITY_CLI_PATH"):
         if val := os.getenv(var, "").strip():
             p = Path(val)
-            if p.is_file() and (os.name == "nt" or os.access(val, os.X_OK)):
+            if _is_existing_file(p) and (os.name == "nt" or os.access(val, os.X_OK)):
                 return val
 
     # Check PATH (shutil.which checks PATHEXT on Windows, e.g. agy.exe)
@@ -76,7 +91,7 @@ def resolve_agy_command() -> str:
             candidates.append(Path(localappdata) / "Microsoft" / "WinGet" / "Links" / binary_name)
 
     for candidate in candidates:
-        if candidate.is_file() and (os.name == "nt" or os.access(candidate, os.X_OK)):
+        if _is_existing_file(candidate) and (os.name == "nt" or os.access(candidate, os.X_OK)):
             return str(candidate)
 
     return "agy"
@@ -87,13 +102,13 @@ def resolve_real_token_path() -> Path | None:
     token_dir = os.getenv("ANTIGRAVITY_CONFIG_DIR", "").strip()
     if token_dir:
         p = Path(token_dir) / "antigravity-oauth-token"
-        if p.is_file():
+        if _is_existing_file(p):
             return p
     p = Path.home() / ".gemini" / "antigravity-cli" / "antigravity-oauth-token"
-    if p.is_file():
+    if _is_existing_file(p):
         return p
     fallback = Path("/root/.gemini/antigravity-cli/antigravity-oauth-token")
-    if fallback.is_file():
+    if _is_existing_file(fallback):
         return fallback
     return None
 
@@ -120,7 +135,7 @@ def setup_isolated_home(cwd: Path | str) -> tuple[Path, Path]:
     isolated_gemini_dir.mkdir(parents=True, exist_ok=True)
 
     real_token = resolve_real_token_path()
-    if real_token and real_token.is_file():
+    if real_token and _is_existing_file(real_token):
         isolated_token = isolated_gemini_dir / "antigravity-oauth-token"
         if not isolated_token.exists():
             try:
