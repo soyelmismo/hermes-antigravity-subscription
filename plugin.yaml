@@ -13,8 +13,4 @@ platforms:
 requires_hermes: ">=0.21.0"
 external_dependencies:
   - command: agy
-capabilities:
-  provides_tools: []
-  provides_hooks: []
-  provides_middleware: []
-  requires_env: []
+capabilities: []
