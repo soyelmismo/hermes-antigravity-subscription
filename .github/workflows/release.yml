@@ -130,6 +130,10 @@ jobs:
           git clone --depth 1 --branch "$HERMES_REF" \
             https://github.com/NousResearch/hermes-agent.git "$RUNNER_TEMP/hermes-src"
           pip install -e "$RUNNER_TEMP/hermes-src"
+          # pytest is NOT a dependency of hermes-agent (it lives in the
+          # upstream `dev` extra), so the test gate needs it installed
+          # explicitly or the suite fails on collection.
+          pip install "pytest==9.1.1"
           echo "$RUNNER_TEMP/hermes-src" >> "$GITHUB_PATH"
           hermes --version
 
