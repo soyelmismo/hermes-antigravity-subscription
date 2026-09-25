@@ -155,6 +155,36 @@ class AntigravityPluginTests(unittest.TestCase):
             with patch.dict(os.environ, {"ANTIGRAVITY_CONFIG_DIR": tmp}, clear=False):
                 self.assertTrue(is_authenticated())
 
+    def test_auth_check_windows_credential_manager(self):
+        # agy on Windows keeps its session in the Credential Manager, not in a
+        # token file. Only the entry's presence is checked; the secret is never read.
+        listed = SimpleNamespace(stdout="    Target: LegacyGeneric:target=gemini:antigravity\n", returncode=0)
+        missing = SimpleNamespace(stdout="* NONE *\n", returncode=0)
+        with tempfile.TemporaryDirectory() as home:
+            env = {k: v for k, v in os.environ.items() if k != "ANTIGRAVITY_CONFIG_DIR"}
+            with patch.dict(os.environ, env, clear=True), \
+                    patch("process.Path.home", return_value=Path(home)), \
+                    patch("process._is_existing_file", return_value=False), \
+                    patch("process.sys.platform", "win32"):
+                with patch("process.subprocess.run", return_value=listed) as run:
+                    self.assertTrue(is_authenticated())
+                    self.assertEqual(run.call_args.args[0], ["cmdkey", "/list:gemini:antigravity"])
+                with patch("process.subprocess.run", return_value=missing):
+                    self.assertFalse(is_authenticated())
+                with patch("process.subprocess.run", side_effect=FileNotFoundError):
+                    self.assertFalse(is_authenticated())
+
+    def test_auth_check_explicit_dir_wins_over_windows_credential(self):
+        # ANTIGRAVITY_CONFIG_DIR is an override: an empty explicit dir stays
+        # unauthenticated even when the Credential Manager has an entry.
+        listed = SimpleNamespace(stdout="Target: LegacyGeneric:target=gemini:antigravity\n", returncode=0)
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.dict(os.environ, {"ANTIGRAVITY_CONFIG_DIR": tmp}, clear=False), \
+                    patch("process.sys.platform", "win32"), \
+                    patch("process.subprocess.run", return_value=listed) as run:
+                self.assertFalse(is_authenticated())
+                run.assert_not_called()
+
     def test_format_messages_prompt(self):
         messages = [
             {"role": "system", "content": "You are a helpful coding assistant."},

@@ -7,6 +7,7 @@ import os
 import shutil
 import signal
 import subprocess
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -141,14 +142,33 @@ def resolve_real_token_path() -> Path | None:
     return None
 
 
+def _windows_credential_present() -> bool:
+    """True if agy's Windows Credential Manager entry exists.
+
+    On Windows agy stores its session in the Credential Manager
+    (target ``gemini:antigravity``) instead of an oauth token file. `cmdkey /list`
+    prints only target metadata, never the secret.
+    """
+    try:
+        out = subprocess.run(
+            ["cmdkey", "/list:gemini:antigravity"], capture_output=True, text=True, timeout=10, check=False
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return "gemini:antigravity" in out.stdout
+
+
 def is_authenticated() -> bool:
     """Verify that the user has an active Antigravity OAuth session.
-    
+
     Zero-Exfiltration compliance: We only verify file presence and non-zero
     size. We NEVER read, parse, or transmit the token contents.
     """
     token_path = resolve_real_token_path()
     if not token_path:
+        # An explicit ANTIGRAVITY_CONFIG_DIR still wins (see resolve_real_token_path).
+        if sys.platform == "win32" and not os.getenv("ANTIGRAVITY_CONFIG_DIR", "").strip():
+            return _windows_credential_present()
         return False
     try:
         return token_path.is_file() and token_path.stat().st_size > 10
