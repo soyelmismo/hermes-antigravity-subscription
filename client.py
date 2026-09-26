@@ -104,7 +104,28 @@ __all__ = [
 
 
 class AntigravityClient:
-    """OpenAI-compatible client facade driving Antigravity CLI."""
+    """OpenAI-compatible client facade driving Antigravity CLI.
+
+    Async compatibility boundary (issue #8)
+    --------------------------------------
+    Hermes drives this client from its async auxiliary path: with
+    ``HERMES_SKIP_ASYNC_WRAP`` the client is used as-is ("already async-safe"),
+    and the caller then does ``await client.chat.completions.create(...)``.
+    Everything the facade returns is therefore awaitable-yielding-itself —
+    ``stream._AwaitableCompletion`` for the non-streaming plan (which simply
+    wraps the already-assembled response) and ``stream.AntigravityStream`` for
+    the streaming plan (awaitable plus ``async for`` via ``__anext__``). Sync
+    callers are untouched: the objects keep the same attributes and the same
+    blocking behavior, so no existing caller needs to change.
+
+    Known limitation (documented on purpose, not fixed here): the non-streaming
+    ``create()`` executes the whole subprocess round-trip synchronously before
+    it returns, so awaiting it still blocks the event loop for the request's
+    duration. This is identical to the pre-existing sync behavior and to
+    Hermes' own CopilotACPClient shim, and there is no plugin-side fix without
+    a Hermes hook that would let ``create()`` hand back a coroutine instead of
+    a finished value.
+    """
 
     # Instruct Hermes not to wrap this client in wire transports or async adapters
     HERMES_SKIP_TRANSPORT_WRAP = True
