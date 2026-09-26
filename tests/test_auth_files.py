@@ -76,21 +76,23 @@ class AuthFileCompatibilityTests(unittest.TestCase):
                     with _scrubbed_env(HOME=home, ANTIGRAVITY_CONFIG_DIR=config_dir):
                         self.assertEqual(resolve_real_token_path(), token)
 
-    def test_legacy_wins_when_both_exist_in_home(self):
-        # Documented tie-break: legacy-first order means an old token file
-        # lingering next to the new one still wins.
+    def test_new_wins_when_both_exist_in_home(self):
+        # Documented tie-break: new-first order means an upgraded user's
+        # lingering legacy token file must NOT outrank the jetski file that
+        # agy 1.2 actually reads.
         with tempfile.TemporaryDirectory() as tmp:
-            legacy = _write_token(Path(tmp) / ".gemini" / "antigravity-cli" / LEGACY_NAME)
-            _write_token(Path(tmp) / ".gemini" / "antigravity-cli" / NEW_NAME)
+            base = Path(tmp) / ".gemini" / "antigravity-cli"
+            _write_token(base / LEGACY_NAME)
+            new_token = _write_token(base / NEW_NAME)
             with _scrubbed_env(HOME=tmp):
-                self.assertEqual(resolve_real_token_path(), legacy)
+                self.assertEqual(resolve_real_token_path(), new_token)
 
-    def test_legacy_wins_when_both_exist_in_override(self):
+    def test_new_wins_when_both_exist_in_override(self):
         with tempfile.TemporaryDirectory() as config_dir, tempfile.TemporaryDirectory() as home:
-            legacy = _write_token(Path(config_dir) / LEGACY_NAME)
-            _write_token(Path(config_dir) / NEW_NAME)
+            _write_token(Path(config_dir) / LEGACY_NAME)
+            new_token = _write_token(Path(config_dir) / NEW_NAME)
             with _scrubbed_env(HOME=home, ANTIGRAVITY_CONFIG_DIR=config_dir):
-                self.assertEqual(resolve_real_token_path(), legacy)
+                self.assertEqual(resolve_real_token_path(), new_token)
 
     def test_explicit_override_is_strict(self):
         # A token in HOME must not satisfy auth when the override points
@@ -146,6 +148,39 @@ class AuthFileCompatibilityTests(unittest.TestCase):
                     dest = gemini_dir / NEW_NAME
                     self.assertTrue(dest.is_file())
                     self.assertEqual(dest.read_text(encoding="utf-8"), _TOKEN_BODY)
+
+    def test_isolated_home_drops_stale_link_keeps_real_file(self):
+        # Reused cwd: a pre-upgrade agy1.1 run linked the legacy name, so
+        # the isolated gemini dir can already hold a token under the
+        # NON-selected basename when a 1.2 run resolves the new one. A
+        # leftover symlink we created must be dropped (it would linger next
+        # to the fresh link); a real regular file must survive the
+        # os.path.islink() guard untouched — it could be user data.
+        for stale_is_symlink in (True, False):
+            with self.subTest(stale_kind="symlink" if stale_is_symlink else "real_file"):
+                with tempfile.TemporaryDirectory() as cwd, tempfile.TemporaryDirectory() as src_dir:
+                    gemini_dir = Path(cwd) / "home" / ".gemini" / "antigravity-cli"
+                    gemini_dir.mkdir(parents=True)
+                    stale = gemini_dir / LEGACY_NAME
+                    if stale_is_symlink:
+                        os.symlink(Path(src_dir) / "gone-with-the-old-run", stale)
+                    else:
+                        stale.write_text("user data that must not be unlinked", encoding="utf-8")
+                    selected = _write_token(Path(src_dir) / NEW_NAME)
+
+                    with patch("process.resolve_real_token_path", return_value=selected):
+                        _, out_dir = setup_isolated_home(cwd)
+
+                    if stale_is_symlink:
+                        self.assertFalse(os.path.lexists(stale), "stale link should have been unlinked")
+                        self.assertNotIn(LEGACY_NAME, [p.name for p in out_dir.iterdir()])
+                    else:
+                        self.assertFalse(os.path.islink(stale), "a real file must never be unlinked")
+                        self.assertEqual(
+                            stale.read_text(encoding="utf-8"),
+                            "user data that must not be unlinked",
+                        )
+                    self.assertTrue((out_dir / NEW_NAME).exists())
 
 
 if __name__ == "__main__":

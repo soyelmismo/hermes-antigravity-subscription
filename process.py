@@ -14,12 +14,15 @@ from typing import Any
 AGY_MARKER_BASE_URL = "agy://local"
 
 # Known OAuth token basenames. agy1.2 renamed the fallback file from
-# antigravity-oauth-token to jetski-standalone-oauth-token (issue #1);
-# both must resolve. Order is legacy-first for backward compatibility:
-# when both files exist in the same directory the legacy name wins, even
-# for agy-1.2 users. If 1.2 is ever observed leaving both files with the
-# new one authoritative, revisit (e.g. mtime-newest).
-_TOKEN_FILENAMES = ("antigravity-oauth-token", "jetski-standalone-oauth-token")
+# antigravity-oauth-token to jetski-standalone-oauth-token (issue #1),
+# so both must resolve. Order is new-first: an upgraded user (1.1 -> 1.2)
+# has BOTH files in the same directory, because 1.2 does not remove the
+# old one, and 1.2 reads only the new name — so when both coexist the new
+# name is authoritative. Resolving the stale legacy file there would
+# authenticate (size > 10) a token that agy 1.2 ignores. Legacy-only 1.1
+# users are unaffected: the new file simply does not exist and the scan
+# falls through to the legacy name.
+_TOKEN_FILENAMES = ("jetski-standalone-oauth-token", "antigravity-oauth-token")
 
 
 def _is_existing_file(path: str | Path) -> bool:
@@ -161,6 +164,18 @@ def setup_isolated_home(cwd: Path | str) -> tuple[Path, Path]:
 
     real_token = resolve_real_token_path()
     if real_token and _is_existing_file(real_token):
+        # Reused cwd: a previous run may have selected the OTHER known
+        # basename (e.g. a pre-upgrade agy1.1 run linked
+        # antigravity-oauth-token). Such a leftover link would linger next
+        # to the fresh one, so drop it — but only if it is a symlink we
+        # created; never unlink a real file that could be user data.
+        for stale_name in _TOKEN_FILENAMES:
+            if stale_name == real_token.name:
+                continue
+            stale_link = isolated_gemini_dir / stale_name
+            if os.path.islink(stale_link):
+                with contextlib.suppress(OSError):
+                    stale_link.unlink()
         # Preserve the selected basename so the agy1.2 filename keeps
         # working inside the isolated home (zero secret parsing).
         isolated_token = isolated_gemini_dir / real_token.name

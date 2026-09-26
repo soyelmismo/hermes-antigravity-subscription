@@ -99,6 +99,50 @@ class AntigravityPluginTests(unittest.TestCase):
                 cmd = real_resolve()
                 self.assertTrue(cmd.endswith("agy.exe"))
 
+    def test_command_resolution_env_var_returns_exact_path(self):
+        # When ANTIGRAVITY_COMMAND points at an existing executable file it
+        # must be returned verbatim, short-circuiting PATH and candidate
+        # scan. Deterministic: real temp file, no host dependence.
+        from process import resolve_agy_command as real_resolve
+
+        with tempfile.TemporaryDirectory() as tmp:
+            agy_bin = Path(tmp) / "agy-custom-bin"
+            agy_bin.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            if os.name != "nt":
+                os.chmod(agy_bin, 0o755)
+            env = {
+                "ANTIGRAVITY_COMMAND": str(agy_bin),
+                "AGY_CLI_PATH": "",
+                "ANTIGRAVITY_CLI_PATH": "",
+            }
+            with patch.dict(os.environ, env, clear=False), patch(
+                "process.shutil.which",
+                side_effect=AssertionError("env var must win before the PATH scan"),
+            ):
+                self.assertEqual(real_resolve(), str(agy_bin))
+
+    def test_command_resolution_env_var_skipped_when_not_executable(self):
+        # The env var only wins if it points at an executable file. A
+        # non-executable file must fall through to the rest of resolution
+        # (the POSIX X_OK gate; os.access is pinned inside the process
+        # module so the outcome cannot vary by host/root).
+        from process import resolve_agy_command as real_resolve
+
+        with tempfile.TemporaryDirectory() as tmp:
+            plain_file = Path(tmp) / "not-executable"
+            plain_file.write_text("dummy", encoding="utf-8")
+            env = {
+                "ANTIGRAVITY_COMMAND": str(plain_file),
+                "AGY_CLI_PATH": "",
+                "ANTIGRAVITY_CLI_PATH": "",
+            }
+            with patch.dict(os.environ, env, clear=False), patch(
+                "process.shutil.which", return_value="/fake/agy-from-path"
+            ), patch("process.os", wraps=os) as mock_os:
+                mock_os.access = lambda *args, **kwargs: False
+                mock_os.name = "posix"
+                self.assertEqual(real_resolve(), "/fake/agy-from-path")
+
     def test_auth_check(self):
         # Auth must be determined by the token directory, not by host state.
         # Exercise both ends of the gate with a real temp token file: absent
