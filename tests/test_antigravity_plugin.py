@@ -157,10 +157,19 @@ class AntigravityPluginTests(unittest.TestCase):
                 self.assertTrue(is_authenticated())
 
     def _windows_without_token_file(self, home):
-        # Windows, no token file and no ANTIGRAVITY_CONFIG_DIR.
+        # Windows, no token file and no ANTIGRAVITY_CONFIG_DIR. The OS name
+        # is faked only inside the process module (wraps the real os module)
+        # so pathlib's global os.name check keeps working.
         env = {k: v for k, v in os.environ.items() if k != "ANTIGRAVITY_CONFIG_DIR"}
+
+        @contextlib.contextmanager
+        def fake_nt():
+            with patch("process.os", wraps=os) as mock_os:
+                mock_os.name = "nt"
+                yield
+
         return (patch.dict(os.environ, env, clear=True), patch("process.Path.home", return_value=Path(home)),
-                patch("process._is_existing_file", return_value=False), patch("os.name", "nt"))
+                patch("process._is_existing_file", return_value=False), fake_nt())
 
     def test_auth_check_windows_credential_manager(self):
         # agy on Windows keeps its session in the Credential Manager, not in a
@@ -196,8 +205,12 @@ class AntigravityPluginTests(unittest.TestCase):
         # unauthenticated even when the Credential Manager has an entry.
         listed = SimpleNamespace(stdout=b"Target: LegacyGeneric:target=gemini:antigravity\r\n", returncode=0)
         with tempfile.TemporaryDirectory() as tmp:
+            # The OS name is faked only inside the process module (wraps the
+            # real os module) so pathlib's global os.name check keeps working.
             with patch.dict(os.environ, {"ANTIGRAVITY_CONFIG_DIR": tmp}, clear=False), \
-                    patch("os.name", "nt"), patch("process.subprocess.run", return_value=listed) as run:
+                    patch("process.os", wraps=os) as mock_os, \
+                    patch("process.subprocess.run", return_value=listed) as run:
+                mock_os.name = "nt"
                 self.assertFalse(is_authenticated())
                 run.assert_not_called()
 
