@@ -56,6 +56,14 @@ def _write_token(path: Path) -> Path:
 
 
 class AuthFileCompatibilityTests(unittest.TestCase):
+    def setUp(self):
+        # On a macOS dev box setup_isolated_home() would link the tester's real
+        # ~/Library/Keychains into the throwaway home; that step has its own
+        # tests (test_macos_keychain.py), so pin it off here.
+        patcher_keychains = patch("process._link_macos_keychains")
+        patcher_keychains.start()
+        self.addCleanup(patcher_keychains.stop)
+
     def test_legacy_filename_resolves_in_home(self):
         with tempfile.TemporaryDirectory() as tmp:
             token = _write_token(Path(tmp) / ".gemini" / "antigravity-cli" / LEGACY_NAME)

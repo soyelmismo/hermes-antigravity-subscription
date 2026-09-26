@@ -192,12 +192,15 @@ class _PinnedSeamsMixin:
         patcher_auth = patch("client.is_authenticated", return_value=True)
         patcher_token = patch("process.resolve_real_token_path", return_value=None)
         patcher_cmd = patch("client.resolve_agy_command", return_value="agy")
+        patcher_keychains = patch("process._link_macos_keychains")
         patcher_auth.start()
         patcher_token.start()
         patcher_cmd.start()
+        patcher_keychains.start()
         self.addCleanup(patcher_auth.stop)
         self.addCleanup(patcher_token.stop)
         self.addCleanup(patcher_cmd.stop)
+        self.addCleanup(patcher_keychains.stop)
 
     def _client(self) -> AntigravityClient:
         temp_dir = tempfile.TemporaryDirectory(prefix="hermes_agy_test_")

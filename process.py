@@ -417,6 +417,58 @@ def _linux_keyring_present() -> bool:
     return _scripted_keyring_present()
 
 
+# macOS: go-keyring's darwin backend shells out to /usr/bin/security and stores
+# a generic password with service "gemini" and account "antigravity" in the
+# login keychain (verified live against agy 1.2.11: `security
+# find-generic-password -s gemini -a antigravity` finds exactly that item, and
+# agy's cli.log reports "authenticated via keyring"). The absolute path is used
+# so a PATH entry cannot shadow the system binary.
+_SECURITY_BINARY = "/usr/bin/security"
+# Without -g or -w, find-generic-password prints only the item's attributes (to
+# stdout) and never the secret, so the probe never asks the keychain for the
+# credential and never triggers an access prompt.
+_SECURITY_PROBE_ARGV = [
+    _SECURITY_BINARY,
+    "find-generic-password",
+    "-s",
+    _KEYRING_SERVICE,
+    "-a",
+    _KEYRING_USERNAME,
+]
+# The -s/-a filters already select the exact pair; the markers re-check it so
+# the verdict never rests on the return code alone. Each is anchored on the
+# closing quote, so a hypothetical service "gemini-cli" does not match.
+_SECURITY_HIT_MARKERS = (
+    b'"svce"<blob>="' + _KEYRING_SERVICE.encode() + b'"',
+    b'"acct"<blob>="' + _KEYRING_USERNAME.encode() + b'"',
+)
+
+
+def _macos_keychain_present() -> bool:
+    """True if agy's macOS keychain item exists.
+
+    Zero-Exfiltration compliance: only item attributes are requested (no -g/-w),
+    so the credential never leaves the keychain. Fails closed like the Windows
+    probe: a missing binary, a timeout, or any non-zero rc (44 is "item not
+    found") reads as not authenticated. Uncached for the same reason as the
+    Linux probe: a cached verdict would outlive a logout or block a fresh login.
+    """
+    try:
+        out = subprocess.run(
+            list(_SECURITY_PROBE_ARGV),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=_KEYRING_PROBE_TIMEOUT_SECONDS,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):  # missing binary, TimeoutExpired
+        return False
+    if out.returncode != 0:
+        return False
+    stdout = out.stdout or b""
+    return all(marker in stdout for marker in _SECURITY_HIT_MARKERS)
+
+
 def is_authenticated() -> bool:
     """Verify that the user has an active Antigravity OAuth session.
 
@@ -436,6 +488,8 @@ def is_authenticated() -> bool:
         # this probe reads.
         if sys.platform.startswith("linux") and not explicit_dir:
             return _linux_keyring_present()
+        if sys.platform == "darwin" and not explicit_dir:
+            return _macos_keychain_present()
         return False
     try:
         return token_path.is_file() and token_path.stat().st_size > 10
@@ -497,7 +551,43 @@ def setup_isolated_home(cwd: Path | str) -> tuple[Path, Path]:
                     with contextlib.suppress(OSError):
                         shutil.copy2(real_token, isolated_token)
 
+    _link_macos_keychains(isolated_home)
     return isolated_home, isolated_gemini_dir
+
+
+def _link_macos_keychains(isolated_home: Path) -> None:
+    """Expose the user's keychains inside the isolated HOME on macOS.
+
+    agy 1.2 on macOS keeps its session in the login keychain (see
+    _macos_keychain_present), and the keychain search list is resolved through
+    $HOME/Library/Keychains. Under the isolated HOME that directory does not
+    exist, so the child agy finds no credential and answers "Authentication
+    required" even though the user is logged in (verified live, agy 1.2.11).
+    Linking the directory restores exactly the access agy has when run
+    normally; the isolation this HOME provides is for project files, not for
+    agy's own credential. Skipped when ANTIGRAVITY_CONFIG_DIR is set, so an
+    explicit token directory is not overridden by the keychain session (agy
+    tries the keychain first).
+    """
+    if sys.platform != "darwin" or os.getenv("ANTIGRAVITY_CONFIG_DIR", "").strip():
+        return
+    real_keychains = Path.home() / "Library" / "Keychains"
+    if not real_keychains.is_dir():
+        return
+    isolated_keychains = Path(isolated_home) / "Library" / "Keychains"
+    # Same directory already (isolated_home is, or links to, the real HOME).
+    with contextlib.suppress(OSError):
+        if isolated_keychains.resolve() == real_keychains.resolve():
+            return
+    if os.path.islink(isolated_keychains):
+        # Reused cwd: a leftover link from a previous run may point elsewhere.
+        with contextlib.suppress(OSError):
+            isolated_keychains.unlink()
+    elif isolated_keychains.exists():
+        return  # a real directory: never replace it
+    with contextlib.suppress(OSError):
+        isolated_keychains.parent.mkdir(parents=True, exist_ok=True)
+        os.symlink(real_keychains, isolated_keychains, target_is_directory=True)
 
 
 def build_child_env(isolated_home: Path | str) -> dict[str, str]:
