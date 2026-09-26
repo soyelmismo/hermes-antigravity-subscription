@@ -40,6 +40,19 @@ def _counter_delta(usage_data: dict[str, Any], baseline: dict[str, int], field: 
     field never resets unrelated counters. A value below the baseline means
     the CLI restarted its counters for this session: the current value is
     already this turn's usage and becomes the new baseline.
+
+    Known limitations of the remaining handling (kept on purpose; no code
+    change, no better signal exists in the delta alone):
+
+    * A value below the baseline is a SUFFICIENT but not a definitive restart
+      detector. A CLI restart whose counter already reports >= the old
+      baseline reads as a small positive delta: the pre-restart usage is
+      attributed to that (in fact empty) turn instead of restarting the
+      accounting.
+    * A counter first reported mid-session (no previous snapshot, e.g.
+      cache_read_tokens appearing only once the prompt cache warms) is
+      attributed in full to the current turn. How that session-to-date value
+      splits across earlier turns is unknowable, so this turn over-reports.
     """
     if field not in usage_data:
         return 0
@@ -400,9 +413,19 @@ class AntigravityStream(Iterator[Any]):
                     raise RuntimeError(f"Antigravity execution failed: worker process exited with return code {returncode}")
 
             finish_reason = "tool_calls" if has_tool_calls else "stop"
-            yield self._make_chunk(finish_reason=finish_reason)
 
+            # Resolve usage (advancing the cumulative worker baseline) BEFORE
+            # emitting the finish-reason chunk. The common client pattern
+            # `for chunk in stream: if finish_reason: break` abandons the
+            # stream right here without calling close(), finalizing this
+            # generator at this yield: the usage chunk below is then never
+            # received, but the turn's tokens were already spent, so the
+            # baseline must not wait for that chunk or the next turn's delta
+            # absorbs them. There is no yield between this computation and
+            # the finish-reason yield, so chunk emission order is unchanged.
             input_tokens, output_tokens, total_tokens, cached_tokens = self._usage_totals(usage_data)
+
+            yield self._make_chunk(finish_reason=finish_reason)
 
             usage = SimpleNamespace(
                 prompt_tokens=input_tokens,

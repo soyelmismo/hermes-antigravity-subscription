@@ -357,12 +357,24 @@ class WorkerTurnUsageTests(unittest.TestCase):
                 )
             )
             self.assertEqual((usage1.prompt_tokens, usage1.completion_tokens), (100, 10))
+            # The completed turn advanced the baseline to its cumulative
+            # values. This assertion is what makes the reset check below
+            # meaningful: against a raw-forwarding implementation the
+            # baseline never populates, so "== {}" would pass even when no
+            # reset happens at all.
+            self.assertEqual(
+                client._worker_usage_baseline,
+                {"input_tokens": 100, "output_tokens": 10},
+            )
 
             stream2 = client.chat.completions.create(
                 model=MODEL, messages=MESSAGES_TURN_2, stream=True
             )
             next(stream2)
             stream2.close()
+            # close() -> client._terminate_worker -> _terminate_worker_locked
+            # replaces the baseline dict, so the respawned session starts
+            # clean instead of inheriting the dead session's counters.
             self.assertEqual(client._worker_usage_baseline, {})
 
             # The respawned worker's first turn reports full usage.
@@ -376,6 +388,88 @@ class WorkerTurnUsageTests(unittest.TestCase):
                 )
             )
             self.assertEqual((usage3.prompt_tokens, usage3.completion_tokens), (70, 5))
+
+    def test_stream_abandoned_after_finish_chunk_advances_baseline(self):
+        """Consumers that break at the finish_reason chunk must not lose usage.
+
+        The common OpenAI pattern `for chunk in stream: if finish_reason:
+        break` abandons the stream right at the finish-reason yield and never
+        calls close(): garbage collection finalizes the suspended generator
+        via GeneratorExit, so the trailing usage chunk is never received.
+        The baseline must already hold turn one's cumulative snapshot when
+        that yield happens (advanced inside the generator before emitting
+        the chunk). If it waited for the usage chunk, turn one's tokens would
+        leak into turn two's delta and re-introduce the over-counting these
+        deltas exist to prevent.
+        """
+        client = self._client()
+        proc = _mock_proc(
+            _turn_lines(
+                # Turn one is abandoned immediately after its finish chunk.
+                _turn_events("conv-1", "answer one", CUMULATIVE_TURN_USAGE[0]),
+                _turn_events("conv-1", "answer two", CUMULATIVE_TURN_USAGE[1]),
+            )
+        )
+        turn_one_baseline = {
+            "input_tokens": 12233,
+            "output_tokens": 134,
+            "total_tokens": 12367,
+            "cache_read_tokens": 0,
+        }
+        with patch("subprocess.Popen", return_value=proc):
+            stream = client.chat.completions.create(
+                model=MODEL, messages=MESSAGES_TURN_1, stream=True
+            )
+            stream_generator = stream._generator
+            consumed = []
+            for chunk in stream:
+                consumed.append(chunk)
+                if any(
+                    getattr(choice, "finish_reason", None)
+                    for choice in getattr(chunk, "choices", [])
+                ):
+                    break
+            # The consumer stopped at the finish chunk; the usage chunk that
+            # follows it in the generator was never yielded or received.
+            self.assertEqual(consumed[-1].choices[0].finish_reason, "stop")
+            self.assertIsNone(consumed[-1].usage)
+
+            # The baseline already advanced to turn one's cumulative usage
+            # even though the usage chunk was never consumed.
+            self.assertEqual(client._worker_usage_baseline, turn_one_baseline)
+
+            # Drop the reference WITHOUT close(), as a consumer that moved on
+            # would. Garbage collection later finalizes the suspended
+            # generator by raising GeneratorExit at its finish-reason yield;
+            # while the consuming frame is still on the generator's f_back
+            # chain that cannot happen yet, so the test performs that same
+            # deferred finalization explicitly (note: the *generator's*
+            # close, not the stream's close() -- the latter is the
+            # interrupted/terminate path pinned by the test above).
+            del stream
+            stream_generator.close()
+            # The turn had succeeded, so finalization keeps the worker (and
+            # its advanced baseline) alive instead of terminating it.
+            self.assertIsNotNone(client._worker_proc)
+            self.assertEqual(client._worker_usage_baseline, turn_one_baseline)
+
+            # The next turn deltas against the advanced baseline, instead of
+            # absorbing the abandoned turn's cumulative usage in full.
+            usage2 = _usage_of(
+                list(
+                    client.chat.completions.create(
+                        model=MODEL, messages=MESSAGES_TURN_2, stream=True
+                    )
+                )
+            )
+            self.assertEqual(
+                (usage2.prompt_tokens, usage2.completion_tokens, usage2.total_tokens),
+                EXPECTED_TURN_DELTAS[1],  # (12440, 75, 12515): not (24673, 75, 24882)
+            )
+            self.assertEqual(
+                client._worker_usage_baseline,
+                {"input_tokens": 24673, "output_tokens": 209, "total_tokens": 24882, "cache_read_tokens": 0},
+            )
 
     def test_concurrent_oneshot_fallback_does_not_touch_worker_baseline(self):
         client = self._client()
