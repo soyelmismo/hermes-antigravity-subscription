@@ -1,0 +1,125 @@
+name: Tests
+
+# PR / branch CI. release.yml is tag-only and never runs on branches, so
+# without this workflow a PR could merge code the release gate would reject.
+# This workflow runs the plugin test suite on every pull request and on
+# pushes to main, on Linux and Windows with Python 3.11.
+#
+# Hermes is built from the upstream source at a pinned tag, NOT from PyPI:
+# the PyPI wheel lags (0.19.0) below the plugin's requires_hermes floor
+# (>=0.21.0), so `pip install hermes-agent` would fail the version check.
+# The suite imports `providers` (register_provider, get_provider_profile,
+# ProviderProfile) from that source tree — no mocks, no skips.
+#
+# Windows note: the test invocation is split per OS because PYTHONPATH
+# entries are separated with `:` on POSIX but `;` on Windows
+# (`VAR=value cmd` prefix syntax is bash-only, so Windows uses a pwsh
+# `$env:` assignment instead). The install step is shared via `shell: bash`
+# (git-bash ships on windows-latest runners).
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Upstream Hermes tag whose pyproject version satisfies the plugin's
+  # requires_hermes floor (0.21.4). Keep in sync with release.yml's
+  # HERMES_REF so PRs test against the same source the release gate uses.
+  HERMES_REF: v2026.9.21
+
+jobs:
+  tests:
+    name: tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      # Report both platforms even if one fails; a Windows-only failure
+      # must not hide behind (or hide) the Ubuntu result.
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Fork PRs run untrusted code; the suite makes no git calls, so
+          # the token must not persist in the local git config.
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Guard against HERMES_REF drift with release.yml
+        # Both workflows pin the upstream Hermes tag independently. A bump
+        # applied to only one would silently test (or release) against a
+        # different source than the other gate — fail loudly instead.
+        if: runner.os != 'Windows'
+        run: |
+          set -euo pipefail
+          pin() { grep -E '^[[:space:]]*HERMES_REF:' "$1" | sed -E 's/^[^:]*:[[:space:]]*//'; }
+          TESTS_PIN=$(pin "$GITHUB_WORKSPACE/.github/workflows/tests.yml")
+          RELEASE_PIN=$(pin "$GITHUB_WORKSPACE/.github/workflows/release.yml")
+          if [ "$TESTS_PIN" != "$RELEASE_PIN" ]; then
+            echo "::error::HERMES_REF drift: tests.yml pins '$TESTS_PIN' but release.yml pins '$RELEASE_PIN' — bump both"
+            exit 1
+          fi
+          echo "HERMES_REF in sync: $TESTS_PIN"
+
+      - name: Install Hermes from upstream source at ${{ env.HERMES_REF }}
+        # Not from PyPI: the published wheel (0.19.0) is below the plugin's
+        # requires_hermes floor, so the manifest check would fail even
+        # though the pinned upstream tag satisfies it.
+        # `shell: bash` keeps this step identical on both runners
+        # (windows-latest ships git-bash); only the PYTHONPATH separator
+        # differs, and that is handled in the test steps below.
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          git clone --depth 1 --branch "$HERMES_REF" \
+            https://github.com/NousResearch/hermes-agent.git "$RUNNER_TEMP/hermes-src"
+          pip install -e "$RUNNER_TEMP/hermes-src"
+          # pytest is NOT a dependency of hermes-agent (it lives in the
+          # upstream `dev` extra), so it is installed explicitly, pinned to
+          # the same version the release gate uses.
+          pip install "pytest==9.1.1"
+          # POSIX-only append, mirroring release.yml: on Windows the shell
+          # is git-bash so this line still runs, but the runner resolves
+          # `hermes` from pip's Scripts\hermes.exe, not from $GITHUB_PATH.
+          echo "$RUNNER_TEMP/hermes-src" >> "$GITHUB_PATH"
+          hermes --version
+
+      - name: Run the plugin test suite (POSIX)
+        # PYTHONPATH must include the Hermes tree: the plugin's tests import
+        # `providers` from it, so the suite only runs against Hermes source.
+        if: runner.os != 'Windows'
+        run: |
+          set -euo pipefail
+          PYTHONPATH="$RUNNER_TEMP/hermes-src:$GITHUB_WORKSPACE" \
+            python -m pytest tests/ -q
+
+      - name: Validate the plugin manifest (POSIX)
+        # Mirrors the release gate's other half (release.yml runs validate
+        # before its test step too). Kept on the non-Windows leg only, like
+        # the release gate, which is ubuntu-only.
+        if: runner.os != 'Windows'
+        run: hermes plugins validate "$GITHUB_WORKSPACE"
+
+      - name: Run the plugin test suite (Windows)
+        # Same as above, but pwsh syntax: `VAR=value cmd` prefixes do not
+        # exist in PowerShell, and the entries are `;`-separated because
+        # os.pathsep is `;` on Windows regardless of the shell.
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $env:PYTHONPATH = "$env:RUNNER_TEMP/hermes-src;$env:GITHUB_WORKSPACE"
+          python -m pytest tests/ -q
