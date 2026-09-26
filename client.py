@@ -165,6 +165,10 @@ def _force_rmtree(path: str) -> None:
       exists to prevent. That Windows remnant is accepted on purpose;
       the field shape (agy writes tokens writable, and #4's actual
       conversations/*.db is nlink=1) is swept and removed normally.
+      On macOS, ``setup_isolated_home`` also links the user's real
+      ``~/Library/Keychains`` directory into the isolated HOME
+      (``_link_macos_keychains``, process.py), so the symlink skip
+      protects that keychain data as well.
     * Skipping is also sufficient: unlinking an entry needs write
       permission on its PARENT directory -- which the sweep grants via
       the walk's own directory chmods -- never on the entry's target.

@@ -124,6 +124,8 @@ def _pin_host_dependent_seams(test: unittest.TestCase) -> None:
         patch("client.is_authenticated", return_value=True),
         patch("process.resolve_real_token_path", return_value=None),
         patch("client.resolve_agy_command", return_value="agy"),
+        # like the token/auth seams: isolated homes must not link real keychains
+        patch("process._link_macos_keychains"),
     )
     for patcher in patchers:
         patcher.start()

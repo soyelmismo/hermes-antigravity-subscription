@@ -126,6 +126,22 @@ class KeychainProbeTests(unittest.TestCase):
             ):
                 self.assertIs(is_authenticated(), False)
 
+    def test_single_marker_is_not_a_match(self):
+        # AND semantics (all() over _SECURITY_HIT_MARKERS): stdout carrying
+        # exactly ONE of the two markers is a miss, never a hit. This is the
+        # near-miss a neighbouring keychain item produces -- e.g. gemini-cli's
+        # "antigravity-cli" generic password, which shares our service line and
+        # differs only in the account -- so the probe may not treat one line in
+        # common as "our item is there". Mirrors test_keyring_probe.py's
+        # test_single_attribute_line_is_not_a_match for the Linux side.
+        svce_only = _SECURITY_STDOUT_HIT.replace(b'"acct"<blob>="antigravity"', b'"acct"<blob>="antigravity-cli"')
+        acct_only = _SECURITY_STDOUT_HIT.replace(b'"svce"<blob>="gemini"', b'"svce"<blob>="gemini-cli"')
+        for present, stdout in (("svce-only", svce_only), ("acct-only", acct_only)):
+            with self.subTest(markers=present), _macos(), patch(
+                "process.subprocess.run", return_value=_security_result(stdout)
+            ):
+                self.assertIs(is_authenticated(), False)
+
     def test_spawn_failures_fail_closed(self):
         for error in (FileNotFoundError("security"), subprocess.TimeoutExpired(_EXPECTED_ARGV, 5.0)):
             with self.subTest(error=type(error).__name__), _macos(), patch(
@@ -193,6 +209,25 @@ class IsolatedHomeKeychainTests(unittest.TestCase):
             setup_isolated_home(cwd)
             self.assertFalse(os.path.islink(existing))
             self.assertEqual((existing / "keep").read_text(), "user data")
+
+    def test_a_regular_file_is_never_replaced(self):
+        # Same user-data guarantee for a plain FILE at the link path: the
+        # islink/elif-exists/return ladder in _link_macos_keychains() is the
+        # intentional backstop (a delete-first relink would clobber the
+        # file); the shipped symlink raising FileExistsError there is a
+        # second, silent one, swallowed by contextlib.suppress(OSError). The
+        # test pins the observable guarantee -- file survives, no link --
+        # not either mechanism alone.
+        with contextlib.ExitStack() as stack:
+            home = self._home_with_keychains(stack)
+            cwd = stack.enter_context(tempfile.TemporaryDirectory())
+            existing = Path(cwd) / "home" / "Library" / "Keychains"
+            existing.parent.mkdir(parents=True)
+            existing.write_text("not a keychains dir")
+            stack.enter_context(_macos(home=home))
+            setup_isolated_home(cwd)
+            self.assertFalse(os.path.islink(existing))
+            self.assertEqual(existing.read_text(), "not a keychains dir")
 
     def test_skipped_off_macos_without_keychains_or_with_explicit_config_dir(self):
         with contextlib.ExitStack() as stack:
