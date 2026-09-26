@@ -443,6 +443,86 @@ class AsyncStreamSemanticsTests(_PinnedSeamsMixin, unittest.TestCase):
             with self.assertRaises(StopAsyncIteration):
                 asyncio.run(_await_directly(stream.__anext__()))
 
+    def _assert_executor_threads_gone(self, executor: Any, baseline: int, timeout: float = 1.0) -> None:
+        """No agy-stream thread may outlive the stream's end.
+
+        ``executor._threads`` keeps finished Thread objects around for joining
+        (CPython does not remove them), so liveness plus the process-wide
+        active count are the honest signals here.
+        """
+        deadline = time.monotonic() + timeout
+        live = [t for t in executor._threads if t.is_alive()]
+        while live and time.monotonic() < deadline:
+            time.sleep(0.01)
+            live = [t for t in executor._threads if t.is_alive()]
+        self.assertFalse(live, "an agy-stream thread outlived the stream")
+        deadline = time.monotonic() + timeout
+        while threading.active_count() > baseline and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertEqual(threading.active_count(), baseline)
+
+    def test_exhausted_worker_stream_retires_its_executor(self):
+        # The worker SUCCESS path deliberately does not call close() (the
+        # worker lives on for the next turn), so exhaustion itself must retire
+        # the private async executor -- otherwise its idle thread lingers
+        # until the stream object happens to be collected. __next__'s
+        # StopIteration path does that, for sync and async consumers alike
+        # (__anext__ reaches it through _pull_chunk -> __next__).
+        client = self._client()
+        baseline_threads = threading.active_count()
+        with patch("subprocess.Popen", return_value=_mock_proc(self._turn_lines())):
+            stream = client.chat.completions.create(model=MODEL, messages=MESSAGES, stream=True)
+
+            async def _drain() -> list[str]:
+                contents: list[str] = []
+                async for chunk in stream:
+                    choices = getattr(chunk, "choices", None)
+                    delta = choices[0].delta if choices else None
+                    if delta is not None and delta.content:
+                        contents.append(delta.content)
+                return contents
+
+            contents = asyncio.run(_drain())
+        self.assertEqual(contents, ["answer one"])
+        # Success path keeps the worker alive and the lock released.
+        self.assertIsNotNone(client._worker_proc)
+        self.assertFalse(client._worker_lock.locked())
+        # ...and retires the executor, thread included.
+        executor = stream._async_executor
+        self.assertIsNotNone(executor)
+        self.assertTrue(executor._shutdown)
+        self._assert_executor_threads_gone(executor, baseline_threads)
+        # close() after exhaustion stays idempotent, and the stream is done.
+        stream.close()
+        stream.close()
+        self.assertTrue(executor._shutdown)
+        with self.assertRaises(StopAsyncIteration):
+            asyncio.run(_await_directly(stream.__anext__()))
+
+    def test_sync_exhaustion_creates_no_executor_and_close_stays_idempotent(self):
+        # Sync consumption never creates the private executor (lazy creation
+        # on the first __anext__ only), so exhaustion has nothing to retire:
+        # the pin is that no executor and no extra thread come into existence
+        # at all. close() after exhaustion remains idempotent.
+        client = self._client()
+        with patch("subprocess.Popen", return_value=_mock_proc(self._turn_lines())):
+            stream = client.chat.completions.create(model=MODEL, messages=MESSAGES, stream=True)
+            contents = [
+                chunk.choices[0].delta.content for chunk in stream if chunk.choices
+            ]
+        self.assertIn("answer one", contents)
+        self.assertIsNone(stream._async_executor)
+        # The worker success path still leaves the worker alive and unlocked.
+        self.assertIsNotNone(client._worker_proc)
+        self.assertFalse(client._worker_lock.locked())
+        stream.close()
+        stream.close()
+        self.assertTrue(stream._closed)
+        with self.assertRaises(StopIteration):
+            next(stream)
+        with self.assertRaises(StopAsyncIteration):
+            asyncio.run(_await_directly(stream.__anext__()))
+
     def test_aclosing_context_manager_and_double_aclose(self):
         # aclose() exists for `async with contextlib.aclosing(stream)` and
         # direct-await consumers (Hermes' _close_chunk_stream prefers the

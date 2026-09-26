@@ -164,8 +164,10 @@ class AntigravityStream(Iterator[Any]):
         self._early_error: str | None = None
         self._generator = self._stream_generator()
         # Private single-thread executor for the async path, created lazily on
-        # the first __anext__ (sync consumers never create one, and a closed
-        # reference after close() is what keeps a stale submit loud). See
+        # the first __anext__ (sync consumers never create one, and a retired
+        # reference is what keeps a stale submit loud). Retired -- shutdown
+        # (wait=False, cancel_futures=False) -- by close() OR by exhaustion in
+        # __next__, so no idle thread outlives either end of life. See
         # __anext__ for why this is not the shared default executor.
         self._async_executor: ThreadPoolExecutor | None = None
 
@@ -179,12 +181,40 @@ class AntigravityStream(Iterator[Any]):
             return next(self._generator)
         except StopIteration:
             self._closed = True
+            # Exhaustion is end of life for the stream even when the worker
+            # lives on (the success path deliberately does not close()), so
+            # the private async executor is retired here too; otherwise its
+            # idle thread lingers until the stream object is collected. Covers
+            # sync and async consumption alike, because __anext__ reaches this
+            # point through _pull_chunk -> __next__.
+            self._retire_executor()
             if not self.is_worker:
                 self.close()
             raise
         except Exception:
             self.close()
             raise
+
+    def _retire_executor(self) -> None:
+        """Shut down the private async executor, if the async path created one.
+
+        Called from close() and from the exhaustion path in __next__, so the
+        discipline lives here once and both ends of life behave the same.
+
+        wait=False is mandatory: retirement also runs ON the executor thread
+        (the exhaustion path is reached from _pull_chunk, and the error path
+        from close()), so joining would deadlock on the caller.
+        cancel_futures=False: an in-flight _pull_chunk has already started and
+        cannot be cancelled -- and it does not need to be, because the
+        terminating process makes its readline() return EOF, so the worker
+        thread finishes on its own. The reference is kept (not None'd) so a
+        stale submit after retirement fails loudly instead of silently
+        starting a new executor; __anext__ guards that with its _closed check
+        first.
+        """
+        executor = self._async_executor
+        if executor is not None:
+            executor.shutdown(wait=False, cancel_futures=False)
 
     def __await__(self) -> Any:
         """Allow ``chunks = await create(stream=True)`` on the async wire.
@@ -226,9 +256,9 @@ class AntigravityStream(Iterator[Any]):
         ...)`` user in the host loop for that long is not acceptable.
 
         The closed check comes FIRST, before the executor is touched: after
-        ``close()`` the executor is shut down, and submitting to a dead
-        executor raises RuntimeError -- a closed stream is simply done, so
-        ``StopAsyncIteration`` is the caller-visible outcome.
+        ``close()`` or exhaustion the executor is retired, and submitting to a
+        dead executor raises RuntimeError -- a closed stream is simply done,
+        so ``StopAsyncIteration`` is the caller-visible outcome.
 
         The worker-side stop sentinel from ``_pull_chunk`` is mapped back to
         ``StopAsyncIteration`` so ``async for`` terminates exactly like the
@@ -302,18 +332,10 @@ class AntigravityStream(Iterator[Any]):
                 self.client._active_processes.discard(self.proc)
             self.client._terminate_process(self.proc)
         # Retire the private async executor, if the async path created one.
-        # wait=False is mandatory: close() also runs ON the executor thread
-        # (the __next__ error path reaches it from _pull_chunk), so joining
-        # would deadlock on the caller. cancel_futures=False: an in-flight
-        # _pull_chunk has already started and cannot be cancelled -- and it
-        # does not need to be, because terminating the process above makes
-        # its readline() return EOF, so the worker thread finishes on its
-        # own. The executor reference is kept (not None'd) so a stale submit
-        # after close() fails loudly instead of silently starting a new
-        # executor; __anext__ guards that with its _closed check first.
-        executor = self._async_executor
-        if executor is not None:
-            executor.shutdown(wait=False, cancel_futures=False)
+        # Same discipline as the exhaustion path in __next__ (see
+        # _retire_executor); a second call is a harmless no-op because an
+        # already-shut-down executor accepts shutdown() again.
+        self._retire_executor()
 
     def _make_chunk(
         self,
