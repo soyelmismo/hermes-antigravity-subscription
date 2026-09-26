@@ -143,9 +143,25 @@ class AntigravityStream(Iterator[Any]):
         tools: list[dict[str, Any]] | None = None,
         is_worker: bool = False,
         worker_lock: threading.Lock | None = None,
+        worker_lock_held: bool | None = None,
         messages: list[dict[str, Any]] | None = None,
         usage_baseline: dict[str, int] | None = None,
     ):
+        # Loud pairing, not a defaulted bool (review nit): a future site
+        # passing worker_lock WITHOUT worker_lock_held would silently never
+        # release it -- a permanent _worker_lock leak that degrades every
+        # later turn to the oneshot path with no error anywhere. An
+        # explicit raise (not an assert: `python -O` strips asserts and
+        # would restore the fail-silent default) keeps the pairing from
+        # ever drifting apart again.
+        if (worker_lock is None) != (worker_lock_held is None):
+            raise ValueError(
+                "worker_lock and worker_lock_held must be passed together: "
+                "the stream of a turn that failed to acquire _worker_lock "
+                "must not hold (or release) it, and the stream of a turn "
+                "that acquired it must carry the ownership flag so its "
+                "cleanup can release it."
+            )
         self.proc = proc
         self.client = client
         self.model = model
@@ -154,6 +170,16 @@ class AntigravityStream(Iterator[Any]):
         self.is_worker = is_worker
         self.worker_lock = worker_lock
         self.messages = messages
+        # Ownership record for the worker request lock. threading.Lock is
+        # NOT owner-bound: locked() is true and release() succeeds from any
+        # thread, so a lock()/locked() probe cannot tell "my lock" from
+        # "someone else's". The client sets this True ONLY for the stream
+        # built for the turn whose `_worker_lock.acquire(blocking=False)`
+        # actually succeeded (worker streams of turns that fell back to
+        # oneshot, and oneshot streams, never pass it). Every release goes
+        # through _release_worker_lock_once, which consults this flag
+        # instead of probing state it does not own.
+        self._worker_lock_held: bool = bool(worker_lock_held and worker_lock is not None)
         # Cumulative usage snapshot of the worker session that owns this
         # stream; only worker streams receive one (see client._create_chat_completion).
         self.usage_baseline = usage_baseline
@@ -194,6 +220,30 @@ class AntigravityStream(Iterator[Any]):
         except Exception:
             self.close()
             raise
+
+    def _release_worker_lock_once(self) -> None:
+        """Release the worker request lock exactly once, and only if ours.
+
+        Ownership, not a locked() probe. ``threading.Lock`` is not
+        owner-bound: ``locked()`` reports any holder's state and
+        ``release()`` succeeds from any thread, so the old
+        ``if self.worker_lock.locked(): release()`` probe could not tell
+        "my lock" from "someone else's". A stream that finished normally
+        releases here on its success path (clearing the flag), but if such
+        a stream was abandoned WITHOUT close(), its generator is only
+        finalized later by the cyclic GC -- at an arbitrary moment on an
+        arbitrary thread, long after another turn may have acquired the
+        lock. Probing then would release the LIVE turn's lock underneath
+        its owner, letting a third request acquire it and write to the
+        same worker concurrently: protocol corruption. The flag is set
+        only for the stream of the turn that actually acquired the lock
+        and is cleared on first release, so a finalizer racing its own
+        owner's release (or running after it) is inert.
+        """
+        if self._worker_lock_held:
+            self._worker_lock_held = False
+            with contextlib.suppress(Exception):
+                self.worker_lock.release()
 
     def _retire_executor(self) -> None:
         """Shut down the private async executor, if the async path created one.
@@ -321,12 +371,17 @@ class AntigravityStream(Iterator[Any]):
             return
         self._closed = True
         if self.is_worker:
-            if not self._finished:
+            # Terminate the worker only if it is still OURS. The interrupted
+            # path runs at an arbitrary later time on an arbitrary thread --
+            # close() called by a GC finalizer long after this stream was
+            # abandoned -- and by then client._worker_proc may be a fresh
+            # worker serving a later turn. Killing it would take down a
+            # healthy live request; a stream whose worker was replaced must
+            # leave the current one alone (issue #10 follow-up).
+            if not self._finished and self.proc is self.client._worker_proc:
                 self._interrupted = True
                 self.client._terminate_worker()
-            if self.worker_lock and self.worker_lock.locked():
-                with contextlib.suppress(Exception):
-                    self.worker_lock.release()
+            self._release_worker_lock_once()
         else:
             with self.client._lock:
                 self.client._active_processes.discard(self.proc)
@@ -621,9 +676,7 @@ class AntigravityStream(Iterator[Any]):
             if self.is_worker:
                 if success and not self._interrupted:
                     self.client._update_worker_history(self.messages)
-                    if self.worker_lock and self.worker_lock.locked():
-                        with contextlib.suppress(Exception):
-                            self.worker_lock.release()
+                    self._release_worker_lock_once()
                 else:
                     self.close()
             else:

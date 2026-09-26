@@ -10,9 +10,13 @@ from __future__ import annotations
 import contextlib
 import json
 import logging
+import os
+import shutil
+import stat
 import subprocess
 import tempfile
 import threading
+import time
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -80,6 +84,26 @@ logger = logging.getLogger(__name__)
 
 _DEFAULT_TIMEOUT_SECONDS = 300.0
 
+# Issue #4 (Windows, WinError 32): terminating agy's process tree
+# (taskkill /F /T) is asynchronous, so a child -- or a grandchild -- can
+# still hold conversations/*.db for a short moment after termination
+# returns, and TemporaryDirectory.cleanup() then raises PermissionError.
+# Three quick attempts (0.1s, then 0.25s apart) cover that handle-release
+# window: the worst case adds ~0.35s to a close() that was failing anyway,
+# while the normal case (POSIX, or Windows where the handle is already
+# gone) succeeds on the first attempt and pays none of it. After the last
+# attempt a forced removal drops whatever is still unlocked, so close()
+# never raises and never leaves the workspace behind needlessly.
+#
+# The tuple is the single source of truth for the retry budget: the
+# attempts count is DERIVED from it (one try plus one backoff per retry),
+# so extending the budget can never desynchronize the two -- a longer
+# budget than tuple would index past its end and the IndexError would be
+# swallowed by _remove_temp_dir's outer guard, turning a retry budget
+# into a silent workspace leak.
+_TEMP_DIR_CLEANUP_BACKOFF_SECONDS = (0.1, 0.25)
+_TEMP_DIR_CLEANUP_ATTEMPTS = len(_TEMP_DIR_CLEANUP_BACKOFF_SECONDS) + 1
+
 __all__ = [
     "AGY_MARKER_BASE_URL",
     "AntigravityClient",
@@ -88,6 +112,9 @@ __all__ = [
     "_MODEL_ALIASES",
     "_PROMPT_PREAMBLE",
     "_ROLE_LABELS",
+    "_TEMP_DIR_CLEANUP_ATTEMPTS",
+    "_TEMP_DIR_CLEANUP_BACKOFF_SECONDS",
+    "_force_rmtree",
     "_format_delta_prompt",
     "_format_messages_as_prompt",
     "_kill_process_tree",
@@ -101,6 +128,79 @@ __all__ = [
     "resolve_agy_command",
     "resolve_model_and_effort",
 ]
+
+
+def _force_rmtree(path: str) -> None:
+    """Best-effort forced removal of a workspace; never raises (issue #4).
+
+    ``shutil.rmtree(path, ignore_errors=True)`` alone is WEAKER than the
+    ``tempfile._rmtree`` that ``TemporaryDirectory.cleanup()`` uses:
+    the latter chmod-resets read-only subtrees and retries them, the
+    former silently skips them, which is exactly the residual leak this
+    issue is about (a read-only ``conversations`` tree surviving the
+    forced pass on the Windows shape of the bug). So: forced removal
+    first; if anything survives, grant the owner write (and, for
+    directories, search) permission -- the POSIX analogue of "the handle
+    is gone now, try again" -- and sweep once more.
+
+    The permission sweep deliberately SKIPS links using ``os.lstat`` so
+    nothing is ever followed:
+
+    * ``setup_isolated_home`` links the user's REAL OAuth token into the
+      isolated HOME with ``os.symlink``, ``os.link``, or a ``copy2``
+      fallback (process.py). A surviving token link is precisely the
+      residual-leak shape of #4, and following it would chmod the user's
+      real 0400 token OUTSIDE the workspace to 0600 -- out-of-scope
+      permission widening on user data, on the exact path this issue is
+      about. The residual link is a documented lesser evil. The
+      hardlink case (the ``os.link`` fallback, ``st_nlink > 1``) is
+      skipped for the same reason -- that inode is the user's token.
+      On Windows the skip is deliberate for an additional reason:
+      DeleteFile fails with ACCESS_DENIED on a file carrying
+      FILE_ATTRIBUTE_READONLY, unlike POSIX where unlinking needs only
+      parent-directory write, so a readonly hardlinked file -- and its
+      now-unneeded parent chain -- survives removal THERE. Clearing
+      that attribute would clear it on the shared file record, i.e. on
+      the user's real token: the same out-of-scope widening the skip
+      exists to prevent. That Windows remnant is accepted on purpose;
+      the field shape (agy writes tokens writable, and #4's actual
+      conversations/*.db is nlink=1) is swept and removed normally.
+    * Skipping is also sufficient: unlinking an entry needs write
+      permission on its PARENT directory -- which the sweep grants via
+      the walk's own directory chmods -- never on the entry's target.
+    * ``os.walk`` never follows symlinked directories either
+      (``followlinks=False``), so recursion cannot escape the workspace
+      through a linked directory.
+
+    Both rmtree passes ignore errors and every chmod is individually
+    suppressed, so this function cannot raise.
+    """
+    shutil.rmtree(path, ignore_errors=True)
+    if not os.path.exists(path):
+        return
+    for dirpath, dirnames, filenames in os.walk(path):
+        for name in (*dirnames, *filenames):
+            entry = os.path.join(dirpath, name)
+            with contextlib.suppress(OSError):
+                entry_stat = os.lstat(entry)
+                is_link = stat.S_ISLNK(entry_stat.st_mode)
+                is_dir = stat.S_ISDIR(entry_stat.st_mode)
+                # The hardlink check is scoped to non-directories: an
+                # ordinary directory already has st_nlink >= 2 (itself
+                # plus one link per subdirectory), so skipping every
+                # nlink > 1 entry would skip the whole directory tree --
+                # the sweep would stop working for the read-only-tree
+                # case it exists for. Only a FILE's inode can be shared
+                # with the outside world (the token os.link fallback).
+                if is_link or (not is_dir and entry_stat.st_nlink > 1):
+                    continue
+                os.chmod(
+                    entry,
+                    entry_stat.st_mode
+                    | stat.S_IWUSR
+                    | (stat.S_IXUSR if is_dir else 0),
+                )
+    shutil.rmtree(path, ignore_errors=True)
 
 
 class AntigravityClient:
@@ -158,7 +258,35 @@ class AntigravityClient:
         self.chat = SimpleNamespace(completions=SimpleNamespace(create=self._create_chat_completion))
         self.is_closed = False
         self._active_processes: set[subprocess.Popen] = set()
-        self._lock = threading.Lock()
+        # RLock (NOT a plain Lock) deliberately -- issue #10.
+        #
+        # A suspended AntigravityStream._stream_generator forms a
+        # reference cycle with the stream (stream._generator <-> generator
+        # frame <-> stream), so an ABANDONED stream (consumer stopped
+        # iterating without close()) is reclaimable only by the cyclic
+        # GC. That pass fires at an arbitrary allocation -- possibly on
+        # the SAME thread while it already holds this lock (client.close(),
+        # _get_or_spawn_worker, _create_chat_completion, ...). The
+        # GC-finalized generator's finally block then runs stream.close()
+        # -> client._terminate_worker()/_update_worker_history() ->
+        # `with self._lock` on a thread that already holds it: a plain
+        # Lock self-deadlocks here (deterministic hangs were observed
+        # while developing #9). RLock makes that same-thread re-entrance
+        # succeed; cross-thread mutual exclusion is unchanged.
+        #
+        # Trade-off, documented on purpose: re-entrance can MASK a future
+        # lock-ordering bug that would otherwise deadlock loudly -- a
+        # code path that re-acquires _lock without expecting to already
+        # hold it is now silently allowed instead of hanging. Mutating
+        # shared state under _lock must therefore never call back into
+        # the client (a nested _lock acquisition, a state-dependent
+        # branch, another lock); the region is for flat
+        # acquire -> mutate -> release only. Known, accepted exceptions
+        # inside the regions below are the bounded-but-blocking process
+        # calls (Popen spawn, proc.wait(timeout=2), Windows taskkill
+        # without timeout): they touch no client state, and moving them
+        # out of the locked region would trade the deadlock for races.
+        self._lock = threading.RLock()
         self._worker_proc: subprocess.Popen | None = None
         self._worker_model: str | None = None
         self._worker_effort: str | None = None
@@ -198,6 +326,11 @@ class AntigravityClient:
         self.close()
 
     def close(self) -> None:
+        # Phase 1 -- terminate every child process BEFORE the workspace is
+        # touched (issue #4): on Windows a still-running agy keeps
+        # conversations/*.db open, and taskkill /F /T is asynchronous, so
+        # removing the workspace first would race the OS and fail with
+        # WinError 32. Ordering is therefore load-bearing, not cosmetic.
         with self._lock:
             self.is_closed = True
             self._terminate_worker_locked()
@@ -205,10 +338,89 @@ class AntigravityClient:
             self._active_processes.clear()
         for proc in procs:
             self._terminate_process(proc)
-        if self._temp_dir is not None:
-            with contextlib.suppress(Exception):
-                self._temp_dir.cleanup()
-            self._temp_dir = None
+        # Phase 2 -- remove the private workspace, retrying transient
+        # failures. close() must never raise from cleanup and must never
+        # leave the client half-closed (issue #4).
+        self._remove_temp_dir()
+
+    def _remove_temp_dir(self) -> None:
+        """Remove the private workspace; cannot raise, cannot half-finish.
+
+        Issue #4 (reported on Windows 11, agy 1.2.3): cleanup raised
+        PermissionError [WinError 32] on conversations/*.db because the
+        agy child still held the file after taskkill /F /T returned (that
+        kill is asynchronous). The old code swallowed the error and gave
+        up, leaking the whole workspace. Now: bounded retries with short
+        backoff (see _TEMP_DIR_CLEANUP_ATTEMPTS/_BACKOFF constants above
+        for the sizing), then a forced removal of whatever is unlocked.
+
+        Live Windows verification by the reporter is still pending and
+        will be requested on the issue after this merges; the retry budget
+        is deliberately small so the worst case stays under ~0.5s and the
+        common clean path pays nothing.
+
+        The client is already fully closed when this runs (is_closed set,
+        every process terminated in close() phase 1), and _temp_dir is
+        cleared unconditionally, so a second close() is a no-op and a
+        lingering workspace never blocks a fresh client on the same path.
+        """
+        temp_dir = self._temp_dir
+        if temp_dir is None:
+            return
+        self._temp_dir = None
+        try:
+            self._cleanup_temp_dir_with_retries(temp_dir)
+        except Exception as exc:
+            # Defense in depth: a cleanup path must never break close().
+            # Only the workspace path is logged; the isolated HOME inside
+            # it holds a token link but no secret content of its own, and
+            # the path itself is this client's own private directory.
+            logger.debug(
+                "Antigravity workspace %s cleanup raised unexpectedly: %s",
+                temp_dir.name,
+                exc,
+            )
+
+    def _cleanup_temp_dir_with_retries(self, temp_dir: tempfile.TemporaryDirectory) -> None:
+        """Try cleanup up to _TEMP_DIR_CLEANUP_ATTEMPTS times, then force.
+
+        The loop catches EVERY exception -- not just OSError -- because the
+        goal is that nothing can escape into close(): OSError
+        (PermissionError/WinError 32, EBUSY, ENOTEMPTY -- the "handle
+        still held" symptoms) is retried with backoff, while any other
+        exception breaks out immediately and lands in the forced removal
+        below. Retrying a failed TemporaryDirectory.cleanup() is safe: its
+        finalizer is detached on the first call, so each attempt is a
+        fresh rmtree pass.
+        """
+        for attempt in range(1, _TEMP_DIR_CLEANUP_ATTEMPTS + 1):
+            try:
+                temp_dir.cleanup()
+                return
+            except Exception as exc:
+                retryable = isinstance(exc, OSError) and attempt < _TEMP_DIR_CLEANUP_ATTEMPTS
+                if retryable:
+                    logger.debug(
+                        "Antigravity workspace %s cleanup attempt %d/%d failed (%s); retrying.",
+                        temp_dir.name,
+                        attempt,
+                        _TEMP_DIR_CLEANUP_ATTEMPTS,
+                        exc,
+                    )
+                    time.sleep(_TEMP_DIR_CLEANUP_BACKOFF_SECONDS[attempt - 1])
+                    continue
+                logger.debug(
+                    "Antigravity workspace %s cleanup failed on attempt %d/%d (%s: %s); "
+                    "forcing removal of whatever is unlocked.",
+                    temp_dir.name,
+                    attempt,
+                    _TEMP_DIR_CLEANUP_ATTEMPTS,
+                    type(exc).__name__,
+                    exc,
+                )
+                break
+        if temp_dir.name:
+            _force_rmtree(temp_dir.name)
 
     def _terminate_worker_locked(self) -> None:
         if self._worker_proc is not None:
@@ -399,6 +611,7 @@ class AntigravityClient:
                     tools=tools,
                     is_worker=True,
                     worker_lock=self._worker_lock,
+                    worker_lock_held=worker_acquired,
                     messages=messages_list,
                     usage_baseline=worker_usage_baseline,
                 )
