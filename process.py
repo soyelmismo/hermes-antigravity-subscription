@@ -13,6 +13,14 @@ from typing import Any
 # Marker scheme for Antigravity local provider
 AGY_MARKER_BASE_URL = "agy://local"
 
+# Known OAuth token basenames. agy1.2 renamed the fallback file from
+# antigravity-oauth-token to jetski-standalone-oauth-token (issue #1);
+# both must resolve. Order is legacy-first for backward compatibility:
+# when both files exist in the same directory the legacy name wins, even
+# for agy-1.2 users. If 1.2 is ever observed leaving both files with the
+# new one authoritative, revisit (e.g. mtime-newest).
+_TOKEN_FILENAMES = ("antigravity-oauth-token", "jetski-standalone-oauth-token")
+
 
 def _is_existing_file(path: str | Path) -> bool:
     """True if path is a regular file, treating any OS error as absent.
@@ -108,15 +116,22 @@ def resolve_real_token_path() -> Path | None:
     """
     token_dir = os.getenv("ANTIGRAVITY_CONFIG_DIR", "").strip()
     if token_dir:
-        explicit = Path(token_dir) / "antigravity-oauth-token"
-        return explicit if _is_existing_file(explicit) else None
+        config_path = Path(token_dir)
+        for filename in _TOKEN_FILENAMES:
+            explicit = config_path / filename
+            if _is_existing_file(explicit):
+                return explicit
+        return None
 
-    candidates = [
-        Path.home() / ".gemini" / "antigravity-cli" / "antigravity-oauth-token",
-        # Last resort for containers/sudo contexts where HOME does not point
-        # at the account that ran `agy`.
-        Path("/root/.gemini/antigravity-cli/antigravity-oauth-token"),
-    ]
+    home_base = Path.home() / ".gemini" / "antigravity-cli"
+    root_base = Path("/root/.gemini/antigravity-cli")
+    candidates = [home_base / name for name in _TOKEN_FILENAMES]
+    # Last resort for containers/sudo contexts where HOME does not point
+    # at the account that ran `agy`. All home candidates win over any
+    # /root fallback so a stale /root legacy token never beats the user's
+    # current token. Skip the extra stat when HOME already is /root.
+    if root_base != home_base:
+        candidates += [root_base / name for name in _TOKEN_FILENAMES]
     for candidate in candidates:
         if _is_existing_file(candidate):
             return candidate
@@ -146,7 +161,9 @@ def setup_isolated_home(cwd: Path | str) -> tuple[Path, Path]:
 
     real_token = resolve_real_token_path()
     if real_token and _is_existing_file(real_token):
-        isolated_token = isolated_gemini_dir / "antigravity-oauth-token"
+        # Preserve the selected basename so the agy1.2 filename keeps
+        # working inside the isolated home (zero secret parsing).
+        isolated_token = isolated_gemini_dir / real_token.name
         if not isolated_token.exists():
             try:
                 os.symlink(real_token, isolated_token)

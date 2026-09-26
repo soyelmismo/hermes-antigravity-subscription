@@ -80,8 +80,24 @@ class AntigravityPluginTests(unittest.TestCase):
         self.assertEqual(profile.name, "antigravity-subscription-directsdk")
 
     def test_command_resolution(self):
-        cmd = resolve_agy_command()
-        self.assertTrue(cmd.endswith("agy"))
+        # Deterministic: never touch the host (env/PATH/filesystem). Force
+        # candidate fallback and verify the per-OS executable name. The OS
+        # name is faked only inside the process module (wraps the real os
+        # module) so pathlib's global os.name check keeps working.
+        from process import resolve_agy_command as real_resolve
+        env_clear = {"ANTIGRAVITY_COMMAND": "", "AGY_CLI_PATH": "", "ANTIGRAVITY_CLI_PATH": ""}
+        with patch.dict(os.environ, env_clear, clear=False):
+            with patch("process.shutil.which", return_value=None), patch(
+                "process._is_existing_file", return_value=True
+            ), patch("process.os", wraps=os) as mock_os:
+                mock_os.access = lambda *args, **kwargs: True
+                mock_os.name = "posix"
+                cmd = real_resolve()
+                self.assertTrue(cmd.endswith("agy"))
+                self.assertFalse(cmd.endswith("agy.exe"))
+                mock_os.name = "nt"
+                cmd = real_resolve()
+                self.assertTrue(cmd.endswith("agy.exe"))
 
     def test_auth_check(self):
         # Auth must be determined by the token directory, not by host state.
