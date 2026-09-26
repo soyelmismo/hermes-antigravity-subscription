@@ -7,7 +7,6 @@ import os
 import shutil
 import signal
 import subprocess
-import time
 from pathlib import Path
 from typing import Any
 
@@ -142,11 +141,6 @@ def resolve_real_token_path() -> Path | None:
     return None
 
 
-# is_authenticated() runs on every chat completion and every retry; cache the cmdkey answer briefly.
-_CREDENTIAL_TTL_SECONDS = 30.0
-_credential_cache: tuple[float, bool] | None = None
-
-
 def _windows_credential_present() -> bool:
     """True if agy's Windows Credential Manager entry exists.
 
@@ -154,23 +148,13 @@ def _windows_credential_present() -> bool:
     (target ``gemini:antigravity``) instead of an oauth token file. `cmdkey /list`
     prints only target metadata, never the secret.
     """
-    global _credential_cache
-    now = time.monotonic()
-    if _credential_cache is not None and now - _credential_cache[0] < _CREDENTIAL_TTL_SECONDS:
-        return _credential_cache[1]
     try:
-        # cmdkey prints in the console/OEM code page; replace undecodable bytes instead of raising.
-        out = subprocess.run(
-            ["cmdkey", "/list:gemini:antigravity"], capture_output=True, encoding="utf-8", errors="replace",
-            timeout=3, check=False,
-        )
-    except (OSError, subprocess.SubprocessError):
-        present = False
-    else:
-        # The listed target keeps the casing it was stored with.
-        present = "gemini:antigravity" in (out.stdout or "").lower()
-    _credential_cache = (now, present)
-    return present
+        # Bytes, not text: cmdkey prints in the console/OEM code page, so nothing is decoded.
+        out = subprocess.run(["cmdkey", "/list:gemini:antigravity"], capture_output=True, timeout=3, check=False)
+    except (OSError, subprocess.SubprocessError):  # missing cmdkey, TimeoutExpired
+        return False
+    # Fail closed on a failing cmdkey; the listed target keeps the casing it was stored with.
+    return out.returncode == 0 and b"gemini:antigravity" in (out.stdout or b"").lower()
 
 
 def is_authenticated() -> bool:
