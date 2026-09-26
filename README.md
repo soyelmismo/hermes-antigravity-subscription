@@ -75,6 +75,26 @@ This plugin lets Hermes use Gemini and Claude models through your existing Antig
    hermes --version
    ```
 
+> **Optional — Linux keyring detection.**
+> On Linux with a D-Bus session, `agy` keeps its session in the freedesktop
+> Secret Service instead of a token file (credentials `service`/`gemini` +
+> `username`/`antigravity`, the go-keyring convention). Detection uses
+> `secret-tool`, falling back to `python3` with `secretstorage` when the CLI is
+> absent or cannot answer (missing, spawn failure, timeout or non-zero exit).
+> `secret-tool` prints the credential on its own stdout, so the plugin closes
+> that stream and reads only the attribute lines on stderr; the scripted
+> fallback reads attributes and labels and never asks for the secret. Either way
+> the plugin never receives the stored secret. Installing `secret-tool` is not
+> strictly neutral: the CLI path answers on the exact attribute pair, while the
+> scripted path additionally matches a credential whose go-keyring label embeds
+> "antigravity" — so hosts without the CLI get the slightly more permissive
+> verdict. Headless systems without a D-Bus session keep using the token-file
+> path, so nothing extra is required there.
+> ```bash
+> command -v secret-tool   # optional: faster than the python3 fallback
+> ```
+> Install it with `libsecret-tools` (Debian/Ubuntu) or `libsecret` (Fedora/Arch).
+
 ---
 
 ## Installation
