@@ -731,14 +731,13 @@ class GatingTests(unittest.TestCase):
                 run.assert_not_called()
 
     def test_other_platforms_do_not_probe(self):
-        # darwin has its own keychain probe (tests/test_macos_keychain.py) and
-        # must never reach the Linux Secret Service one either.
-        for platform_name in ("win32",):
-            with self.subTest(platform=platform_name), _no_token_file(platform=platform_name), _probe_env(), patch(
-                "process.subprocess.run", return_value=_secret_tool_result(_SECRET_TOOL_STDERR_HIT)
-            ) as run:
-                self.assertFalse(is_authenticated())
-                run.assert_not_called()
+        # A non-nt win32 host has no probe at all. darwin runs its own keychain
+        # probe instead; test_macos_keychain.py pins that it never reaches this one.
+        with _no_token_file(platform="win32"), _probe_env(), patch(
+            "process.subprocess.run", return_value=_secret_tool_result(_SECRET_TOOL_STDERR_HIT)
+        ) as run:
+            self.assertFalse(is_authenticated())
+            run.assert_not_called()
 
     def test_nt_still_routes_to_cmdkey(self):
         # PR #2's branch must keep serving Windows: sys.platform says "win32"

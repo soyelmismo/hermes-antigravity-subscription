@@ -86,7 +86,19 @@ class KeychainProbeTests(unittest.TestCase):
     def test_keychain_item_authenticates(self):
         with _macos(), patch("process.subprocess.run", return_value=_security_result(_SECURITY_STDOUT_HIT)) as run:
             self.assertIs(is_authenticated(), True)
+            # Exactly one spawn, and it is the security probe: no secret-tool or
+            # interpreter call may precede it.
+            run.assert_called_once()
             self.assertEqual(run.call_args.args[0], _EXPECTED_ARGV)
+
+    def test_darwin_never_reaches_the_linux_probe(self):
+        for returncode, stdout in ((0, _SECURITY_STDOUT_HIT), (44, b"")):
+            with self.subTest(returncode=returncode), _macos(), patch(
+                "process._linux_keyring_present", side_effect=AssertionError("Linux probe ran on darwin")
+            ), patch("process.subprocess.run", return_value=_security_result(stdout, returncode=returncode)) as run:
+                self.assertIs(is_authenticated(), returncode == 0)
+                run.assert_called_once()
+                self.assertEqual(run.call_args.args[0], _EXPECTED_ARGV)
 
     def test_probe_never_asks_for_the_secret(self):
         # -g prints the password to stderr and -w prints it alone to stdout;
