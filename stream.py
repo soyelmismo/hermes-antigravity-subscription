@@ -440,6 +440,47 @@ class AntigravityStream(Iterator[Any]):
         cached_tokens = int(usage_data.get("cache_read_tokens", 0) or 0)
         return input_tokens, output_tokens, total_tokens, cached_tokens
 
+    def _empty_result_message(
+        self,
+        *,
+        saw_result: bool,
+        status: str,
+        process_exit: int | None,
+        has_evidence: bool,
+    ) -> str:
+        """Detail for a turn that ended without proving success.
+
+        One formatter for both branches so the oneshot and worker paths raise
+        the same style of message: Hermes' retry/fallback logic treats these
+        like the other transient ``Antigravity execution failed: ...``
+        failures. ``process_exit`` is ``None`` when the process is still
+        alive (a worker that outlived the broken turn).
+
+        ``has_evidence`` (output already produced this turn) splits the
+        concluded-turn case in two: with output, the status merely failed to
+        be a success one ("unsuccessful"/"unconfirmed result" -- calling
+        that "empty" would misreport a turn whose partial text was already
+        delivered); without output the result genuinely carried nothing
+        ("empty result", the wording the pre-existing tests pin).
+        """
+        if saw_result:
+            if has_evidence:
+                detail = (
+                    f"unsuccessful result (status='{status}')"
+                    if status
+                    else "unconfirmed result (no status reported)"
+                )
+            elif status:
+                detail = f"empty result (status='{status}')"
+            else:
+                detail = "empty result (no status reported)"
+            if process_exit not in (None, 0):
+                detail += f", process exited with return code {process_exit}"
+            return detail
+        if process_exit is None:
+            return "no result event, process still alive"
+        return f"no result event, process exited with return code {process_exit}"
+
     def _stream_generator(self) -> Iterator[Any]:
         deadline = time.monotonic() + self.timeout
         text_buffer = ""
@@ -449,6 +490,11 @@ class AntigravityStream(Iterator[Any]):
         in_tool_call = False
         error_msg = ""
         status = ""
+        # Positive evidence about how the stream ended: did a `result`
+        # event conclude the turn, and did the run abort early because
+        # agy attempted a native tool invocation (security neutralization)?
+        saw_result = False
+        neutralized_tool_step = False
         success = False
         start_time = time.monotonic()
 
@@ -523,6 +569,13 @@ class AntigravityStream(Iterator[Any]):
                             step.get("tool_name"),
                         )
                         self.close()
+                        # Recorded so the post-loop positive-evidence check
+                        # does not treat this security abort as an empty
+                        # failed turn: the process is terminated right here
+                        # on purpose, and the empty completion assembled
+                        # afterwards is the pinned behavior (see
+                        # test_native_tool_step_neutralization_in_stream).
+                        neutralized_tool_step = True
                         break
                     if "usage" in step:
                         usage_data = step["usage"]
@@ -585,10 +638,40 @@ class AntigravityStream(Iterator[Any]):
                         usage_data = res["usage"]
                     if "error" in res:
                         error_msg = res["error"]
-                    success = (status != "ERROR")
+                    saw_result = True
+                    # Fold a response that never streamed as deltas into the
+                    # buffer so the post-loop flush emits it as content.
                     final_resp = res.get("response", "")
                     if final_resp and not has_content and not has_tool_calls and not text_buffer:
                         text_buffer = final_resp
+                    # POSITIVE success evidence only: status SUCCESS *and* an
+                    # answer that actually exists (streamed content, tool
+                    # calls, buffered text, or a response field) *and* no
+                    # error field. Absence of "ERROR" is NOT evidence: a
+                    # persistent worker can emit a result with status
+                    # CANCELLED, "" or an unknown value while carrying no
+                    # response (observed live when agy's pubsub channel was
+                    # killed mid-turn and the worker survived), and such a
+                    # turn must fail the request instead of being recorded as
+                    # an empty answer. Usage presence is deliberately NOT
+                    # evidence: a legitimate turn (especially a worker's
+                    # first) may report no usage at all.
+                    #
+                    # `not error_msg` is evaluated HERE, at the origin of the
+                    # success verdict, and not only at the post-loop
+                    # `if error_msg` raise: a turn that fails on its error
+                    # field must NOT reach the finally's success branch,
+                    # which would append the FAILED turn to the worker
+                    # history (and skip the worker teardown the failure
+                    # deserves). Fail-closed on the field's name alone --
+                    # agy's contract for "error" on a SUCCESS result is
+                    # unverified -- and it mirrors `if error_msg` exactly:
+                    # the same falsy test, no extra validation invented.
+                    success = (
+                        status == "SUCCESS"
+                        and not error_msg
+                        and bool(has_content or has_tool_calls or text_buffer or final_resp)
+                    )
                     break
 
             if text_buffer and not has_tool_calls:
@@ -615,31 +698,148 @@ class AntigravityStream(Iterator[Any]):
                     self.client._terminate_process(self.proc)
 
                 stderr_out = self.proc.stderr.read() if self.proc.stderr else ""
-                returncode = self.proc.poll() or 0
+                # Raw poll(), NOT `poll() or 0`: a process that is still
+                # alive (None) must stay None. The old coercion fabricated
+                # "exited 0" for it, and the empty-result message then named
+                # a return code for a process that had never exited.
+                # _empty_result_message already formats None as "process
+                # still alive"; the guard below uses the same
+                # `not in (None, 0)` test as the worker branch.
+                returncode = self.proc.poll()
 
                 if self._early_error:
                     raise RuntimeError(f"Antigravity model error: {self._early_error}")
 
-                if status == "ERROR":
+                # A result carrying an "error" field fails the turn whatever
+                # its status says (status was not the only failure channel:
+                # agy can report a killed pubsub channel with a non-ERROR
+                # status), and a terminal ERROR status fails it with no field
+                # at all -- the pre-PR `if status == "ERROR"` route, restored
+                # for its user-visible wording (a bare
+                # "Antigravity model error: "). Wording, not routing: that
+                # message and the generic empty-result raise below classify
+                # identically for Hermes (FailoverReason.unknown, retryable,
+                # no fallback), so the user-visible text is what is pinned.
+                # Checked before the quota and exit-code raises below, where
+                # the pre-PR status check sat. Fail-closed on the field's
+                # name alone -- agy's contract for a non-empty "error" on a
+                # SUCCESS result is unverified -- and mirrored in the success
+                # verdict above, so this failed turn can never reach the
+                # worker-history update.
+                if error_msg or status == "ERROR":
                     raise RuntimeError(f"Antigravity model error: {error_msg}")
 
-                if not has_tool_calls and not has_content and returncode != 0:
+                # `not in (None, 0)`, not `!= 0`: with the raw poll() above,
+                # None means "still alive", and an alive process that
+                # produced nothing is the empty-result raise's job below,
+                # not this exit-code one. A real nonzero exit keeps the
+                # quota/exit-code raise's priority over the generic one.
+                if not has_tool_calls and not has_content and returncode not in (None, 0):
                     quota_err = _check_early_quota_error(gemini_dir, min_mtime=start_time)
                     if quota_err:
                         raise RuntimeError(f"Antigravity model error: {quota_err}")
                     err_detail = error_msg or stderr_out.strip() or f"Process exited with return code {returncode}"
                     raise RuntimeError(f"Antigravity execution failed: {err_detail}")
+
+                # Precedence: this positive-evidence raise comes AFTER the
+                # quota and exit-code checks above because those are the more
+                # specific failure signals. The old code fell through here
+                # when returncode == 0 and no result event had been seen,
+                # emitting a finish chunk and Hermes then recorded an empty
+                # assistant turn as a legitimate response.
+                #
+                # Success is now REQUIRED to emit finish/usage, the security
+                # neutralization above being the only exception (pinned by
+                # test_native_tool_step_neutralization_in_stream): a partial
+                # answer with no result event used to slip through on the
+                # strength of its own deltas (saw_result False, has_content
+                # True) and was delivered as a complete stop turn while the
+                # broken worker lived on. No result event is never a
+                # legitimate conclusion, and the deltas already yielded
+                # cannot be retracted -- Hermes aggregates a stream that
+                # raises mid-way, so failing the turn is the only honest
+                # outcome.
+                if not neutralized_tool_step and not success:
+                    raise RuntimeError(
+                        "Antigravity execution failed: "
+                        + self._empty_result_message(
+                            saw_result=saw_result,
+                            status=status,
+                            process_exit=returncode,
+                            has_evidence=has_content or has_tool_calls,
+                        )
+                    )
             else:
                 if self._early_error:
                     raise RuntimeError(f"Antigravity model error: {self._early_error}")
-                if status == "ERROR":
+
+                # A result carrying an "error" field fails the turn whatever
+                # its status says. This is the incident shape: agy's pubsub
+                # channel died mid-turn, the worker survived (poll() None),
+                # and the result event carried neither a response nor an
+                # "ERROR" status. The terminal ERROR status still fails the
+                # turn with no field at all -- the pre-PR
+                # `if status == "ERROR"` route, restored for its user-visible
+                # wording (bare "Antigravity model error: "); wording, not
+                # routing, because both messages classify identically for
+                # Hermes (FailoverReason.unknown, retryable, no fallback).
+                # Either way success is False (the verdict demands SUCCESS),
+                # so this failed turn can never reach the worker-history
+                # update; the deltas already yielded cannot be retracted --
+                # Hermes aggregates a stream that raises mid-way.
+                if error_msg or status == "ERROR":
                     raise RuntimeError(f"Antigravity model error: {error_msg}")
-                if not has_tool_calls and not has_content and self.proc.poll() not in (None, 0):
+
+                worker_exit = self.proc.poll()
+                if not has_tool_calls and not has_content and worker_exit not in (None, 0):
                     quota_err = _check_early_quota_error(gemini_dir, min_mtime=start_time)
                     if quota_err:
                         raise RuntimeError(f"Antigravity model error: {quota_err}")
-                    returncode = self.proc.poll()
-                    raise RuntimeError(f"Antigravity execution failed: worker process exited with return code {returncode}")
+                    raise RuntimeError(f"Antigravity execution failed: worker process exited with return code {worker_exit}")
+
+                # Positive-evidence verdict, placed AFTER the quota and
+                # exit-code checks (the more specific signals) and BEFORE the
+                # usage/baseline finalization below. The old code fell
+                # through here whenever the worker was alive (poll() None) or
+                # had exited 0 with a non-ERROR status, so an empty failed
+                # turn was emitted as a legitimate response AND (success was
+                # True) appended to the worker history.
+                #
+                # Baseline (usage accounting) is deliberately NOT advanced on
+                # this raise path: the turn failed, but agy did spend tokens.
+                # Advancing it here would change no outcome -- the usage
+                # chunk is never yielded on a raised turn, so the spent
+                # tokens reach no consumer either way -- and NOT advancing is
+                # provably safe: the finally below closes this worker
+                # (success is False), and client._terminate_worker_locked /
+                # _get_or_spawn_worker reset _worker_usage_baseline on
+                # termination and on respawn, so the stale snapshot is
+                # discarded together with the dead session instead of
+                # poisoning the respawned worker's deltas. Oneshot streams
+                # carry no baseline at all.
+                #
+                # Success is now REQUIRED to emit finish/usage, the security
+                # neutralization above being the only exception (pinned by
+                # test_native_tool_step_neutralization_in_stream): partial
+                # deltas with no result event used to slip through on the
+                # strength of their own content (saw_result False,
+                # has_content True), sealing the turn as a complete stop AND
+                # leaving the broken worker alive because _finished was
+                # already True when close() ran. No result event is never a
+                # legitimate conclusion, and the deltas already yielded
+                # cannot be retracted -- Hermes aggregates a stream that
+                # raises mid-way -- so the turn fails, and the finally's
+                # close() terminates the worker that broke it.
+                if not neutralized_tool_step and not success:
+                    raise RuntimeError(
+                        "Antigravity execution failed: "
+                        + self._empty_result_message(
+                            saw_result=saw_result,
+                            status=status,
+                            process_exit=worker_exit,
+                            has_evidence=has_content or has_tool_calls,
+                        )
+                    )
 
             finish_reason = "tool_calls" if has_tool_calls else "stop"
 
@@ -669,6 +869,25 @@ class AntigravityStream(Iterator[Any]):
                 usage=usage,
             )
             self._finished = True
+        except Exception:
+            # A turn that already set success=True at its result event can
+            # still fail afterwards: _early_error surfacing in the post-loop
+            # (the watchdog race), a quota/exit-code raise, or _usage_totals
+            # raising. Left as-is, the finally below would take the success
+            # branch for such a turn: appending the FAILED exchange to the
+            # worker history and releasing the worker request lock while the
+            # worker is still alive -- close() only runs afterwards, from
+            # __next__, once the exception propagates. Resetting the verdict
+            # here funnels every failure through close(), which terminates
+            # the worker and only then releases the lock.
+            #
+            # Exception, not BaseException: GeneratorExit (a consumer
+            # abandoning the stream after the finish chunk, or the GC
+            # finalizer) is deliberately NOT reset -- the pinned success
+            # semantics of an abandoned successful stream (worker survives,
+            # history recorded) must survive this handler.
+            success = False
+            raise
         finally:
             watchdog_stop.set()
             if watchdog_thread and watchdog_thread.is_alive():
