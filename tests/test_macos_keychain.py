@@ -69,6 +69,8 @@ def _macos(home=None, config_dir=None):
         if home is None:
             home = stack.enter_context(tempfile.TemporaryDirectory())
         env["HOME"] = str(home)
+        # Path.home() reads USERPROFILE on Windows runners, where darwin is faked.
+        env["USERPROFILE"] = str(home)
         if config_dir is not None:
             env["ANTIGRAVITY_CONFIG_DIR"] = str(config_dir)
         stack.enter_context(patch.dict(os.environ, env, clear=True))

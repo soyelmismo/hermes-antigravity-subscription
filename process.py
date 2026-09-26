@@ -587,7 +587,7 @@ def _link_macos_keychains(isolated_home: Path) -> None:
         return  # a real directory: never replace it
     with contextlib.suppress(OSError):
         isolated_keychains.parent.mkdir(parents=True, exist_ok=True)
-        os.symlink(real_keychains, isolated_keychains)
+        os.symlink(real_keychains, isolated_keychains, target_is_directory=True)
 
 
 def build_child_env(isolated_home: Path | str) -> dict[str, str]:
