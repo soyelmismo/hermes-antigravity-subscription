@@ -694,6 +694,580 @@ class AntigravityPluginTests(unittest.TestCase):
         client.close()
         mock_proc.terminate.assert_called()
 
+    @staticmethod
+    def _scripted_proc(events: list[str], *, alive: bool) -> MagicMock:
+        """Mock agy process replaying scripted stream-json events.
+
+        Host-free: no real subprocess, zero quota state. Mirrors the fakes
+        used by the mock-stream tests above; ``alive=False`` models a process
+        that has already exited 0 (readline returns EOF, poll() == 0).
+        """
+        proc = MagicMock()
+        proc.stdin = MagicMock()
+        proc.stderr = io.StringIO("")
+        proc.poll.return_value = None if alive else 0
+        proc.wait.return_value = 0
+        proc.stdout = io.StringIO("\n".join(events) + "\n")
+        return proc
+
+    @staticmethod
+    @contextlib.contextmanager
+    def _spy_update_worker_history(client: AntigravityClient):
+        """Record whether the success path updated the worker history.
+
+        ``wraps`` keeps the real update in place, so the spy observes the
+        production call without changing behavior.
+        """
+        with patch.object(
+            client, "_update_worker_history", wraps=client._update_worker_history
+        ) as spy:
+            yield spy
+
+    def test_worker_result_with_cancelled_status_is_not_success(self):
+        # Incident shape: agy's pubsub channel was killed mid-turn, the worker
+        # survived (poll() -> None), and the result event carried no response
+        # with a non-ERROR status. The turn must raise instead of emitting
+        # finish_reason="stop" plus an empty response (which Hermes would
+        # record as a legitimate answer), and the failed turn must NOT be
+        # appended to the worker's conversation history.
+        tmp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp_dir.cleanup)
+        client = AntigravityClient(cwd=tmp_dir.name)
+        events = [
+            json.dumps({"event": "init", "conversation_id": "conv-cancelled"}),
+            json.dumps({"event": "result", "result": {"status": "CANCELLED"}}),
+        ]
+        proc = self._scripted_proc(events, alive=True)
+
+        with patch("subprocess.Popen", return_value=proc), \
+                self._spy_update_worker_history(client) as history_spy:
+            stream = client.chat.completions.create(
+                model="gemini-3.8-flash-high",
+                messages=[{"role": "user", "content": "hello"}],
+                stream=True,
+                timeout=30.0,
+            )
+            with self.assertRaises(RuntimeError) as ctx:
+                list(stream)
+
+        self.assertIn("Antigravity execution failed", str(ctx.exception))
+        self.assertIn("status='CANCELLED'", str(ctx.exception))
+        history_spy.assert_not_called()
+        # The failing turn closed (terminated) the worker instead.
+        self.assertIsNone(client._worker_proc)
+        self.assertEqual(client._worker_history, [])
+        proc.terminate.assert_called_once()
+        self.assertFalse(client._worker_lock.locked())
+
+    def test_worker_cancelled_status_with_partial_content_is_not_success(self):
+        # Same incident shape WITH partial output: the pubsub channel died
+        # mid-turn, so 'partial' streamed as deltas and the result arrived
+        # CANCELLED carrying the same partial response. The turn must still
+        # fail -- partial text is not a conclusion, and Hermes cannot unsee
+        # deltas a stream already yielded -- and the message must not call
+        # that output-empty: the status is simply not a success one.
+        tmp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp_dir.cleanup)
+        client = AntigravityClient(cwd=tmp_dir.name)
+        events = [
+            json.dumps({"event": "init", "conversation_id": "conv-cancelled-partial"}),
+            json.dumps({"event": "step_update", "step_update": {"text_delta": "partial"}}),
+            json.dumps({
+                "event": "result",
+                "result": {"status": "CANCELLED", "response": "partial"},
+            }),
+        ]
+        proc = self._scripted_proc(events, alive=True)
+
+        with patch("subprocess.Popen", return_value=proc), \
+                self._spy_update_worker_history(client) as history_spy:
+            stream = client.chat.completions.create(
+                model="gemini-3.8-flash-high",
+                messages=[{"role": "user", "content": "hello"}],
+                stream=True,
+                timeout=30.0,
+            )
+            with self.assertRaises(RuntimeError) as ctx:
+                list(stream)
+
+        self.assertIn("Antigravity execution failed", str(ctx.exception))
+        self.assertIn("unsuccessful result", str(ctx.exception))
+        self.assertIn("status='CANCELLED'", str(ctx.exception))
+        history_spy.assert_not_called()
+        self.assertIsNone(client._worker_proc)
+        self.assertEqual(client._worker_history, [])
+        proc.terminate.assert_called_once()
+        self.assertFalse(client._worker_lock.locked())
+
+    def test_worker_unsuccessful_result_with_partial_content_reports_exit_code(self):
+        # Same partial-output failure with the worker dead: the message must
+        # name the status AND the return code, so an operator can tell "agy
+        # answered, then died" from "agy never answered" at a glance.
+        tmp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp_dir.cleanup)
+        client = AntigravityClient(cwd=tmp_dir.name)
+        events = [
+            json.dumps({"event": "init", "conversation_id": "conv-cancelled-dead"}),
+            json.dumps({"event": "step_update", "step_update": {"text_delta": "partial"}}),
+            json.dumps({
+                "event": "result",
+                "result": {"status": "CANCELLED", "response": "partial"},
+            }),
+        ]
+        proc = self._scripted_proc(events, alive=False)
+        proc.poll.return_value = 7
+
+        with patch("subprocess.Popen", return_value=proc), \
+                self._spy_update_worker_history(client) as history_spy:
+            stream = client.chat.completions.create(
+                model="gemini-3.8-flash-high",
+                messages=[{"role": "user", "content": "hello"}],
+                stream=True,
+                timeout=30.0,
+            )
+            with self.assertRaises(RuntimeError) as ctx:
+                list(stream)
+
+        self.assertIn("Antigravity execution failed", str(ctx.exception))
+        self.assertIn("unsuccessful result", str(ctx.exception))
+        self.assertIn("status='CANCELLED'", str(ctx.exception))
+        self.assertIn("return code 7", str(ctx.exception))
+        history_spy.assert_not_called()
+        self.assertIsNone(client._worker_proc)
+        self.assertEqual(client._worker_history, [])
+        proc.terminate.assert_called_once()
+        self.assertFalse(client._worker_lock.locked())
+
+    def test_worker_result_success_status_without_content_is_not_success(self):
+        # SUCCESS is necessary but not sufficient: a status of SUCCESS with no
+        # response, no streamed content and no usage is still an empty failed
+        # turn and must raise rather than deliver an empty answer.
+        tmp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp_dir.cleanup)
+        client = AntigravityClient(cwd=tmp_dir.name)
+        events = [
+            json.dumps({"event": "init", "conversation_id": "conv-empty-success"}),
+            json.dumps({"event": "result", "result": {"status": "SUCCESS"}}),
+        ]
+        proc = self._scripted_proc(events, alive=True)
+
+        with patch("subprocess.Popen", return_value=proc), \
+                self._spy_update_worker_history(client) as history_spy:
+            stream = client.chat.completions.create(
+                model="gemini-3.8-flash-high",
+                messages=[{"role": "user", "content": "hello"}],
+                stream=True,
+                timeout=30.0,
+            )
+            with self.assertRaises(RuntimeError) as ctx:
+                list(stream)
+
+        self.assertIn("Antigravity execution failed", str(ctx.exception))
+        self.assertIn("empty result", str(ctx.exception))
+        self.assertIn("status='SUCCESS'", str(ctx.exception))
+        history_spy.assert_not_called()
+        self.assertIsNone(client._worker_proc)
+        proc.terminate.assert_called_once()
+        self.assertFalse(client._worker_lock.locked())
+
+    def test_worker_result_error_field_fails_turn_regardless_of_status(self):
+        # A result carrying an "error" field must fail the turn whatever its
+        # status says -- the reported pubsub failure arrived with a
+        # non-ERROR status, so error presence, not status, is the trigger.
+        tmp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp_dir.cleanup)
+        client = AntigravityClient(cwd=tmp_dir.name)
+        events = [
+            json.dumps({"event": "init", "conversation_id": "conv-pubsub"}),
+            json.dumps({
+                "event": "result",
+                "result": {"status": "CANCELLED", "error": "pubsub closed"},
+            }),
+        ]
+        proc = self._scripted_proc(events, alive=True)
+
+        with patch("subprocess.Popen", return_value=proc), \
+                self._spy_update_worker_history(client) as history_spy:
+            stream = client.chat.completions.create(
+                model="gemini-3.8-flash-high",
+                messages=[{"role": "user", "content": "hello"}],
+                stream=True,
+                timeout=30.0,
+            )
+            with self.assertRaises(RuntimeError) as ctx:
+                list(stream)
+
+        self.assertIn("Antigravity model error", str(ctx.exception))
+        self.assertIn("pubsub closed", str(ctx.exception))
+        history_spy.assert_not_called()
+        self.assertIsNone(client._worker_proc)
+        proc.terminate.assert_called_once()
+        self.assertFalse(client._worker_lock.locked())
+
+    def test_worker_success_status_with_error_field_fails_turn(self):
+        # Origin fix for the corruption the error-field raise introduced:
+        # status SUCCESS with a response AND a non-empty error field used to
+        # raise (correctly) while success stayed True, so the finally branch
+        # appended the FAILED turn to the worker history before the worker
+        # was torn down. The error field must invalidate success at the
+        # verdict itself, so a raising turn never reaches the history update.
+        tmp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp_dir.cleanup)
+        client = AntigravityClient(cwd=tmp_dir.name)
+        messages = [{"role": "user", "content": "hello"}]
+        events = [
+            json.dumps({"event": "init", "conversation_id": "conv-success-error"}),
+            json.dumps({"event": "step_update", "step_update": {"text_delta": "partial answer"}}),
+            json.dumps({
+                "event": "result",
+                "result": {
+                    "status": "SUCCESS",
+                    "response": "partial answer",
+                    "error": "pubsub closed",
+                },
+            }),
+        ]
+        proc = self._scripted_proc(events, alive=True)
+
+        with patch("subprocess.Popen", return_value=proc), \
+                self._spy_update_worker_history(client) as history_spy:
+            stream = client.chat.completions.create(
+                model="gemini-3.8-flash-high",
+                messages=messages,
+                stream=True,
+                timeout=30.0,
+            )
+            with self.assertRaises(RuntimeError) as ctx:
+                list(stream)
+
+        self.assertIn("Antigravity model error", str(ctx.exception))
+        self.assertIn("pubsub closed", str(ctx.exception))
+        # The failed turn must not be recorded as a legitimate exchange.
+        history_spy.assert_not_called()
+        self.assertEqual(client._worker_history, [])
+        self.assertIsNone(client._worker_proc)
+        proc.terminate.assert_called_once()
+        self.assertFalse(client._worker_lock.locked())
+
+    def test_worker_eof_without_result_event_is_not_success(self):
+        # The dead-worker guard's blind spot: the worker exited 0, so
+        # poll() == 0 passed `not in (None, 0)` and the empty stream used to
+        # fall through as a successful empty turn.
+        tmp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp_dir.cleanup)
+        client = AntigravityClient(cwd=tmp_dir.name)
+        proc = self._scripted_proc([], alive=False)
+
+        with patch("subprocess.Popen", return_value=proc), \
+                self._spy_update_worker_history(client) as history_spy:
+            stream = client.chat.completions.create(
+                model="gemini-3.8-flash-high",
+                messages=[{"role": "user", "content": "hello"}],
+                stream=True,
+                timeout=30.0,
+            )
+            with self.assertRaises(RuntimeError) as ctx:
+                list(stream)
+
+        self.assertIn("Antigravity execution failed", str(ctx.exception))
+        self.assertIn("no result event", str(ctx.exception))
+        self.assertIn("return code 0", str(ctx.exception))
+        history_spy.assert_not_called()
+        self.assertIsNone(client._worker_proc)
+        proc.terminate.assert_called_once()
+        self.assertFalse(client._worker_lock.locked())
+
+    def test_oneshot_eof_without_result_event_is_not_success(self):
+        # Same blind spot for oneshots: exit code 0 passed
+        # `returncode != 0`, so the empty stream used to be recorded as a
+        # legitimate empty response. The worker lock is held by the test to
+        # force the oneshot path (mirrors test_concurrent_fallback_to_oneshot).
+        tmp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp_dir.cleanup)
+        client = AntigravityClient(cwd=tmp_dir.name)
+        self.assertTrue(client._worker_lock.acquire(blocking=False))
+        proc = self._scripted_proc([], alive=False)
+
+        with patch("subprocess.Popen", return_value=proc):
+            stream = client.chat.completions.create(
+                model="gemini-3.8-flash-high",
+                messages=[{"role": "user", "content": "hello"}],
+                stream=True,
+                timeout=30.0,
+            )
+            with self.assertRaises(RuntimeError) as ctx:
+                list(stream)
+
+        self.assertIn("Antigravity execution failed", str(ctx.exception))
+        self.assertIn("no result event", str(ctx.exception))
+        self.assertIn("return code 0", str(ctx.exception))
+        proc.terminate.assert_called_once()
+        client._worker_lock.release()
+        client.close()
+
+    def test_worker_partial_text_without_result_event_is_not_success(self):
+        # The surviving-worker hazard: 'partial' streamed, the worker never
+        # sent a result event and is still alive, so the read loop only ends
+        # at the deadline (EOF -> poll() None -> sleep, repeatedly). The
+        # partial deltas used to satisfy the old `not (has_content or
+        # has_tool_calls)` escape, so the turn was sealed as
+        # finish_reason="stop" AND the broken worker survived it (_finished
+        # was already True when close() ran). Short timeout keeps the test
+        # fast and deterministic: nothing else can end the loop.
+        tmp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp_dir.cleanup)
+        client = AntigravityClient(cwd=tmp_dir.name)
+        events = [
+            json.dumps({"event": "init", "conversation_id": "conv-partial-no-result"}),
+            json.dumps({"event": "step_update", "step_update": {"text_delta": "partial"}}),
+        ]
+        proc = self._scripted_proc(events, alive=True)
+
+        with patch("subprocess.Popen", return_value=proc), \
+                self._spy_update_worker_history(client) as history_spy:
+            stream = client.chat.completions.create(
+                model="gemini-3.8-flash-high",
+                messages=[{"role": "user", "content": "hello"}],
+                stream=True,
+                timeout=0.1,
+            )
+            chunks = []
+            with self.assertRaises(RuntimeError) as ctx:
+                for chunk in stream:
+                    chunks.append(chunk)
+
+        # The partial text WAS delivered before the raise (Hermes aggregates
+        # a stream that fails mid-way; delivered deltas cannot be retracted).
+        # What must never happen is the finish chunk that would seal the
+        # turn as complete.
+        contents = "".join(
+            c.choices[0].delta.content
+            for c in chunks
+            if c.choices and c.choices[0].delta.content
+        )
+        self.assertEqual(contents, "partial")
+        self.assertEqual(
+            [c for c in chunks if c.choices and c.choices[0].finish_reason],
+            [],
+        )
+        self.assertIn("Antigravity execution failed", str(ctx.exception))
+        self.assertIn("no result event", str(ctx.exception))
+        self.assertIn("process still alive", str(ctx.exception))
+        history_spy.assert_not_called()
+        self.assertIsNone(client._worker_proc)
+        proc.terminate.assert_called_once()
+        self.assertFalse(client._worker_lock.locked())
+
+    def test_oneshot_partial_text_without_result_event_is_not_success(self):
+        # Same hazard on the oneshot path: partial deltas, no result event,
+        # exit code 0. The worker lock is held by the test to force the
+        # oneshot path (mirrors test_oneshot_eof_without_result_event_is_not_success).
+        tmp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp_dir.cleanup)
+        client = AntigravityClient(cwd=tmp_dir.name)
+        self.assertTrue(client._worker_lock.acquire(blocking=False))
+        events = [
+            json.dumps({"event": "init", "conversation_id": "oneshot-partial-no-result"}),
+            json.dumps({"event": "step_update", "step_update": {"text_delta": "partial"}}),
+        ]
+        proc = self._scripted_proc(events, alive=False)
+
+        with patch("subprocess.Popen", return_value=proc):
+            stream = client.chat.completions.create(
+                model="gemini-3.8-flash-high",
+                messages=[{"role": "user", "content": "hello"}],
+                stream=True,
+                timeout=30.0,
+            )
+            chunks = []
+            with self.assertRaises(RuntimeError) as ctx:
+                for chunk in stream:
+                    chunks.append(chunk)
+
+        contents = "".join(
+            c.choices[0].delta.content
+            for c in chunks
+            if c.choices and c.choices[0].delta.content
+        )
+        self.assertEqual(contents, "partial")
+        self.assertEqual(
+            [c for c in chunks if c.choices and c.choices[0].finish_reason],
+            [],
+        )
+        self.assertIn("Antigravity execution failed", str(ctx.exception))
+        self.assertIn("no result event", str(ctx.exception))
+        self.assertIn("return code 0", str(ctx.exception))
+        proc.terminate.assert_called_once()
+        client._worker_lock.release()
+        client.close()
+
+    def test_worker_failure_surfaces_in_non_streaming_mode(self):
+        # stream=False robustness for the same failure: the raise must reach
+        # collect_stream_completion's caller, and the client-side finally
+        # must not double-release the worker lock the stream already
+        # released (an unlocked release() would raise RuntimeError and mask
+        # the real failure).
+        tmp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp_dir.cleanup)
+        client = AntigravityClient(cwd=tmp_dir.name)
+        events = [
+            json.dumps({"event": "init", "conversation_id": "conv-cancelled-nostream"}),
+            json.dumps({"event": "result", "result": {"status": "CANCELLED"}}),
+        ]
+        proc = self._scripted_proc(events, alive=True)
+
+        with patch("subprocess.Popen", return_value=proc), \
+                self._spy_update_worker_history(client) as history_spy:
+            with self.assertRaises(RuntimeError) as ctx:
+                client.chat.completions.create(
+                    model="gemini-3.8-flash-high",
+                    messages=[{"role": "user", "content": "hello"}],
+                    stream=False,
+                    timeout=30.0,
+                )
+
+        self.assertIn("Antigravity execution failed", str(ctx.exception))
+        self.assertIn("status='CANCELLED'", str(ctx.exception))
+        history_spy.assert_not_called()
+        self.assertIsNone(client._worker_proc)
+        proc.terminate.assert_called_once()
+        self.assertFalse(client._worker_lock.locked())
+
+    def test_worker_happy_path_result_success_still_updates_history(self):
+        # Regression guard pinning the positive-evidence contract: status
+        # SUCCESS WITH a response remains a success -- no raise, the worker
+        # survives the turn, and its history is updated for continuation --
+        # so a future tightening of the success check cannot silently turn
+        # every healthy turn into a failure.
+        tmp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp_dir.cleanup)
+        client = AntigravityClient(cwd=tmp_dir.name)
+        messages = [{"role": "user", "content": "hello"}]
+        events = [
+            json.dumps({"event": "init", "conversation_id": "conv-happy"}),
+            json.dumps({
+                "event": "result",
+                "result": {"status": "SUCCESS", "response": "all good", "usage": {}},
+            }),
+        ]
+        proc = self._scripted_proc(events, alive=True)
+
+        with patch("subprocess.Popen", return_value=proc), \
+                self._spy_update_worker_history(client) as history_spy:
+            stream = client.chat.completions.create(
+                model="gemini-3.8-flash-high",
+                messages=messages,
+                stream=True,
+                timeout=30.0,
+            )
+            chunks = list(stream)
+
+        contents = "".join(
+            c.choices[0].delta.content
+            for c in chunks
+            if c.choices and c.choices[0].delta.content
+        )
+        self.assertEqual(contents, "all good")
+        self.assertEqual(
+            [c.choices[0].finish_reason for c in chunks if c.choices and c.choices[0].finish_reason],
+            ["stop"],
+        )
+        history_spy.assert_called_once_with(messages)
+        # The worker survived the successful turn: same process, reusable.
+        self.assertIs(client._worker_proc, proc)
+        self.assertFalse(client._worker_lock.locked())
+        proc.terminate.assert_not_called()
+        # Only client teardown kills it.
+        client.close()
+        proc.terminate.assert_called_once()
+
+    def test_post_result_usage_failure_does_not_record_failed_turn(self):
+        # Post-result race window: success=True is fixed at the result
+        # event, but a failure can still surface afterwards -- here
+        # _usage_totals raising. Without a reset the finally would take the
+        # success branch for this failed turn: appending it to the worker
+        # history and releasing the request lock with the worker still
+        # alive (close() only ran later, from __next__). The failed turn
+        # must instead tear the worker down like any other failure. The
+        # usage patch is installed for the consumption alone.
+        tmp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp_dir.cleanup)
+        client = AntigravityClient(cwd=tmp_dir.name)
+        events = [
+            json.dumps({"event": "init", "conversation_id": "conv-usage-race"}),
+            json.dumps({
+                "event": "result",
+                "result": {"status": "SUCCESS", "response": "ok", "usage": {}},
+            }),
+        ]
+        proc = self._scripted_proc(events, alive=True)
+
+        with patch("subprocess.Popen", return_value=proc), \
+                self._spy_update_worker_history(client) as history_spy:
+            stream = client.chat.completions.create(
+                model="gemini-3.8-flash-high",
+                messages=[{"role": "user", "content": "hello"}],
+                stream=True,
+                timeout=30.0,
+            )
+            with self.assertRaises(RuntimeError) as ctx:
+                with patch.object(
+                    AntigravityStream,
+                    "_usage_totals",
+                    side_effect=RuntimeError("synthetic usage failure"),
+                ):
+                    list(stream)
+
+        self.assertIn("synthetic usage failure", str(ctx.exception))
+        history_spy.assert_not_called()
+        self.assertEqual(client._worker_history, [])
+        self.assertIsNone(client._worker_proc)
+        proc.terminate.assert_called_once()
+        self.assertFalse(client._worker_lock.locked())
+
+    def test_early_error_after_result_does_not_record_failed_turn(self):
+        # Same race window through _early_error: the watchdog can flag a
+        # quota failure after the result event was already parsed (success
+        # True), and the post-loop check then raises for a turn the success
+        # branch would have recorded. Deterministic without sleeps: the
+        # result is consumed (first next() parses it and flushes the folded
+        # response), then the flag is set on the stream before the generator
+        # resumes into the post-loop checks.
+        tmp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp_dir.cleanup)
+        client = AntigravityClient(cwd=tmp_dir.name)
+        events = [
+            json.dumps({"event": "init", "conversation_id": "conv-early-race"}),
+            json.dumps({
+                "event": "result",
+                "result": {"status": "SUCCESS", "response": "ok", "usage": {}},
+            }),
+        ]
+        proc = self._scripted_proc(events, alive=True)
+
+        with patch("subprocess.Popen", return_value=proc), \
+                self._spy_update_worker_history(client) as history_spy:
+            stream = client.chat.completions.create(
+                model="gemini-3.8-flash-high",
+                messages=[{"role": "user", "content": "hello"}],
+                stream=True,
+                timeout=30.0,
+            )
+            first_chunk = next(stream)
+            self.assertEqual(first_chunk.choices[0].delta.content, "ok")
+            stream._early_error = "synthetic early quota error after result"
+            with self.assertRaises(RuntimeError) as ctx:
+                for _ in stream:
+                    pass
+
+        self.assertIn("Antigravity model error", str(ctx.exception))
+        self.assertIn("synthetic early quota error", str(ctx.exception))
+        history_spy.assert_not_called()
+        self.assertEqual(client._worker_history, [])
+        self.assertIsNone(client._worker_proc)
+        proc.terminate.assert_called_once()
+        self.assertFalse(client._worker_lock.locked())
+
     def test_concurrent_fallback_to_oneshot(self):
         # TemporaryDirectory (not /tmp): on Windows "/tmp" resolves to a
         # drive-rooted \tmp with no guaranteed write access, and an
