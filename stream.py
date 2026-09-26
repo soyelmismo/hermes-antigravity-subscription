@@ -698,7 +698,14 @@ class AntigravityStream(Iterator[Any]):
                     self.client._terminate_process(self.proc)
 
                 stderr_out = self.proc.stderr.read() if self.proc.stderr else ""
-                returncode = self.proc.poll() or 0
+                # Raw poll(), NOT `poll() or 0`: a process that is still
+                # alive (None) must stay None. The old coercion fabricated
+                # "exited 0" for it, and the empty-result message then named
+                # a return code for a process that had never exited.
+                # _empty_result_message already formats None as "process
+                # still alive"; the guard below uses the same
+                # `not in (None, 0)` test as the worker branch.
+                returncode = self.proc.poll()
 
                 if self._early_error:
                     raise RuntimeError(f"Antigravity model error: {self._early_error}")
@@ -706,18 +713,28 @@ class AntigravityStream(Iterator[Any]):
                 # A result carrying an "error" field fails the turn whatever
                 # its status says (status was not the only failure channel:
                 # agy can report a killed pubsub channel with a non-ERROR
-                # status). This is more specific than the generic
-                # empty-result raise below, so it is checked first.
-                # Fail-closed on the field's name alone -- agy's contract for
-                # a non-empty "error" on a SUCCESS result is unverified --
-                # and mirrored in the success verdict above, so this failed
-                # turn can never reach the worker-history update. Deltas
-                # already yielded cannot be retracted; Hermes aggregates a
-                # stream that raises mid-way.
-                if error_msg:
+                # status), and a terminal ERROR status fails it with no field
+                # at all -- the pre-PR `if status == "ERROR"` route, restored
+                # for its user-visible wording (a bare
+                # "Antigravity model error: "). Wording, not routing: that
+                # message and the generic empty-result raise below classify
+                # identically for Hermes (FailoverReason.unknown, retryable,
+                # no fallback), so the user-visible text is what is pinned.
+                # Checked before the quota and exit-code raises below, where
+                # the pre-PR status check sat. Fail-closed on the field's
+                # name alone -- agy's contract for a non-empty "error" on a
+                # SUCCESS result is unverified -- and mirrored in the success
+                # verdict above, so this failed turn can never reach the
+                # worker-history update.
+                if error_msg or status == "ERROR":
                     raise RuntimeError(f"Antigravity model error: {error_msg}")
 
-                if not has_tool_calls and not has_content and returncode != 0:
+                # `not in (None, 0)`, not `!= 0`: with the raw poll() above,
+                # None means "still alive", and an alive process that
+                # produced nothing is the empty-result raise's job below,
+                # not this exit-code one. A real nonzero exit keeps the
+                # quota/exit-code raise's priority over the generic one.
+                if not has_tool_calls and not has_content and returncode not in (None, 0):
                     quota_err = _check_early_quota_error(gemini_dir, min_mtime=start_time)
                     if quota_err:
                         raise RuntimeError(f"Antigravity model error: {quota_err}")
@@ -760,13 +777,17 @@ class AntigravityStream(Iterator[Any]):
                 # its status says. This is the incident shape: agy's pubsub
                 # channel died mid-turn, the worker survived (poll() None),
                 # and the result event carried neither a response nor an
-                # "ERROR" status. Fail-closed on the field's name alone --
-                # agy's contract for a non-empty "error" on a SUCCESS result
-                # is unverified -- and mirrored in the success verdict above,
+                # "ERROR" status. The terminal ERROR status still fails the
+                # turn with no field at all -- the pre-PR
+                # `if status == "ERROR"` route, restored for its user-visible
+                # wording (bare "Antigravity model error: "); wording, not
+                # routing, because both messages classify identically for
+                # Hermes (FailoverReason.unknown, retryable, no fallback).
+                # Either way success is False (the verdict demands SUCCESS),
                 # so this failed turn can never reach the worker-history
-                # update. Deltas already yielded cannot be retracted; Hermes
-                # aggregates a stream that raises mid-way.
-                if error_msg:
+                # update; the deltas already yielded cannot be retracted --
+                # Hermes aggregates a stream that raises mid-way.
+                if error_msg or status == "ERROR":
                     raise RuntimeError(f"Antigravity model error: {error_msg}")
 
                 worker_exit = self.proc.poll()
