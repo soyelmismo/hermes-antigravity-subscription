@@ -9,7 +9,7 @@ import subprocess
 import threading
 import time
 from types import SimpleNamespace
-from typing import Any, Iterator
+from typing import Any, Iterator, NamedTuple
 
 try:
     from .process import _check_early_quota_error
@@ -19,6 +19,79 @@ except ImportError:
     from prompt import _longest_tool_call_prefix_match, _parse_tool_block
 
 logger = logging.getLogger(__name__)
+
+
+class _UsageDeltas(NamedTuple):
+    """Per-turn usage derived from cumulative worker-session counters."""
+
+    input_tokens: int
+    output_tokens: int
+    total_tokens: int
+    cache_read_tokens: int
+
+
+def _counter_delta(usage_data: dict[str, Any], baseline: dict[str, int], field: str) -> int:
+    """Per-turn delta of one cumulative usage counter reported by a worker.
+
+    agy 1.2.10+ persistent workers report cumulative session usage, so each
+    turn must subtract the snapshot captured after the previous turn. The
+    baseline is updated in place with the latest snapshot. A missing field
+    contributes 0 and leaves the baseline untouched, so an omitted optional
+    field never resets unrelated counters. A value below the baseline means
+    the CLI restarted its counters for this session: the current value is
+    already this turn's usage and becomes the new baseline.
+
+    Known limitations of the remaining handling (kept on purpose; no code
+    change, no better signal exists in the delta alone):
+
+    * A value below the baseline is a SUFFICIENT but not a definitive restart
+      detector. A CLI restart whose counter already reports >= the old
+      baseline reads as a small positive delta: the pre-restart usage is
+      attributed to that (in fact empty) turn instead of restarting the
+      accounting.
+    * A counter first reported mid-session (no previous snapshot, e.g.
+      cache_read_tokens appearing only once the prompt cache warms) is
+      attributed in full to the current turn. How that session-to-date value
+      splits across earlier turns is unknowable, so this turn over-reports.
+    """
+    if field not in usage_data:
+        return 0
+    value = int(usage_data[field] or 0)
+    previous = baseline.get(field)
+    if previous is None or value < previous:
+        baseline[field] = value
+        return value
+    delta = value - previous
+    baseline[field] = value
+    return delta
+
+
+def _delta_worker_usage(usage_data: dict[str, Any], baseline: dict[str, int]) -> _UsageDeltas:
+    """Convert cumulative worker-session usage into per-turn deltas.
+
+    The baseline dict belongs to the worker session that produced this usage
+    and is updated in place. Callers must hand in the baseline captured when
+    the worker stream was created, so a stream left over from a terminated
+    session can never corrupt the baseline of the session that replaced it.
+
+    total_tokens is expected to be stably present or absent for a session. If
+    it flaps (present -> absent -> present), the absent turn falls back to
+    input+output without advancing the total_tokens snapshot, so the next
+    present turn's total delta spans two turns.
+    """
+    input_delta = _counter_delta(usage_data, baseline, "input_tokens")
+    output_delta = _counter_delta(usage_data, baseline, "output_tokens")
+    if "total_tokens" in usage_data:
+        total_delta = _counter_delta(usage_data, baseline, "total_tokens")
+    else:
+        # total_tokens is optional: fall back to the per-turn input+output.
+        total_delta = input_delta + output_delta
+    return _UsageDeltas(
+        input_tokens=input_delta,
+        output_tokens=output_delta,
+        total_tokens=total_delta,
+        cache_read_tokens=_counter_delta(usage_data, baseline, "cache_read_tokens"),
+    )
 
 
 class AntigravityStream(Iterator[Any]):
@@ -37,6 +110,7 @@ class AntigravityStream(Iterator[Any]):
         is_worker: bool = False,
         worker_lock: threading.Lock | None = None,
         messages: list[dict[str, Any]] | None = None,
+        usage_baseline: dict[str, int] | None = None,
     ):
         self.proc = proc
         self.client = client
@@ -46,6 +120,9 @@ class AntigravityStream(Iterator[Any]):
         self.is_worker = is_worker
         self.worker_lock = worker_lock
         self.messages = messages
+        # Cumulative usage snapshot of the worker session that owns this
+        # stream; only worker streams receive one (see client._create_chat_completion).
+        self.usage_baseline = usage_baseline
         self.conversation_id = ""
         self._closed = False
         self._interrupted = False
@@ -111,6 +188,28 @@ class AntigravityStream(Iterator[Any]):
             model=self.model,
             usage=None,
         )
+
+    def _usage_totals(self, usage_data: dict[str, Any]) -> tuple[int, int, int, int]:
+        """(input, output, total, cached) token counts for the usage chunk.
+
+        Persistent worker sessions report cumulative usage, so worker streams
+        forward per-turn deltas against their session baseline. Oneshot
+        processes already report per-turn usage and are forwarded raw; they
+        never touch the worker baseline.
+        """
+        if self.is_worker and self.usage_baseline is not None:
+            deltas = _delta_worker_usage(usage_data, self.usage_baseline)
+            return (
+                deltas.input_tokens,
+                deltas.output_tokens,
+                deltas.total_tokens,
+                deltas.cache_read_tokens,
+            )
+        input_tokens = int(usage_data.get("input_tokens", 0) or 0)
+        output_tokens = int(usage_data.get("output_tokens", 0) or 0)
+        total_tokens = int(usage_data.get("total_tokens", input_tokens + output_tokens) or 0)
+        cached_tokens = int(usage_data.get("cache_read_tokens", 0) or 0)
+        return input_tokens, output_tokens, total_tokens, cached_tokens
 
     def _stream_generator(self) -> Iterator[Any]:
         deadline = time.monotonic() + self.timeout
@@ -314,12 +413,19 @@ class AntigravityStream(Iterator[Any]):
                     raise RuntimeError(f"Antigravity execution failed: worker process exited with return code {returncode}")
 
             finish_reason = "tool_calls" if has_tool_calls else "stop"
-            yield self._make_chunk(finish_reason=finish_reason)
 
-            input_tokens = int(usage_data.get("input_tokens", 0) or 0)
-            output_tokens = int(usage_data.get("output_tokens", 0) or 0)
-            total_tokens = int(usage_data.get("total_tokens", input_tokens + output_tokens) or 0)
-            cached_tokens = int(usage_data.get("cache_read_tokens", 0) or 0)
+            # Resolve usage (advancing the cumulative worker baseline) BEFORE
+            # emitting the finish-reason chunk. The common client pattern
+            # `for chunk in stream: if finish_reason: break` abandons the
+            # stream right here without calling close(), finalizing this
+            # generator at this yield: the usage chunk below is then never
+            # received, but the turn's tokens were already spent, so the
+            # baseline must not wait for that chunk or the next turn's delta
+            # absorbs them. There is no yield between this computation and
+            # the finish-reason yield, so chunk emission order is unchanged.
+            input_tokens, output_tokens, total_tokens, cached_tokens = self._usage_totals(usage_data)
+
+            yield self._make_chunk(finish_reason=finish_reason)
 
             usage = SimpleNamespace(
                 prompt_tokens=input_tokens,

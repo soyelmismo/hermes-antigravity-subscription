@@ -142,6 +142,14 @@ class AntigravityClient:
         self._worker_model: str | None = None
         self._worker_effort: str | None = None
         self._worker_history: list[dict[str, Any]] = []
+        # Cumulative usage snapshot of the current worker session. agy 1.2.10+
+        # persistent workers report cumulative session usage, so per-turn
+        # deltas need this baseline. The reference is replaced on every spawn
+        # and termination; the dict contents are advanced in place by the
+        # owning session's stream. Each stream captures the dict of the
+        # session it was created for, so a stream left over from a terminated
+        # session cannot corrupt a later session's baseline.
+        self._worker_usage_baseline: dict[str, int] = {}
         self._worker_lock = threading.Lock()
 
     @staticmethod
@@ -190,6 +198,9 @@ class AntigravityClient:
             self._worker_history = []
             self._active_processes.discard(proc)
             self._terminate_process(proc)
+        # The session is gone: any later usage from it belongs to a dead
+        # session, and the next spawn must start from a clean baseline.
+        self._worker_usage_baseline = {}
 
     def _terminate_worker(self) -> None:
         with self._lock:
@@ -234,6 +245,7 @@ class AntigravityClient:
             self._worker_model = model
             self._worker_effort = effort
             self._worker_history = []
+            self._worker_usage_baseline = {}
             self._active_processes.add(proc)
             return proc
 
@@ -356,6 +368,8 @@ class AntigravityClient:
                     proc.stdin.write(json.dumps(event_msg) + "\n")
                     proc.stdin.flush()
 
+                with self._lock:
+                    worker_usage_baseline = self._worker_usage_baseline
                 stream_iter = AntigravityStream(
                     proc=proc,
                     client=self,
@@ -365,6 +379,7 @@ class AntigravityClient:
                     is_worker=True,
                     worker_lock=self._worker_lock,
                     messages=messages_list,
+                    usage_baseline=worker_usage_baseline,
                 )
                 if stream:
                     return stream_iter
