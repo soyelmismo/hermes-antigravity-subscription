@@ -183,7 +183,7 @@ jobs:
           TAG_SHA: ${{ needs.check-tag.outputs.tag_sha }}
         run: |
           set -euo pipefail
-          PREV=$(git describe --tags --abbrev=0 --match 'v[0-9]+.[0-9]+.[0-9]+' \
+          PREV=$(git describe --tags --abbrev=0 --match 'v[0-9]*' \
             "${TAG}^{commit}^" 2>/dev/null || true)
           {
             echo "## What changed"
