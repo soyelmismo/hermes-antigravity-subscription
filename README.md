@@ -95,6 +95,16 @@ This plugin lets Hermes use Gemini and Claude models through your existing Antig
 > ```
 > Install it with `libsecret-tools` (Debian/Ubuntu) or `libsecret` (Fedora/Arch).
 
+> **macOS keychain.** On macOS `agy` keeps its session in the login keychain
+> (a generic password with service `gemini` and account `antigravity`).
+> Detection runs `/usr/bin/security find-generic-password` without `-g` or
+> `-w`, which prints only the item's attributes, so the plugin never receives
+> the secret and no keychain prompt appears. The keychain is found through
+> `$HOME/Library/Keychains`, so the plugin links that directory into the
+> isolated HOME it gives `agy`; otherwise the child `agy` would ask you to log
+> in again. Nothing extra is required. Setting `ANTIGRAVITY_CONFIG_DIR` turns
+> both off and keeps the token-file path.
+
 ---
 
 ## Installation

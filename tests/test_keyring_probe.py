@@ -731,7 +731,9 @@ class GatingTests(unittest.TestCase):
                 run.assert_not_called()
 
     def test_other_platforms_do_not_probe(self):
-        for platform_name in ("darwin", "win32"):
+        # darwin has its own keychain probe (tests/test_macos_keychain.py) and
+        # must never reach the Linux Secret Service one either.
+        for platform_name in ("win32",):
             with self.subTest(platform=platform_name), _no_token_file(platform=platform_name), _probe_env(), patch(
                 "process.subprocess.run", return_value=_secret_tool_result(_SECRET_TOOL_STDERR_HIT)
             ) as run:

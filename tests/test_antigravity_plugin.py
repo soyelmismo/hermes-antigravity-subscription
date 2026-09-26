@@ -47,19 +47,24 @@ _pkg_spec.loader.exec_module(_pkg)
 
 class AntigravityPluginTests(unittest.TestCase):
     def setUp(self):
-        # The suite must not depend on host state. Two host facts leak in
+        # The suite must not depend on host state. Three host facts leak in
         # otherwise: a real ~/.gemini auth token (present on a dev box, absent
-        # on CI) and the resolved agy binary, whose candidate scan stats
-        # paths under another account's home. Pin both for every test.
+        # on CI), the resolved agy binary, whose candidate scan stats paths
+        # under another account's home, and on macOS the tester's real
+        # ~/Library/Keychains, which setup_isolated_home() would link into the
+        # throwaway home. Pin all three for every test.
         patcher_auth = patch("client.is_authenticated", return_value=True)
         patcher_token = patch("client.resolve_real_token_path", return_value=None)
         patcher_cmd = patch("client.resolve_agy_command", return_value="agy")
+        patcher_keychains = patch("process._link_macos_keychains")
         patcher_auth.start()
         patcher_token.start()
         patcher_cmd.start()
+        patcher_keychains.start()
         self.addCleanup(patcher_auth.stop)
         self.addCleanup(patcher_token.stop)
         self.addCleanup(patcher_cmd.stop)
+        self.addCleanup(patcher_keychains.stop)
 
     @staticmethod
     def _write_token(tmp_dir: str) -> Path:
