@@ -1,3 +1,4 @@
+import contextlib
 import io
 import json
 import os
@@ -154,6 +155,64 @@ class AntigravityPluginTests(unittest.TestCase):
             self._write_token(tmp)
             with patch.dict(os.environ, {"ANTIGRAVITY_CONFIG_DIR": tmp}, clear=False):
                 self.assertTrue(is_authenticated())
+
+    def _windows_without_token_file(self, home):
+        # Windows, no token file and no ANTIGRAVITY_CONFIG_DIR. The OS name
+        # is faked only inside the process module (wraps the real os module)
+        # so pathlib's global os.name check keeps working.
+        env = {k: v for k, v in os.environ.items() if k != "ANTIGRAVITY_CONFIG_DIR"}
+
+        @contextlib.contextmanager
+        def fake_nt():
+            with patch("process.os", wraps=os) as mock_os:
+                mock_os.name = "nt"
+                yield
+
+        return (patch.dict(os.environ, env, clear=True), patch("process.Path.home", return_value=Path(home)),
+                patch("process._is_existing_file", return_value=False), fake_nt())
+
+    def test_auth_check_windows_credential_manager(self):
+        # agy on Windows keeps its session in the Credential Manager, not in a
+        # token file. Only the entry's presence is checked; the secret is never read.
+        listed = SimpleNamespace(stdout=b"    Target: LegacyGeneric:target=gemini:antigravity\r\n", returncode=0)
+        cases = [
+            (listed, True),
+            (SimpleNamespace(stdout=b"Target: LegacyGeneric:target=Gemini:Antigravity\r\n", returncode=0), True),
+            # Bytes undefined in cp1252 around the target: no decoding happens, so nothing can raise.
+            (SimpleNamespace(stdout=b"User: \x81\x8d\x90\r\n Target: gemini:antigravity\r\n", returncode=0), True),
+            (SimpleNamespace(stdout=b"* NONE *\r\n", returncode=0), False),
+            # A failing cmdkey can echo the requested target in its diagnostics: fail closed.
+            (SimpleNamespace(stdout=b"gemini:antigravity: element not found\r\n", returncode=1), False),
+            (subprocess.TimeoutExpired(["cmdkey"], 3), False),
+            (FileNotFoundError(), False),
+        ]
+        for result, expected in cases:
+            with self.subTest(result=result), tempfile.TemporaryDirectory() as home, \
+                    contextlib.ExitStack() as stack:
+                for ctx in self._windows_without_token_file(home):
+                    stack.enter_context(ctx)
+                kwargs = {"side_effect": result} if isinstance(result, Exception) else {"return_value": result}
+                with patch("process.subprocess.run", **kwargs) as run:
+                    self.assertIs(is_authenticated(), expected)
+                    self.assertEqual(run.call_args.args[0], ["cmdkey", "/list:gemini:antigravity"])
+                    call = run.call_args.kwargs
+                    # Output is captured as bytes: no text mode, no encoding to get wrong.
+                    self.assertFalse(call.get("text") or call.get("encoding") or call.get("universal_newlines"))
+                    self.assertLessEqual(call.get("timeout"), 3)
+
+    def test_auth_check_explicit_dir_wins_over_windows_credential(self):
+        # ANTIGRAVITY_CONFIG_DIR is an override: an empty explicit dir stays
+        # unauthenticated even when the Credential Manager has an entry.
+        listed = SimpleNamespace(stdout=b"Target: LegacyGeneric:target=gemini:antigravity\r\n", returncode=0)
+        with tempfile.TemporaryDirectory() as tmp:
+            # The OS name is faked only inside the process module (wraps the
+            # real os module) so pathlib's global os.name check keeps working.
+            with patch.dict(os.environ, {"ANTIGRAVITY_CONFIG_DIR": tmp}, clear=False), \
+                    patch("process.os", wraps=os) as mock_os, \
+                    patch("process.subprocess.run", return_value=listed) as run:
+                mock_os.name = "nt"
+                self.assertFalse(is_authenticated())
+                run.assert_not_called()
 
     def test_format_messages_prompt(self):
         messages = [
