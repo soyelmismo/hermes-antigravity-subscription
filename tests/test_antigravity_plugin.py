@@ -186,7 +186,12 @@ class AntigravityPluginTests(unittest.TestCase):
         self.assertIn("Continue the conversation from the latest tool result.", d_prompt2)
 
     def test_mock_stream_tool_call_suppresses_trailing_hallucination(self):
-        client = AntigravityClient(cwd="/tmp")
+        # TemporaryDirectory (not /tmp): on Windows "/tmp" resolves to a
+        # drive-rooted \tmp with no guaranteed write access, and an
+        # explicit cwd is never cleaned by close() — addCleanup removes it.
+        tmp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp_dir.cleanup)
+        client = AntigravityClient(cwd=tmp_dir.name)
         tool_call_obj = {"id": "call_stream_1", "type": "function", "function": {"name": "stream_tool", "arguments": json.dumps({"q": 42})}}
         fake_events = [
             json.dumps({"event": "init", "conversation_id": "stream-tool-hallucination"}),
@@ -235,7 +240,12 @@ class AntigravityPluginTests(unittest.TestCase):
             self.assertEqual(len(content_chunks), 0)
 
     def test_create_client_and_mock_turn(self):
-        client = AntigravityClient(cwd="/tmp")
+        # TemporaryDirectory (not /tmp): on Windows "/tmp" resolves to a
+        # drive-rooted \tmp with no guaranteed write access, and an
+        # explicit cwd is never cleaned by close() — addCleanup removes it.
+        tmp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp_dir.cleanup)
+        client = AntigravityClient(cwd=tmp_dir.name)
         fake_events = [
             json.dumps({"event": "init", "conversation_id": "test-conv-1"}),
             json.dumps({"event": "step_update", "step_update": {"text_delta": "Hello from mock"}}),
@@ -271,7 +281,12 @@ class AntigravityPluginTests(unittest.TestCase):
             self.assertEqual(res.usage.total_tokens, 110)
 
     def test_mock_tool_call_turn(self):
-        client = AntigravityClient(cwd="/tmp")
+        # TemporaryDirectory (not /tmp): on Windows "/tmp" resolves to a
+        # drive-rooted \tmp with no guaranteed write access, and an
+        # explicit cwd is never cleaned by close() — addCleanup removes it.
+        tmp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp_dir.cleanup)
+        client = AntigravityClient(cwd=tmp_dir.name)
         tool_call_obj = {"id": "call_99", "type": "function", "function": {"name": "test_tool", "arguments": json.dumps({"arg": 1})}}
         tool_call_body = f"<tool_call>{json.dumps(tool_call_obj)}</tool_call>"
         fake_events = [
@@ -309,7 +324,12 @@ class AntigravityPluginTests(unittest.TestCase):
             self.assertEqual(json.loads(tc.function.arguments), {"arg": 1})
 
     def test_mock_stream_turn(self):
-        client = AntigravityClient(cwd="/tmp")
+        # TemporaryDirectory (not /tmp): on Windows "/tmp" resolves to a
+        # drive-rooted \tmp with no guaranteed write access, and an
+        # explicit cwd is never cleaned by close() — addCleanup removes it.
+        tmp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp_dir.cleanup)
+        client = AntigravityClient(cwd=tmp_dir.name)
         fake_events = [
             json.dumps({"event": "init", "conversation_id": "stream-conv-1"}),
             json.dumps({"event": "step_update", "step_update": {"text_delta": "Hello "}}),
@@ -358,7 +378,12 @@ class AntigravityPluginTests(unittest.TestCase):
             self.assertEqual(chunks[3].usage.total_tokens, 55)
 
     def test_mock_stream_tool_call(self):
-        client = AntigravityClient(cwd="/tmp")
+        # TemporaryDirectory (not /tmp): on Windows "/tmp" resolves to a
+        # drive-rooted \tmp with no guaranteed write access, and an
+        # explicit cwd is never cleaned by close() — addCleanup removes it.
+        tmp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp_dir.cleanup)
+        client = AntigravityClient(cwd=tmp_dir.name)
         tool_call_obj = {"id": "call_stream_1", "type": "function", "function": {"name": "stream_tool", "arguments": json.dumps({"q": 42})}}
         fake_events = [
             json.dumps({"event": "init", "conversation_id": "stream-tool-conv"}),
@@ -403,7 +428,12 @@ class AntigravityPluginTests(unittest.TestCase):
             self.assertEqual(finish_chunks[0].choices[0].finish_reason, "tool_calls")
 
     def test_base_model_and_effort_resolution(self):
-        client = AntigravityClient(cwd="/tmp")
+        # TemporaryDirectory (not /tmp): on Windows "/tmp" resolves to a
+        # drive-rooted \tmp with no guaranteed write access, and an
+        # explicit cwd is never cleaned by close() — addCleanup removes it.
+        tmp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp_dir.cleanup)
+        client = AntigravityClient(cwd=tmp_dir.name)
         # Base model + explicit effort
         self.assertEqual(client._resolve_model_and_effort("gemini-3.8-flash", "low"), ("gemini-3.8-flash-low", "low"))
         self.assertEqual(client._resolve_model_and_effort("gemini-3.8-flash", "medium"), ("gemini-3.8-flash-medium", "medium"))
@@ -438,7 +468,12 @@ class AntigravityPluginTests(unittest.TestCase):
         self.assertNotIn("gemini-3.8-flash-high", models)
         self.assertNotIn("gemini-3.8-flash-medium", models)
     def test_security_default_args_omit_dangerous_permissions(self):
-        client = AntigravityClient(cwd="/tmp")
+        # TemporaryDirectory (not /tmp): on Windows "/tmp" resolves to a
+        # drive-rooted \tmp with no guaranteed write access, and an
+        # explicit cwd is never cleaned by close() — addCleanup removes it.
+        tmp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp_dir.cleanup)
+        client = AntigravityClient(cwd=tmp_dir.name)
         self.assertNotIn("--dangerously-skip-permissions", client._args)
         self.assertIn("--disable-slash-commands", client._args)
         self.assertIn("--output-format", client._args)
@@ -448,7 +483,12 @@ class AntigravityPluginTests(unittest.TestCase):
         self.assertIn("--output-format", profile.process_args)
 
     def test_native_tool_step_neutralization_in_stream(self):
-        client = AntigravityClient(cwd="/tmp")
+        # TemporaryDirectory (not /tmp): on Windows "/tmp" resolves to a
+        # drive-rooted \tmp with no guaranteed write access, and an
+        # explicit cwd is never cleaned by close() — addCleanup removes it.
+        tmp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp_dir.cleanup)
+        client = AntigravityClient(cwd=tmp_dir.name)
         fake_events = [
             json.dumps({"event": "init", "conversation_id": "test-sec-conv"}),
             json.dumps({"event": "step_update", "step_update": {"step_type": "tool", "tool_name": "run_command"}}),
@@ -497,7 +537,12 @@ class AntigravityPluginTests(unittest.TestCase):
         self.assertIn("Continue the conversation from the latest tool result.", delta)
 
     def test_session_worker_reuse_on_continuation(self):
-        client = AntigravityClient(cwd="/tmp")
+        # TemporaryDirectory (not /tmp): on Windows "/tmp" resolves to a
+        # drive-rooted \tmp with no guaranteed write access, and an
+        # explicit cwd is never cleaned by close() — addCleanup removes it.
+        tmp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp_dir.cleanup)
+        client = AntigravityClient(cwd=tmp_dir.name)
         mock_proc = MagicMock()
         mock_proc.poll.return_value = None
         mock_proc.stdin = MagicMock()
@@ -526,7 +571,12 @@ class AntigravityPluginTests(unittest.TestCase):
         mock_proc.terminate.assert_called()
 
     def test_concurrent_fallback_to_oneshot(self):
-        client = AntigravityClient(cwd="/tmp")
+        # TemporaryDirectory (not /tmp): on Windows "/tmp" resolves to a
+        # drive-rooted \tmp with no guaranteed write access, and an
+        # explicit cwd is never cleaned by close() — addCleanup removes it.
+        tmp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp_dir.cleanup)
+        client = AntigravityClient(cwd=tmp_dir.name)
         # Acquire worker lock manually to simulate an in-progress stream
         self.assertTrue(client._worker_lock.acquire(blocking=False))
 
@@ -590,7 +640,12 @@ class AntigravityPluginTests(unittest.TestCase):
             )
 
     def test_child_env_windows_userprofile(self):
-        client = AntigravityClient(cwd="/tmp")
+        # TemporaryDirectory (not /tmp): on Windows "/tmp" resolves to a
+        # drive-rooted \tmp with no guaranteed write access, and an
+        # explicit cwd is never cleaned by close() — addCleanup removes it.
+        tmp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp_dir.cleanup)
+        client = AntigravityClient(cwd=tmp_dir.name)
         env = client._child_env()
         self.assertIn("HOME", env)
         self.assertIn("USERPROFILE", env)
