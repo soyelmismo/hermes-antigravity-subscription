@@ -7,7 +7,7 @@ import os
 import shutil
 import signal
 import subprocess
-import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -142,6 +142,11 @@ def resolve_real_token_path() -> Path | None:
     return None
 
 
+# is_authenticated() runs on every chat completion and every retry; cache the cmdkey answer briefly.
+_CREDENTIAL_TTL_SECONDS = 30.0
+_credential_cache: tuple[float, bool] | None = None
+
+
 def _windows_credential_present() -> bool:
     """True if agy's Windows Credential Manager entry exists.
 
@@ -149,13 +154,23 @@ def _windows_credential_present() -> bool:
     (target ``gemini:antigravity``) instead of an oauth token file. `cmdkey /list`
     prints only target metadata, never the secret.
     """
+    global _credential_cache
+    now = time.monotonic()
+    if _credential_cache is not None and now - _credential_cache[0] < _CREDENTIAL_TTL_SECONDS:
+        return _credential_cache[1]
     try:
+        # cmdkey prints in the console/OEM code page; replace undecodable bytes instead of raising.
         out = subprocess.run(
-            ["cmdkey", "/list:gemini:antigravity"], capture_output=True, text=True, timeout=10, check=False
+            ["cmdkey", "/list:gemini:antigravity"], capture_output=True, encoding="utf-8", errors="replace",
+            timeout=3, check=False,
         )
     except (OSError, subprocess.SubprocessError):
-        return False
-    return "gemini:antigravity" in out.stdout
+        present = False
+    else:
+        # The listed target keeps the casing it was stored with.
+        present = "gemini:antigravity" in (out.stdout or "").lower()
+    _credential_cache = (now, present)
+    return present
 
 
 def is_authenticated() -> bool:
@@ -167,7 +182,7 @@ def is_authenticated() -> bool:
     token_path = resolve_real_token_path()
     if not token_path:
         # An explicit ANTIGRAVITY_CONFIG_DIR still wins (see resolve_real_token_path).
-        if sys.platform == "win32" and not os.getenv("ANTIGRAVITY_CONFIG_DIR", "").strip():
+        if os.name == "nt" and not os.getenv("ANTIGRAVITY_CONFIG_DIR", "").strip():
             return _windows_credential_present()
         return False
     try:

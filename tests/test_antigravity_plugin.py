@@ -1,3 +1,4 @@
+import contextlib
 import io
 import json
 import os
@@ -155,24 +156,48 @@ class AntigravityPluginTests(unittest.TestCase):
             with patch.dict(os.environ, {"ANTIGRAVITY_CONFIG_DIR": tmp}, clear=False):
                 self.assertTrue(is_authenticated())
 
+    def _windows_without_token_file(self, home):
+        # Windows, no token file, no ANTIGRAVITY_CONFIG_DIR, and an empty credential cache.
+        env = {k: v for k, v in os.environ.items() if k != "ANTIGRAVITY_CONFIG_DIR"}
+        return (patch.dict(os.environ, env, clear=True), patch("process.Path.home", return_value=Path(home)),
+                patch("process._is_existing_file", return_value=False), patch("os.name", "nt"),
+                patch("process._credential_cache", None))
+
     def test_auth_check_windows_credential_manager(self):
         # agy on Windows keeps its session in the Credential Manager, not in a
         # token file. Only the entry's presence is checked; the secret is never read.
         listed = SimpleNamespace(stdout="    Target: LegacyGeneric:target=gemini:antigravity\n", returncode=0)
         missing = SimpleNamespace(stdout="* NONE *\n", returncode=0)
-        with tempfile.TemporaryDirectory() as home:
-            env = {k: v for k, v in os.environ.items() if k != "ANTIGRAVITY_CONFIG_DIR"}
-            with patch.dict(os.environ, env, clear=True), \
-                    patch("process.Path.home", return_value=Path(home)), \
-                    patch("process._is_existing_file", return_value=False), \
-                    patch("process.sys.platform", "win32"):
-                with patch("process.subprocess.run", return_value=listed) as run:
-                    self.assertTrue(is_authenticated())
+        cases = [(listed, True), (missing, False), (FileNotFoundError(), False)]
+        for result, expected in cases:
+            with tempfile.TemporaryDirectory() as home, contextlib.ExitStack() as stack:
+                for ctx in self._windows_without_token_file(home):
+                    stack.enter_context(ctx)
+                kwargs = {"side_effect": result} if isinstance(result, Exception) else {"return_value": result}
+                with patch("process.subprocess.run", **kwargs) as run:
+                    self.assertIs(is_authenticated(), expected)
                     self.assertEqual(run.call_args.args[0], ["cmdkey", "/list:gemini:antigravity"])
-                with patch("process.subprocess.run", return_value=missing):
-                    self.assertFalse(is_authenticated())
-                with patch("process.subprocess.run", side_effect=FileNotFoundError):
-                    self.assertFalse(is_authenticated())
+                    # cmdkey prints in the OEM code page: decoding must never raise.
+                    self.assertEqual(run.call_args.kwargs.get("errors"), "replace")
+
+    def test_auth_check_windows_target_case_insensitive(self):
+        listed = SimpleNamespace(stdout="Target: LegacyGeneric:target=Gemini:Antigravity\n", returncode=0)
+        with tempfile.TemporaryDirectory() as home, contextlib.ExitStack() as stack:
+            for ctx in self._windows_without_token_file(home):
+                stack.enter_context(ctx)
+            with patch("process.subprocess.run", return_value=listed):
+                self.assertTrue(is_authenticated())
+
+    def test_auth_check_windows_is_cached_between_requests(self):
+        # is_authenticated() runs on every chat completion (and every retry): one cmdkey per TTL.
+        listed = SimpleNamespace(stdout="Target: LegacyGeneric:target=gemini:antigravity\n", returncode=0)
+        with tempfile.TemporaryDirectory() as home, contextlib.ExitStack() as stack:
+            for ctx in self._windows_without_token_file(home):
+                stack.enter_context(ctx)
+            with patch("process.subprocess.run", return_value=listed) as run:
+                self.assertTrue(is_authenticated())
+                self.assertTrue(is_authenticated())
+                run.assert_called_once()
 
     def test_auth_check_explicit_dir_wins_over_windows_credential(self):
         # ANTIGRAVITY_CONFIG_DIR is an override: an empty explicit dir stays
@@ -180,7 +205,7 @@ class AntigravityPluginTests(unittest.TestCase):
         listed = SimpleNamespace(stdout="Target: LegacyGeneric:target=gemini:antigravity\n", returncode=0)
         with tempfile.TemporaryDirectory() as tmp:
             with patch.dict(os.environ, {"ANTIGRAVITY_CONFIG_DIR": tmp}, clear=False), \
-                    patch("process.sys.platform", "win32"), \
+                    patch("os.name", "nt"), patch("process._credential_cache", None), \
                     patch("process.subprocess.run", return_value=listed) as run:
                 self.assertFalse(is_authenticated())
                 run.assert_not_called()
