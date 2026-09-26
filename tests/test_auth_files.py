@@ -220,6 +220,27 @@ class AuthFileCompatibilityTests(unittest.TestCase):
                         self.assertTrue(isolated_token.exists(), "token must not be dangling")
                         self.assertEqual(isolated_token.resolve(), selected.resolve())
 
+    def test_isolated_home_keeps_link_when_real_token_lives_in_isolated_dir(self):
+        # Degenerate case: ANTIGRAVITY_CONFIG_DIR points at the very gemini
+        # dir being built, so the resolved real_token IS isolated_token.
+        # Unlinking it would relink the token to itself — a self-referential
+        # symlink that fails to open (ELOOP) — so the link must survive
+        # untouched, still resolving to the external source file.
+        with tempfile.TemporaryDirectory() as cwd, tempfile.TemporaryDirectory() as src_dir:
+            gemini_dir = Path(cwd) / "home" / ".gemini" / "antigravity-cli"
+            gemini_dir.mkdir(parents=True)
+            external = _write_token(Path(src_dir) / "external-token")
+            self_link = gemini_dir / NEW_NAME
+            os.symlink(external, self_link)
+
+            with patch("process.resolve_real_token_path", return_value=self_link):
+                _, out_dir = setup_isolated_home(cwd)
+
+            self.assertEqual(out_dir, gemini_dir)
+            self.assertTrue(os.path.islink(self_link), "self-path symlink must survive")
+            self.assertTrue(self_link.exists(), "must not become a self-referential (ELOOP) link")
+            self.assertEqual(os.path.realpath(self_link), os.path.realpath(external))
+
 
 if __name__ == "__main__":
     unittest.main()

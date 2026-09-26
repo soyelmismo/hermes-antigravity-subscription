@@ -188,7 +188,16 @@ def setup_isolated_home(cwd: Path | str) -> tuple[Path, Path]:
         # link and fails, leaving no usable token. Always relink to the
         # CURRENT real token. A real regular file is left untouched: it can
         # be a valid copy2 hardlink-failure artifact and could be user data.
-        if os.path.islink(isolated_token):
+        # Never unlink the resolved source itself, though: when
+        # ANTIGRAVITY_CONFIG_DIR points at this very gemini dir, real_token
+        # IS isolated_token, and unlinking it would relink the token to
+        # itself — a self-referential symlink, ELOOP on open. Compare
+        # resolved paths rather than raw ones: resolve_real_token_path()
+        # echoes ANTIGRAVITY_CONFIG_DIR verbatim and cwd is caller-supplied,
+        # so either side can be relative, and symlinked parents would make
+        # one file alias two spellings past a raw comparison.
+        is_resolved_source = isolated_token.resolve() == real_token.resolve()
+        if not is_resolved_source and os.path.islink(isolated_token):
             with contextlib.suppress(OSError):
                 isolated_token.unlink()
         if not isolated_token.exists():
