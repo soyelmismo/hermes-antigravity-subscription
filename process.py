@@ -13,6 +13,17 @@ from typing import Any
 # Marker scheme for Antigravity local provider
 AGY_MARKER_BASE_URL = "agy://local"
 
+# Known OAuth token basenames. agy1.2 renamed the fallback file from
+# antigravity-oauth-token to jetski-standalone-oauth-token (issue #1),
+# so both must resolve. Order is new-first: an upgraded user (1.1 -> 1.2)
+# has BOTH files in the same directory, because 1.2 does not remove the
+# old one, and 1.2 reads only the new name — so when both coexist the new
+# name is authoritative. Resolving the stale legacy file there would
+# authenticate (size > 10) a token that agy 1.2 ignores. Legacy-only 1.1
+# users are unaffected: the new file simply does not exist and the scan
+# falls through to the legacy name.
+_TOKEN_FILENAMES = ("jetski-standalone-oauth-token", "antigravity-oauth-token")
+
 
 def _is_existing_file(path: str | Path) -> bool:
     """True if path is a regular file, treating any OS error as absent.
@@ -108,15 +119,22 @@ def resolve_real_token_path() -> Path | None:
     """
     token_dir = os.getenv("ANTIGRAVITY_CONFIG_DIR", "").strip()
     if token_dir:
-        explicit = Path(token_dir) / "antigravity-oauth-token"
-        return explicit if _is_existing_file(explicit) else None
+        config_path = Path(token_dir)
+        for filename in _TOKEN_FILENAMES:
+            explicit = config_path / filename
+            if _is_existing_file(explicit):
+                return explicit
+        return None
 
-    candidates = [
-        Path.home() / ".gemini" / "antigravity-cli" / "antigravity-oauth-token",
-        # Last resort for containers/sudo contexts where HOME does not point
-        # at the account that ran `agy`.
-        Path("/root/.gemini/antigravity-cli/antigravity-oauth-token"),
-    ]
+    home_base = Path.home() / ".gemini" / "antigravity-cli"
+    root_base = Path("/root/.gemini/antigravity-cli")
+    candidates = [home_base / name for name in _TOKEN_FILENAMES]
+    # Last resort for containers/sudo contexts where HOME does not point
+    # at the account that ran `agy`. All home candidates win over any
+    # /root fallback so a stale /root legacy token never beats the user's
+    # current token. Skip the extra stat when HOME already is /root.
+    if root_base != home_base:
+        candidates += [root_base / name for name in _TOKEN_FILENAMES]
     for candidate in candidates:
         if _is_existing_file(candidate):
             return candidate
@@ -146,7 +164,42 @@ def setup_isolated_home(cwd: Path | str) -> tuple[Path, Path]:
 
     real_token = resolve_real_token_path()
     if real_token and _is_existing_file(real_token):
-        isolated_token = isolated_gemini_dir / "antigravity-oauth-token"
+        # Reused cwd: a previous run may have selected the OTHER known
+        # basename (e.g. a pre-upgrade agy1.1 run linked
+        # antigravity-oauth-token). Such a leftover link would linger next
+        # to the fresh one, so drop it — but only if it is a symlink we
+        # created; never unlink a real file that could be user data.
+        for stale_name in _TOKEN_FILENAMES:
+            if stale_name == real_token.name:
+                continue
+            stale_link = isolated_gemini_dir / stale_name
+            if os.path.islink(stale_link):
+                with contextlib.suppress(OSError):
+                    stale_link.unlink()
+        # Preserve the selected basename so the agy1.2 filename keeps
+        # working inside the isolated home (zero secret parsing).
+        isolated_token = isolated_gemini_dir / real_token.name
+        # Reused cwd: the link under the selected basename may itself be a
+        # leftover pointing at a previous run's source. If that source is
+        # stale but still present, the exists() guard below would skip
+        # recreation and the child would use the old token; if it is
+        # dangling (previous run's temp source deleted), symlink raises
+        # FileExistsError and the copy2 fallback opens through the dangling
+        # link and fails, leaving no usable token. Always relink to the
+        # CURRENT real token. A real regular file is left untouched: it can
+        # be a valid copy2 hardlink-failure artifact and could be user data.
+        # Never unlink the resolved source itself, though: when
+        # ANTIGRAVITY_CONFIG_DIR points at this very gemini dir, real_token
+        # IS isolated_token, and unlinking it would relink the token to
+        # itself — a self-referential symlink, ELOOP on open. Compare
+        # resolved paths rather than raw ones: resolve_real_token_path()
+        # echoes ANTIGRAVITY_CONFIG_DIR verbatim and cwd is caller-supplied,
+        # so either side can be relative, and symlinked parents would make
+        # one file alias two spellings past a raw comparison.
+        is_resolved_source = isolated_token.resolve() == real_token.resolve()
+        if not is_resolved_source and os.path.islink(isolated_token):
+            with contextlib.suppress(OSError):
+                isolated_token.unlink()
         if not isolated_token.exists():
             try:
                 os.symlink(real_token, isolated_token)
