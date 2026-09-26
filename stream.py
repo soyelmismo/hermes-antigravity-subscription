@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import json
 import logging
@@ -94,6 +95,38 @@ def _delta_worker_usage(usage_data: dict[str, Any], baseline: dict[str, int]) ->
     )
 
 
+async def _ready(value: Any) -> Any:
+    """Trivial coroutine that immediately returns *value*.
+
+    The return channel of every ``__await__`` in this module: awaiting an
+    already-completed result must produce that result without doing any work
+    (no re-execution, no re-reading of the subprocess).
+    """
+    return value
+
+
+class _AwaitableCompletion(SimpleNamespace):
+    """A completed ChatCompletion that is also awaitable, yielding itself.
+
+    Hermes' async auxiliary path awaits ``create()`` even for clients that
+    declare ``HERMES_SKIP_ASYNC_WRAP`` ("already async-safe"): the plugin is
+    expected to return something legal to ``await`` from its synchronous,
+    already-finished round-trip. A plain ``SimpleNamespace`` is not awaitable,
+    which surfaced as ``TypeError: object SimpleNamespace can't be used in
+    'await' expression`` on vision/auxiliary calls (issue #8).
+
+    The attribute shape is exactly ``SimpleNamespace``'s
+    (``.id/.choices/.usage/.model``); only awaitability is added, so sync
+    callers see byte-identical objects.
+    """
+
+    def __await__(self) -> Any:
+        # Yield a coroutine that immediately returns self. Deliberately NOT
+        # `iter([self])`: a Task receiving a non-Future yield crashes with
+        # "Task got bad yield", so the yield must come from a real coroutine.
+        return _ready(self).__await__()
+
+
 class AntigravityStream(Iterator[Any]):
     """Streaming iterator yielding OpenAI ChatCompletionChunk objects from CLI stream-json."""
 
@@ -146,6 +179,67 @@ class AntigravityStream(Iterator[Any]):
         except Exception:
             self.close()
             raise
+
+    def __await__(self) -> Any:
+        """Allow ``chunks = await create(stream=True)`` on the async wire.
+
+        Same contract as :class:`_AwaitableCompletion`: the stream (and the
+        subprocess round-trip behind it) is already fully constructed, so
+        awaiting yields the stream itself without consuming any chunk;
+        consumption goes through ``__aiter__``/``__anext__`` below.
+        """
+        return _ready(self).__await__()
+
+    def __aiter__(self) -> "AntigravityStream":
+        return self
+
+    def _pull_chunk(self) -> tuple[bool, Any]:
+        """Run one sync ``__next__``; ``(True, None)`` means the stream is done.
+
+        End of stream must be reported as a *value*: StopIteration cannot be
+        raised into a Future (asyncio and ``concurrent.futures`` reject it
+        with "StopIteration interacts badly with generators"), so letting it
+        escape the worker thread would wedge the awaiting coroutine forever
+        instead of ending the ``async for``.
+        """
+        try:
+            return False, self.__next__()
+        except StopIteration:
+            return True, None
+
+    async def __anext__(self) -> Any:
+        """One blocking subprocess read per await, off the event loop.
+
+        Each ``next()`` runs in a worker thread via ``asyncio.to_thread`` so
+        the event loop stays free between chunks (the async path must not
+        block on ``proc.stdout.readline``). The worker-side stop sentinel from
+        ``_pull_chunk`` is mapped back to ``StopAsyncIteration`` so ``async
+        for`` terminates exactly like the sync ``for`` loop; every other
+        exception propagates unchanged, after the same ``close()`` the sync
+        path performs.
+
+        Known limitation (documented, deliberately not fixed): awaiting the
+        stream object itself only yields the stream, so a consumer still
+        drives the subprocess chunk by chunk from worker threads. Per-chunk,
+        not per-request, non-blocking is the best a plugin can do without a
+        Hermes hook that would hand out a coroutine from create().
+
+        Cancelling an in-flight ``__anext__`` (e.g. a ``wait_for`` timeout)
+        leaves the stream unclosed: the worker lock stays held, the worker
+        process stays alive, and the ``to_thread`` worker stays blocked in
+        ``readline()`` until something calls ``close()``. Hermes' own
+        ``_aggregate_chat_stream_async`` supplies that ``close()`` on
+        realistic paths -- its ``finally`` runs ``_close_chunk_stream(chunks,
+        allow_aclose=True)``, which finds this class's sync ``close()`` --
+        matching the sync behavior of abandoning a stream without calling
+        ``close()``. No ``CancelledError`` handler is added here on purpose:
+        reacting to cancellation would change the close/terminate semantics,
+        which is out of scope for this fix.
+        """
+        stream_exhausted, chunk = await asyncio.to_thread(self._pull_chunk)
+        if stream_exhausted:
+            raise StopAsyncIteration
+        return chunk
 
     def close(self) -> None:
         if self._closed:
@@ -457,7 +551,13 @@ class AntigravityStream(Iterator[Any]):
 
 
 def collect_stream_completion(stream: AntigravityStream) -> Any:
-    """Consume an AntigravityStream completely and assemble a non-streaming ChatCompletion object."""
+    """Consume an AntigravityStream completely and assemble a non-streaming ChatCompletion object.
+
+    The returned object is a :class:`_AwaitableCompletion`: identical in shape
+    to the plain ``SimpleNamespace`` this used to return, plus awaitable
+    (``await`` yields the very same object) so the async wire can
+    ``await client.chat.completions.create(...)`` without a TypeError.
+    """
     conversation_id = ""
     model = stream.model
     content_parts: list[str] = []
@@ -524,7 +624,7 @@ def collect_stream_completion(stream: AntigravityStream) -> Any:
             prompt_tokens_details=SimpleNamespace(cached_tokens=0),
         )
 
-    return SimpleNamespace(
+    return _AwaitableCompletion(
         id=conversation_id or f"agy-{int(time.time() * 1000)}",
         choices=[choice],
         usage=usage,
