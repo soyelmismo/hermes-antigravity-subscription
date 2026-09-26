@@ -9,6 +9,7 @@ import logging
 import subprocess
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 from typing import Any, Iterator, NamedTuple
 
@@ -162,6 +163,11 @@ class AntigravityStream(Iterator[Any]):
         self._finished = False
         self._early_error: str | None = None
         self._generator = self._stream_generator()
+        # Private single-thread executor for the async path, created lazily on
+        # the first __anext__ (sync consumers never create one, and a closed
+        # reference after close() is what keeps a stale submit loud). See
+        # __anext__ for why this is not the shared default executor.
+        self._async_executor: ThreadPoolExecutor | None = None
 
     def __iter__(self) -> "AntigravityStream":
         return self
@@ -200,7 +206,9 @@ class AntigravityStream(Iterator[Any]):
         raised into a Future (asyncio and ``concurrent.futures`` reject it
         with "StopIteration interacts badly with generators"), so letting it
         escape the worker thread would wedge the awaiting coroutine forever
-        instead of ending the ``async for``.
+        instead of ending the ``async for``. Runs on this stream's private
+        executor (see ``__anext__``), so a blocking readline occupies one
+        private thread for at most the request timeout.
         """
         try:
             return False, self.__next__()
@@ -210,13 +218,22 @@ class AntigravityStream(Iterator[Any]):
     async def __anext__(self) -> Any:
         """One blocking subprocess read per await, off the event loop.
 
-        Each ``next()`` runs in a worker thread via ``asyncio.to_thread`` so
-        the event loop stays free between chunks (the async path must not
-        block on ``proc.stdout.readline``). The worker-side stop sentinel from
-        ``_pull_chunk`` is mapped back to ``StopAsyncIteration`` so ``async
-        for`` terminates exactly like the sync ``for`` loop; every other
-        exception propagates unchanged, after the same ``close()`` the sync
-        path performs.
+        Each ``next()`` runs on this stream's PRIVATE single-thread executor
+        (created lazily on the first async pull; sync consumers never create
+        one). The shared default executor is deliberately not used: one
+        ``readline()`` can occupy its thread for the whole request timeout
+        (300s by default), and starving every other ``run_in_executor(None,
+        ...)`` user in the host loop for that long is not acceptable.
+
+        The closed check comes FIRST, before the executor is touched: after
+        ``close()`` the executor is shut down, and submitting to a dead
+        executor raises RuntimeError -- a closed stream is simply done, so
+        ``StopAsyncIteration`` is the caller-visible outcome.
+
+        The worker-side stop sentinel from ``_pull_chunk`` is mapped back to
+        ``StopAsyncIteration`` so ``async for`` terminates exactly like the
+        sync ``for`` loop; every other exception propagates unchanged, after
+        the same ``close()`` the sync path performs.
 
         Known limitation (documented, deliberately not fixed): awaiting the
         stream object itself only yields the stream, so a consumer still
@@ -226,20 +243,48 @@ class AntigravityStream(Iterator[Any]):
 
         Cancelling an in-flight ``__anext__`` (e.g. a ``wait_for`` timeout)
         leaves the stream unclosed: the worker lock stays held, the worker
-        process stays alive, and the ``to_thread`` worker stays blocked in
-        ``readline()`` until something calls ``close()``. Hermes' own
+        process stays alive, and the private executor's worker stays blocked
+        in ``readline()`` until something calls ``close()``. Hermes' own
         ``_aggregate_chat_stream_async`` supplies that ``close()`` on
         realistic paths -- its ``finally`` runs ``_close_chunk_stream(chunks,
         allow_aclose=True)``, which finds this class's sync ``close()`` --
         matching the sync behavior of abandoning a stream without calling
         ``close()``. No ``CancelledError`` handler is added here on purpose:
         reacting to cancellation would change the close/terminate semantics,
-        which is out of scope for this fix.
+        which is out of scope for this fix. A stream neither consumed nor
+        closed keeps its executor thread (non-daemon, like every
+        ThreadPoolExecutor thread) blocked until the process exits; the same
+        is true of an abandoned sync stream's subprocess, and closing the
+        client terminates the child, unblocking the read.
         """
-        stream_exhausted, chunk = await asyncio.to_thread(self._pull_chunk)
+        if self._closed:
+            raise StopAsyncIteration
+        executor = self._async_executor
+        if executor is None:
+            executor = self._async_executor = ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="agy-stream"
+            )
+        stream_exhausted, chunk = await asyncio.get_running_loop().run_in_executor(
+            executor, self._pull_chunk
+        )
         if stream_exhausted:
             raise StopAsyncIteration
         return chunk
+
+    async def aclose(self) -> None:
+        """Async close for ``async with contextlib.aclosing(stream)`` consumers.
+
+        Deliberately synchronous inside (``self.close()``). Reasons: Hermes'
+        own ``_close_chunk_stream(chunks, allow_aclose=True)`` prefers the
+        plain ``close`` attribute anyway, so this exists for direct-await
+        consumers and ``aclosing``, not for the Hermes wire; close() is
+        bounded (process terminate + ``wait(2)`` + kill fallback); routing it
+        through the DEFAULT executor would re-introduce the shared-executor
+        occupancy that ``__anext__`` avoids, and routing it through THIS
+        stream's executor would deadlock when close() runs on that very
+        thread (see ``close``).
+        """
+        self.close()
 
     def close(self) -> None:
         if self._closed:
@@ -256,6 +301,19 @@ class AntigravityStream(Iterator[Any]):
             with self.client._lock:
                 self.client._active_processes.discard(self.proc)
             self.client._terminate_process(self.proc)
+        # Retire the private async executor, if the async path created one.
+        # wait=False is mandatory: close() also runs ON the executor thread
+        # (the __next__ error path reaches it from _pull_chunk), so joining
+        # would deadlock on the caller. cancel_futures=False: an in-flight
+        # _pull_chunk has already started and cannot be cancelled -- and it
+        # does not need to be, because terminating the process above makes
+        # its readline() return EOF, so the worker thread finishes on its
+        # own. The executor reference is kept (not None'd) so a stale submit
+        # after close() fails loudly instead of silently starting a new
+        # executor; __anext__ guards that with its _closed check first.
+        executor = self._async_executor
+        if executor is not None:
+            executor.shutdown(wait=False, cancel_futures=False)
 
     def _make_chunk(
         self,

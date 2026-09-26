@@ -22,11 +22,13 @@ subprocess; they skip (never silently pass) when that module is unavailable.
 """
 
 import asyncio
+import contextlib
 import inspect
 import io
 import json
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -129,15 +131,26 @@ def _mock_proc(lines: list[str], *, alive: bool = True) -> MagicMock:
     return proc
 
 
-def _slow_readline(lines: list[str], latency: float):
+def _slow_readline(
+    lines: list[str],
+    latency: float,
+    thread_names: list[str] | None = None,
+    thread_counts: list[int] | None = None,
+):
     """``readline`` stand-in that really blocks *latency* seconds per call.
 
     A mock ``side_effect`` list answers instantly, so only a real sleep makes
-    the generator's blocking read observable from the event loop.
+    the generator's blocking read observable from the event loop. When
+    *thread_names* / *thread_counts* are given, each call records the name and
+    the live-thread count of the thread that performs the read.
     """
     pending = iter(lines)
 
     def _readline() -> str:
+        if thread_names is not None:
+            thread_names.append(threading.current_thread().name)
+        if thread_counts is not None:
+            thread_counts.append(threading.active_count())
         time.sleep(latency)
         return next(pending, "")
 
@@ -407,6 +420,47 @@ class AsyncStreamSemanticsTests(_PinnedSeamsMixin, unittest.TestCase):
         # The interrupted path released the worker lock and terminated the worker.
         self.assertFalse(client._worker_lock.locked())
         self.assertIsNone(client._worker_proc)
+        # The error path reached close() FROM the executor thread (via
+        # __next__'s except -> close()), which must shut the executor down
+        # with wait=False instead of joining its own caller thread.
+        self.assertTrue(stream._async_executor._shutdown)
+        with self.assertRaises(StopAsyncIteration):
+            asyncio.run(_await_directly(stream.__anext__()))
+
+    def test_anext_after_close_raises_stop_async_iteration_and_close_is_idempotent(self):
+        # The _closed-first guard in __anext__: once close() has shut the
+        # executor down, submitting to it would raise RuntimeError; a closed
+        # stream is simply done, so the caller-visible outcome must be
+        # StopAsyncIteration. close() is also idempotent (the early return on
+        # _closed means the executor is never shut down twice).
+        client = self._client()
+        with patch("subprocess.Popen", return_value=_mock_proc(self._turn_lines())):
+            stream = client.chat.completions.create(model=MODEL, messages=MESSAGES, stream=True)
+            asyncio.run(_await_directly(stream.__anext__()))  # creates + uses the executor
+            stream.close()
+            stream.close()  # idempotent: no exception, no double shutdown
+            self.assertTrue(stream._async_executor._shutdown)
+            with self.assertRaises(StopAsyncIteration):
+                asyncio.run(_await_directly(stream.__anext__()))
+
+    def test_aclosing_context_manager_and_double_aclose(self):
+        # aclose() exists for `async with contextlib.aclosing(stream)` and
+        # direct-await consumers (Hermes' _close_chunk_stream prefers the
+        # plain close attribute). It must mark the stream closed and be safe
+        # to await twice.
+        client = self._client()
+        with patch("subprocess.Popen", return_value=_mock_proc(self._turn_lines())):
+            stream = client.chat.completions.create(model=MODEL, messages=MESSAGES, stream=True)
+
+            async def _use() -> str:
+                async with contextlib.aclosing(stream):
+                    chunk = await stream.__anext__()
+                    return chunk.choices[0].delta.content
+
+            self.assertEqual(asyncio.run(_use()), "answer one")
+            self.assertTrue(stream._closed)
+            asyncio.run(stream.aclose())  # second close via aclose: safe
+            self.assertTrue(stream._closed)
 
     def test_concurrent_worker_and_oneshot_streams_in_one_event_loop(self):
         # Two streams alive in the SAME event loop, consumed concurrently
@@ -449,11 +503,12 @@ class AsyncStreamSemanticsTests(_PinnedSeamsMixin, unittest.TestCase):
 
     def test_chunk_reads_run_off_the_event_loop(self):
         # Core design claim of the async stream path: each blocking subprocess
-        # read happens in a worker thread (asyncio.to_thread inside __anext__),
-        # so the event loop keeps running while a chunk is in flight. A
-        # concurrent 0.05s sleeper must finish BEFORE a chunk whose readline
-        # blocks 0.25s (5x margin, over the 4x floor) arrives; a __anext__
-        # that read inline could only release the sleeper after the chunk.
+        # read happens on this stream's private executor thread (see
+        # __anext__), so the event loop keeps running while a chunk is in
+        # flight. A concurrent 0.05s sleeper must finish BEFORE a chunk whose
+        # readline blocks 0.25s (5x margin, over the 4x floor) arrives; a
+        # __anext__ that read inline could only release the sleeper after the
+        # chunk.
         client = self._client()
         proc = _mock_proc([])
         proc.stdout.readline.side_effect = _slow_readline(
@@ -462,9 +517,7 @@ class AsyncStreamSemanticsTests(_PinnedSeamsMixin, unittest.TestCase):
         )
         order: list[str] = []
 
-        async def _drive() -> None:
-            stream = client.chat.completions.create(model=MODEL, messages=MESSAGES, stream=True)
-
+        async def _drive(stream: Any) -> None:
             async def _sleeper() -> None:
                 await asyncio.sleep(_SLEEPER_SECONDS)
                 order.append("sleeper")
@@ -477,41 +530,108 @@ class AsyncStreamSemanticsTests(_PinnedSeamsMixin, unittest.TestCase):
             await asyncio.gather(_sleeper(), _first_chunk())
 
         with patch("subprocess.Popen", return_value=proc):
-            asyncio.run(_drive())
+            stream = client.chat.completions.create(model=MODEL, messages=MESSAGES, stream=True)
+            asyncio.run(_drive(stream))
+            # Close deterministically instead of dropping the stream: a
+            # suspended generator is only reclaimable by the cyclic GC, and
+            # its finalization (which wants the client lock) could otherwise
+            # land at an arbitrary allocation point -- including inside a
+            # later client.close() that already holds that lock. Same reason
+            # the sync suite finalizes abandoned generators explicitly.
+            stream.close()
         self.assertEqual(order, ["sleeper", "chunk"])
 
-    def test_concurrent_anext_on_one_stream_fails_loudly(self):
-        # Re-entrance parity with the sync path: two threads calling next() on
-        # the same iterator make the loser raise ValueError("generator already
-        # executing"). Two concurrent __anext__ awaits on one live stream must
-        # reproduce exactly that loud failure (one chunk, one ValueError) --
-        # this pin is deliberate. A future edit that makes __anext__
-        # re-entrance-tolerant must fail this test and be a conscious
-        # decision, never an accident of a refactor.
+    def test_concurrent_anext_on_one_stream_is_serialized_by_the_private_executor(self):
+        # Re-entrance semantics, pinned after the executor-starvation fix.
+        # The private executor has max_workers=1 (see __anext__), so two
+        # concurrent __anext__ awaits on ONE live stream can no longer hit the
+        # generator at the same time: the second _pull_chunk queues behind the
+        # first and each await yields the next chunk in stream order. The sync
+        # two-thread next() ValueError ("generator already executing") is
+        # therefore NOT reachable on the async path any more -- a deliberate
+        # consequence of the single-thread executor, not an accident. The loud
+        # failure moved to the post-close path instead, pinned by
+        # test_anext_after_close_raises_stop_async_iteration.
+        # A future edit that makes concurrent async pulls collide (or crash)
+        # again must fail this test and be a conscious decision.
         client = self._client()
-        # The slow readline keeps the first __anext__ inside the generator
-        # long enough for the second to hit the non-reentrant next(), so the
-        # outcome cannot depend on thread scheduling.
+        # The slow readline keeps the first __anext__ inside the generator for
+        # 0.25s, long enough for the second await to be queued behind it.
         proc = _mock_proc([])
         proc.stdout.readline.side_effect = _slow_readline(
             _lines_for(_turn_events("conv-1", "answer one", TURN_1_USAGE)),
             _CHUNK_LATENCY_SECONDS,
         )
 
-        async def _drive() -> list[Any]:
-            stream = client.chat.completions.create(model=MODEL, messages=MESSAGES, stream=True)
+        async def _drive(stream: Any) -> list[Any]:
             return await asyncio.gather(
                 stream.__anext__(), stream.__anext__(), return_exceptions=True
             )
 
         with patch("subprocess.Popen", return_value=proc):
-            results = asyncio.run(_drive())
-        chunks = [r for r in results if not isinstance(r, BaseException)]
-        errors = [r for r in results if isinstance(r, BaseException)]
-        self.assertEqual(len(chunks), 1)
-        self.assertEqual(len(errors), 1)
-        self.assertIsInstance(errors[0], ValueError)
-        self.assertIn("generator already executing", str(errors[0]))
+            stream = client.chat.completions.create(model=MODEL, messages=MESSAGES, stream=True)
+            results = asyncio.run(_drive(stream))
+            # Close deterministically: an abandoned suspended generator is
+            # only reclaimable by the cyclic GC, whose finalization would run
+            # at an arbitrary allocation point (and its finally wants the
+            # client lock, see the module note in test_chunk_reads...).
+            stream.close()
+        # No exception surfaced: both pulls were served, in stream order.
+        for result in results:
+            self.assertNotIsInstance(result, BaseException)
+        self.assertEqual(results[0].choices[0].delta.content, "answer one")
+        self.assertIsNone(results[0].choices[0].finish_reason)
+        self.assertIsNone(results[1].choices[0].delta.content)
+        self.assertEqual(results[1].choices[0].finish_reason, "stop")
+
+    def test_async_reads_run_on_a_private_thread_not_the_shared_executor(self):
+        # Executor-starvation fix (see __anext__): the blocking readline must
+        # occupy THIS stream's private single-thread executor, never a shared
+        # default-executor thread (which could be pinned for the whole 300s
+        # request timeout and starve every other run_in_executor(None, ...)
+        # user of the host loop).
+        client = self._client()
+        read_threads: list[str] = []
+        read_thread_counts: list[int] = []
+        baseline_threads = threading.active_count()
+        proc = _mock_proc([])
+        proc.stdout.readline.side_effect = _slow_readline(
+            _lines_for(_turn_events("conv-1", "answer one", TURN_1_USAGE)),
+            _CHUNK_LATENCY_SECONDS,
+            read_threads,
+            read_thread_counts,
+        )
+
+        async def _drive(stream: Any) -> None:
+            async for _chunk in stream:
+                break
+
+        with patch("subprocess.Popen", return_value=proc):
+            stream = client.chat.completions.create(model=MODEL, messages=MESSAGES, stream=True)
+            asyncio.run(_drive(stream))
+            # Close deterministically instead of dropping the stream: a
+            # suspended generator is only reclaimable by the cyclic GC, and
+            # its finalization (which wants the client lock) could otherwise
+            # land at an arbitrary allocation point -- including inside a
+            # later client.close() that already holds that lock. Same reason
+            # the sync suite finalizes abandoned generators explicitly.
+            stream.close()
+        self.assertTrue(read_threads)
+        for name in read_threads:
+            self.assertTrue(name.startswith("agy-stream"), f"read ran on {name!r}")
+        self.assertFalse(
+            any(name.startswith(("asyncio_", "ThreadPoolExecutor-")) for name in read_threads),
+            "a shared default-executor thread performed the blocking read",
+        )
+        # Bounded thread growth: the private executor thread plus the quota
+        # watchdog the generator starts, and nothing else.
+        self.assertTrue(read_thread_counts)
+        for count in read_thread_counts:
+            self.assertLessEqual(count - baseline_threads, 3)
+        # The executor itself is single-threaded and named for the stream.
+        stream_executor = stream._async_executor
+        self.assertIsNotNone(stream_executor)
+        self.assertEqual(stream_executor._max_workers, 1)
 
 
 @unittest.skipIf(
