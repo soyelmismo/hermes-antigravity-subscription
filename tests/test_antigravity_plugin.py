@@ -710,14 +710,22 @@ class AntigravityPluginTests(unittest.TestCase):
         that has already exited 0 (readline returns EOF, poll() == 0).
 
         ``pid`` is pinned to None on purpose: a MagicMock's default pid
-        carries ``__index__() == 1``, so any accidental route into the
-        process-tree kill (a test forgetting _stubbed_kill_path, or a
-        future choreography break) would signal the REAL process group 1.
-        With pid=None the kill fallback raises TypeError instead, failing
-        loud and host-safely. Not 0 and not negative: killpg(0) means
-        "the caller's own group" and killpg(-1) means "every process" --
-        both are real signals, not safe failures. No test here requires
-        a valid pid.
+        carries ``__index__() == 1``, so on POSIX any accidental route
+        into the process-tree kill (a test forgetting _stubbed_kill_path,
+        or a future choreography break) would signal the REAL process
+        group 1. With pid=None the kill fallback raises TypeError
+        instead -- POSIX branch only: ``os.killpg(None, ...)`` raises in
+        CPython before any signal syscall, and TypeError is outside
+        _kill_process_tree's caught set, so on POSIX the kill fails
+        loud and host-safely. On Windows _kill_process_tree takes the
+        "nt" branch and never reaches killpg: pid=None spawns a real
+        ``taskkill /F /T /PID None`` (the literal string) whose failure
+        is suppressed, so the pin alone there is neither loud nor
+        host-free -- _stubbed_kill_path (the outermost guarantee,
+        OS-independent) is what actually keeps taskkill/killpg off the
+        host. Not 0 and not negative: killpg(0) means "the caller's own
+        group" and killpg(-1) means "every process" -- both are real
+        signals, not safe failures. No test here requires a valid pid.
         """
         proc = MagicMock()
         proc.pid = None
@@ -733,21 +741,36 @@ class AntigravityPluginTests(unittest.TestCase):
     def _stubbed_kill_path():
         """Record -- and neuter -- the process-tree kill for fake procs.
 
-        The primary guard is the ``pid=None`` pin on _scripted_proc
-        fakes: ``os.killpg(None, ...)`` raises TypeError in CPython
-        before any signal syscall, so the fake's kill path fails loud
-        and host-safely. The pin is load-bearing, though: drop it and
-        an unpinned MagicMock pid carries ``__index__() == 1``, so a
+        This stub is the OUTERMOST guarantee, and it is
+        OS-independent: it replaces ``_kill_process_tree`` wholesale,
+        and that function is the plugin's only route to a real kill
+        (``os.killpg`` on POSIX, ``taskkill /F /T`` on Windows) --
+        every teardown funnels through process.terminate_process, its
+        sole caller. With it installed no killpg and no taskkill can
+        run on ANY OS, whatever the fake's pid is. It patches the
+        function on the ``process`` module rather than any ``os``
+        attribute -- which is also what keeps it Windows-portable,
+        where ``os.killpg`` does not exist and cannot be patched at
+        all.
+
+        The ``pid=None`` pin on _scripted_proc fakes is the inner,
+        POSIX-only defense-in-depth: ``os.killpg(None, ...)`` raises
+        TypeError in CPython before any signal syscall (TypeError is
+        outside _kill_process_tree's caught set), so a POSIX kill route
+        that bypassed this stub would fail loud instead of signaling a
+        real group. The pin is load-bearing on POSIX: drop it and an
+        unpinned MagicMock pid carries ``__index__() == 1``, so a
         ``_kill_process_tree`` that reached ``os.killpg`` would fire a
-        signal at the REAL process group 1. This stub is the
-        additional layer: it replaces ``_kill_process_tree`` (the
-        ONLY caller of ``os.killpg`` in the plugin) wholesale, so it
-        touches no ``os`` attribute -- which is also what keeps it
-        Windows-portable, where ``os.killpg`` does not exist and
-        cannot be patched at all. Live-oneshot fixtures additionally
-        keep teardown on the graceful branch; this stub is defense in
-        depth: if that choreography ever breaks, the test fails on the
-        yielded record instead of reaching the signal syscall.
+        signal at the REAL process group 1. On Windows the pin alone
+        protects nothing -- the "nt" branch spawns a real
+        ``taskkill /F /T /PID None`` and suppresses its failure --
+        which is exactly why this stub, not the pin, is the host-free
+        guarantee for fixtures that can reach the kill path.
+
+        Live-oneshot fixtures additionally keep teardown on the
+        graceful branch; this stub is defense in depth: if that
+        choreography ever breaks, the test fails on the yielded record
+        instead of reaching the kill at all.
         """
         kill_record: list = []
         with patch("process._kill_process_tree", side_effect=kill_record.append):
@@ -1245,10 +1268,13 @@ class AntigravityPluginTests(unittest.TestCase):
         # Only the generator's bounded wait (timeout=3.0) times out; every
         # later wait -- the ones inside terminate_process (timeout=2) --
         # returns 0, so teardown stays on the graceful branch and the
-        # process-tree kill is never reached (a fake's pid is None, so
-        # even an accidental kill route would raise TypeError, not signal
-        # a real process group; see _scripted_proc and
-        # _stubbed_kill_path).
+        # process-tree kill is never reached. The outermost guarantee is
+        # _stubbed_kill_path below: it replaces process._kill_process_tree
+        # wholesale, so neither killpg (POSIX) nor taskkill (Windows) can
+        # run, regardless of OS. The fake's pid=None pin is only the
+        # POSIX inner layer (TypeError before the syscall); on Windows the
+        # pin alone would spawn a real taskkill /PID "None" instead --
+        # see _scripted_proc and _stubbed_kill_path.
         proc.wait.side_effect = itertools.chain(
             [subprocess.TimeoutExpired(cmd=["agy"], timeout=3.0)],
             itertools.repeat(0),
