@@ -182,6 +182,44 @@ class AuthFileCompatibilityTests(unittest.TestCase):
                         )
                     self.assertTrue((out_dir / NEW_NAME).exists())
 
+    def test_isolated_home_relinks_selected_basename(self):
+        # Reused cwd: a link under the SELECTED basename left by a previous
+        # run must never survive. Pointing at a stale-but-existing source
+        # would be skipped by the exists() guard (child gets the old token);
+        # pointing at a deleted source makes it dangling, and creating over
+        # it fails (FileExistsError) so the home ends with no token at all.
+        # A real regular file is the documented exception: left untouched.
+        for link_state in ("dangling", "stale_source", "real_file"):
+            with self.subTest(link_state=link_state):
+                with tempfile.TemporaryDirectory() as cwd, tempfile.TemporaryDirectory() as src_dir:
+                    gemini_dir = Path(cwd) / "home" / ".gemini" / "antigravity-cli"
+                    gemini_dir.mkdir(parents=True)
+                    isolated_token = gemini_dir / NEW_NAME
+                    if link_state == "dangling":
+                        os.symlink(Path(src_dir) / "deleted-by-previous-run", isolated_token)
+                    elif link_state == "stale_source":
+                        os.symlink(_write_token(Path(src_dir) / "previous-run-token"), isolated_token)
+                    else:
+                        isolated_token.write_text("real file that must be left untouched", encoding="utf-8")
+                    selected = _write_token(Path(src_dir) / NEW_NAME)
+
+                    with patch("process.resolve_real_token_path", return_value=selected):
+                        _, out_dir = setup_isolated_home(cwd)
+
+                    if link_state == "real_file":
+                        # Conservative guard: pre-existing behavior, a
+                        # copy2-failure artifact could legitimately sit here.
+                        self.assertFalse(os.path.islink(isolated_token), "a real file must never be unlinked")
+                        self.assertEqual(
+                            isolated_token.read_text(encoding="utf-8"),
+                            "real file that must be left untouched",
+                        )
+                        self.assertEqual(out_dir, gemini_dir)
+                    else:
+                        self.assertTrue(os.path.lexists(isolated_token))
+                        self.assertTrue(isolated_token.exists(), "token must not be dangling")
+                        self.assertEqual(isolated_token.resolve(), selected.resolve())
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -179,6 +179,18 @@ def setup_isolated_home(cwd: Path | str) -> tuple[Path, Path]:
         # Preserve the selected basename so the agy1.2 filename keeps
         # working inside the isolated home (zero secret parsing).
         isolated_token = isolated_gemini_dir / real_token.name
+        # Reused cwd: the link under the selected basename may itself be a
+        # leftover pointing at a previous run's source. If that source is
+        # stale but still present, the exists() guard below would skip
+        # recreation and the child would use the old token; if it is
+        # dangling (previous run's temp source deleted), symlink raises
+        # FileExistsError and the copy2 fallback opens through the dangling
+        # link and fails, leaving no usable token. Always relink to the
+        # CURRENT real token. A real regular file is left untouched: it can
+        # be a valid copy2 hardlink-failure artifact and could be user data.
+        if os.path.islink(isolated_token):
+            with contextlib.suppress(OSError):
+                isolated_token.unlink()
         if not isolated_token.exists():
             try:
                 os.symlink(real_token, isolated_token)
