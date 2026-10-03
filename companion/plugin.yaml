@@ -1,0 +1,11 @@
+name: antigravity-companion
+version: "0.1.0"
+description: "CLI companion for the antigravity-subscription-directsdk provider. Lists Antigravity accounts with subscription eligibility and remaining quota, runs the official agy binary as a stored account, and inspects per-account quota. Reads the same on-disk contract as the provider (account registry plus one isolated HOME per account) and never prints tokens."
+author: "himanusia"
+license: MIT
+kind: standalone
+platforms:
+  - linux
+  - macos
+  - windows
+requires_hermes: ">=0.21.0"
