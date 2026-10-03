@@ -168,6 +168,22 @@ class AntigravitySubscriptionDirectSDKProfile(ProviderProfile):
             model=model,
         )
 
+    def fetch_account_usage(
+        self,
+        *,
+        base_url: str | None = None,
+        api_key: str | None = None,
+        force_refresh: bool = False,
+        **kwargs: Any,
+    ) -> Any:
+        """Fetch subscription quota snapshot for /usage, status bar, and desktop."""
+        try:
+            from .usage import get_account_usage_snapshot
+        except ImportError:
+            from usage import get_account_usage_snapshot
+
+        return get_account_usage_snapshot(force_refresh=force_refresh)
+
 
 def _classify_antigravity_error(
     error: Exception,
@@ -221,3 +237,4 @@ antigravity_profile = AntigravitySubscriptionDirectSDKProfile(
 )
 
 register_provider(antigravity_profile)
+
