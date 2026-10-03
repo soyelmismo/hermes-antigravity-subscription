@@ -8,3 +8,6 @@ htmlcov/
 *.swo
 *~
 .DS_Store
+
+# Local Antigravity CLI data (skills/config) — machine state, never publish
+.gemini/

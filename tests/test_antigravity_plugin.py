@@ -653,6 +653,24 @@ class AntigravityPluginTests(unittest.TestCase):
         self.assertNotIn("gemini-3.8-flash-high", models)
         self.assertNotIn("gemini-3.8-flash-medium", models)
 
+    def test_fetch_models_offers_union_of_host_and_rotation_accounts(self):
+        profile = get_provider_profile("antigravity-subscription-directsdk")
+        plugin_mod = sys.modules[type(profile).__module__]
+        accounts_mod = sys.modules[plugin_mod.list_accounts.__module__]
+        listing = {
+            None: ("gemini-3.8-flash-high", "claude-opus-5-5-medium", "claude-sonnet-5-5-medium"),
+            "/acc/a": ("gemini-3.8-flash-high", "claude-sonnet-4-6"),
+        }
+        accounts = [{"home_dir": "/acc/a", "enabled": True}, {"home_dir": "/acc/off", "enabled": False}]
+        with patch.object(plugin_mod, "list_accounts", return_value=accounts), \
+                patch.object(accounts_mod, "list_models_for_home",
+                             side_effect=lambda home, timeout=15.0: listing.get(home, ())):
+            models = profile.fetch_models()
+        self.assertEqual(
+            models,
+            ["gemini-3.8-flash", "claude-opus-5-5-medium", "claude-sonnet-5-5-medium", "claude-sonnet-4-6"],
+        )
+
     def test_profile_get_model_context_length(self):
         profile = get_provider_profile("antigravity-subscription-directsdk")
         self.assertEqual(profile.get_model_context_length("gemini-3.8-flash"), 200_000)

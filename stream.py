@@ -10,6 +10,7 @@ import subprocess
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Iterator, NamedTuple
 
@@ -498,7 +499,8 @@ class AntigravityStream(Iterator[Any]):
         success = False
         start_time = time.monotonic()
 
-        gemini_dir = getattr(self.client, "_isolated_gemini_dir", None)
+        acct_dir = getattr(self.client, "_current_account_gemini_dir", None)
+        gemini_dir = acct_dir if isinstance(acct_dir, (str, Path)) else getattr(self.client, "_isolated_gemini_dir", None)
         watchdog_stop = threading.Event()
         watchdog_thread: threading.Thread | None = None
 
