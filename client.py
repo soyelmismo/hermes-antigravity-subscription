@@ -51,6 +51,7 @@ try:
         _PROMPT_PREAMBLE,
         _ROLE_LABELS,
         _format_delta_prompt,
+        _latest_user_text,
         _format_messages_as_prompt,
         _longest_tool_call_prefix_match,
         _messages_match_prefix,
@@ -82,6 +83,7 @@ except ImportError:
         _PROMPT_PREAMBLE,
         _ROLE_LABELS,
         _format_delta_prompt,
+        _latest_user_text,
         _format_messages_as_prompt,
         _longest_tool_call_prefix_match,
         _messages_match_prefix,
@@ -146,6 +148,7 @@ __all__ = [
     "_TEMP_DIR_CLEANUP_BACKOFF_SECONDS",
     "_force_rmtree",
     "_format_delta_prompt",
+    "_latest_user_text",
     "_format_messages_as_prompt",
     "_kill_process_tree",
     "_longest_tool_call_prefix_match",
@@ -691,7 +694,9 @@ class AntigravityClient:
                         resolved_model, effort, conversation_id=conv_id_to_resume
                     )
                     delta_msgs = messages_list[len(ref_history):]
-                    prompt_payload = _format_delta_prompt(delta_msgs)
+                    prompt_payload = _format_delta_prompt(
+                        delta_msgs, pending_user_text=_latest_user_text(messages_list)
+                    )
                     dump_prompt_debug(
                         prompt=prompt_payload,
                         branch="delta",
