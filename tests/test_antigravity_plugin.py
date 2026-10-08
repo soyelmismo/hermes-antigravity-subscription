@@ -883,9 +883,9 @@ class AntigravityPluginTests(unittest.TestCase):
 
     def test_profile_get_model_context_length(self):
         profile = get_provider_profile("antigravity-subscription-directsdk")
-        self.assertEqual(profile.get_model_context_length("gemini-3.8-flash"), 200_000)
-        self.assertEqual(profile.get_model_context_length("gemini-3.1-pro"), 200_000)
-        self.assertEqual(profile.get_model_context_length("claude-sonnet-4-6"), 200_000)
+        self.assertEqual(profile.get_model_context_length("gemini-3.8-flash"), 239_000)
+        self.assertEqual(profile.get_model_context_length("gemini-3.1-pro"), 239_000)
+        self.assertEqual(profile.get_model_context_length("claude-sonnet-4-6"), 239_000)
 
         # Test env overrides
         with patch.dict(os.environ, {"ANTIGRAVITY_CONTEXT_LENGTH": "250000"}):

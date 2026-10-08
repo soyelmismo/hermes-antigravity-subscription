@@ -107,10 +107,10 @@ class AntigravitySubscriptionDirectSDKProfile(ProviderProfile):
     def get_model_context_length(self, model: str) -> int | None:
         """Declared context window for Antigravity CLI.
 
-        Defaults to 200,000 tokens so Hermes compaction triggers safely below agy's
-        compiled internal trajectory compaction threshold (~240k-250k tokens), ensuring
-        Hermes retains sovereign context control. Multi-turn trajectory persistence via
-        native --conversation prevents hitting agy's single-turn 100,000 token limit.
+        Defaults to 239,000 tokens so Hermes compaction triggers safely below agy's
+        compiled internal trajectory checkpoint threshold (239,616 tokens / 256k - 16k output tokens),
+        maximizing usable context while ensuring Hermes retains sovereign context control. Multi-turn
+        trajectory persistence via native --conversation prevents hitting agy's single-turn 100,000 token limit.
         Configurable via HERMES_ANTIGRAVITY_CONTEXT_LENGTH or ANTIGRAVITY_CONTEXT_LENGTH.
         """
         env_val = os.environ.get("HERMES_ANTIGRAVITY_CONTEXT_LENGTH") or os.environ.get("ANTIGRAVITY_CONTEXT_LENGTH")
@@ -121,7 +121,7 @@ class AntigravitySubscriptionDirectSDKProfile(ProviderProfile):
                     return val
             except ValueError:
                 pass
-        return 200_000
+        return 239_000
 
     def classify_api_error(
         self,
