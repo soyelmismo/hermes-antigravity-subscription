@@ -37,6 +37,8 @@ This plugin lets Hermes use Gemini and Claude models through your existing Antig
 
 **Dynamic discovery per account.** Available models and supported reasoning efforts are discovered dynamically from `agy models`. The picker reflects the exact models available on the user's account and subscription tier (including preview models or custom models configured in `agy` settings). A model that agy lists by bare name takes no `--effort`. A requested effort that the model lacks maps to the nearest supported one, the stronger on a tie (`medium` on `gemini-3.1-pro` becomes `high`). The result is cached for one hour; `models.py` provides an emergency fallback when `agy models` fails. Hermes' own `xhigh` and `max` map to `high`.
 
+> **Claude Model Aliases**: Requests for `claude-sonnet-5-5` or `claude-opus-5-5` resolve dynamically if present in the user's `agy models` catalog; if the account lacks them, they gracefully fall back to `claude-sonnet-4-6` and `claude-opus-4-6-thinking`.
+
 > **Trajectory Persistence & Context Length**: Multi-turn sessions persist across worker restarts via `agy --conversation <id>`, sending only incremental deltas on each turn. This bypasses `agy`'s single-turn 100,000-token prompt trimmer. The plugin declares 239,000 tokens to Hermes (configurable via `HERMES_ANTIGRAVITY_CONTEXT_LENGTH` or `ANTIGRAVITY_CONTEXT_LENGTH`), ensuring Hermes auto-compaction triggers safely below `agy`'s internal checkpoint threshold (239,616 tokens / 256k - 16k output tokens) and preserves sovereign context control. Conversation databases are strictly isolated inside the worker's private temp directory and automatically purged on session resets (`/new`).
 
 ### Model Compatibility
