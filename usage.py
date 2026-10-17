@@ -341,15 +341,27 @@ def fetch_subscription_usage(
             return None
 
 
+# The pooled groups agy reports by name. Only these are shortened to a friendly prefix.
+# A group the payload adds later keeps its own name, because two groups must never share a
+# label: agy reports "Gemini 4 Argon" as a quota pool separate from "Gemini Models" (paid Pro
+# plans), and both carry a weekly bucket — shortening every name that merely contains
+# "gemini" made the two indistinguishable in `hermes usage`.
+_CANONICAL_GROUP_PREFIXES = {
+    "gemini models": "Gemini",
+    "gemini model": "Gemini",
+    "claude and gpt models": "Claude/GPT",
+    "claude and gpt model": "Claude/GPT",
+}
+
+
 def _window_label(group_name: str, window: str) -> str:
-    """Generate a compact, readable label for AccountUsageWindow."""
-    gn = group_name.strip()
-    if "gemini" in gn.lower():
-        prefix = "Gemini"
-    elif "claude" in gn.lower() or "gpt" in gn.lower():
-        prefix = "Claude/GPT"
-    else:
-        prefix = gn
+    """Generate a compact, readable label for AccountUsageWindow.
+
+    Known pooled group names are shortened; any other group keeps its own name, so two
+    distinct quota groups can never render under the same label.
+    """
+    gn = " ".join(group_name.split()) or "Unknown"
+    prefix = _CANONICAL_GROUP_PREFIXES.get(gn.lower(), gn)
 
     w = window.strip().lower()
     if w == "5h":

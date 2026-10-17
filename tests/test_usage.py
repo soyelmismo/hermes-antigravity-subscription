@@ -86,6 +86,29 @@ SAMPLE_AGY_USAGE_JSON = {
     },
 }
 
+# agy reports a third group on paid plans: Gemini 4 Argon keeps its own weekly pool, separate
+# from the pooled Gemini Flash/Pro bucket. Both windows are "weekly", which is what made the
+# two indistinguishable while every name containing "gemini" collapsed onto one prefix.
+SAMPLE_AGY_USAGE_JSON_WITH_ARGON = json.loads(json.dumps(SAMPLE_AGY_USAGE_JSON))
+SAMPLE_AGY_USAGE_JSON_WITH_ARGON["command"]["data"]["groups"].append(
+    {
+        "name": "Gemini 4 Argon",
+        "description": (
+            "For paid Pro plans, Argon quota is separate. Higher Argon quota (included as "
+            "part of the larger Gemini quota bucket) is available on Ultra plans."
+        ),
+        "buckets": [
+            {
+                "id": "gemini-argon-wtu-weekly",
+                "name": "Gemini 4 Argon Weekly Limit",
+                "window": "weekly",
+                "remaining_fraction": 1.0,
+                "reset_time": "2026-10-24T14:06:32Z",
+            },
+        ],
+    }
+)
+
 STREAM_JSON_SAMPLE = (
     '{"event":"init","conversation_id":""}\n'
     f'{json.dumps({"event": "command_result", "command": SAMPLE_AGY_USAGE_JSON["command"]})}\n'
@@ -259,6 +282,20 @@ class TestDateTimeAndFormatting(unittest.TestCase):
         self.assertEqual(_window_label("Claude and GPT models", "weekly"), "Claude/GPT (Weekly)")
         self.assertEqual(_window_label("Custom Group", "daily"), "Custom Group (daily)")
 
+        # A group the payload adds later keeps its own name. agy reports "Gemini 4 Argon" as a
+        # pool separate from "Gemini Models" (paid Pro plans), and both carry a weekly bucket:
+        # collapsing every name that contains "gemini" onto one prefix made two distinct
+        # quotas read as a single line in `hermes usage`.
+        self.assertEqual(_window_label("Gemini 4 Argon", "weekly"), "Gemini 4 Argon (Weekly)")
+        self.assertEqual(_window_label("Gemini 4 Argon", "5h"), "Gemini 4 Argon (5h)")
+        self.assertNotEqual(
+            _window_label("Gemini 4 Argon", "weekly"),
+            _window_label("Gemini Models", "weekly"),
+        )
+        # Internal whitespace in the reported name does not change a known label.
+        self.assertEqual(_window_label("  Gemini   Models  ", "weekly"), "Gemini (Weekly)")
+        self.assertEqual(_window_label("", "weekly"), "Unknown (Weekly)")
+
 
 class TestSnapshotAndRendering(unittest.TestCase):
     def test_to_account_usage_snapshot(self):
@@ -281,6 +318,23 @@ class TestSnapshotAndRendering(unittest.TestCase):
         w_gemini_5h = next(w for w in snapshot.windows if w.label == "Gemini (5h)")
         assert w_gemini_5h.used_percent is not None
         self.assertAlmostEqual(w_gemini_5h.used_percent, 5.0613, places=2)
+
+    def test_snapshot_labels_stay_distinct_when_the_payload_adds_a_group(self):
+        usage = parse_agy_usage(SAMPLE_AGY_USAGE_JSON_WITH_ARGON)
+        assert usage is not None
+        snapshot = to_account_usage_snapshot(usage)
+
+        labels = [w.label for w in snapshot.windows]
+        self.assertEqual(len(labels), 5)
+        self.assertEqual(sorted(labels), sorted(set(labels)),
+                         f"two quota windows must never share a label: {labels}")
+
+        argon = next(w for w in snapshot.windows if w.label == "Gemini 4 Argon (Weekly)")
+        assert argon.used_percent is not None
+        self.assertAlmostEqual(argon.used_percent, 0.0, places=6)
+        pooled = next(w for w in snapshot.windows if w.label == "Gemini (Weekly)")
+        self.assertNotEqual(argon.reset_at, pooled.reset_at)
+        self.assertEqual(argon.reset_at, datetime(2026, 10, 24, 14, 6, 32, tzinfo=timezone.utc))
 
     def test_render_usage_text(self):
         usage = parse_agy_usage(SAMPLE_AGY_USAGE_JSON)
