@@ -42,7 +42,7 @@ class ProxyEnvTests(unittest.TestCase):
         parent = _base_env(HTTPS_PROXY="http://inherited:3128", FOO="bar")
         with tempfile.TemporaryDirectory() as tmp:
             env = self._build(parent, tmp)
-        expected = dict(parent, HOME=tmp, USERPROFILE=tmp)
+        expected = dict(parent, HOME=tmp, USERPROFILE=tmp, AGY_CLI_DISABLE_AUTO_UPDATE="true")
         self.assertEqual(env, expected)
         self.assertEqual(env["HTTPS_PROXY"], "http://inherited:3128")
         self.assertNotIn("NO_PROXY", env)
@@ -52,7 +52,7 @@ class ProxyEnvTests(unittest.TestCase):
         parent = _base_env(ANTIGRAVITY_PROXY="   ")
         with tempfile.TemporaryDirectory() as tmp:
             env = self._build(parent, tmp)
-        self.assertEqual(env, dict(parent, HOME=tmp, USERPROFILE=tmp))
+        self.assertEqual(env, dict(parent, HOME=tmp, USERPROFILE=tmp, AGY_CLI_DISABLE_AUTO_UPDATE="true"))
 
     def test_set_populates_all_proxy_variables(self):
         parent = _base_env(ANTIGRAVITY_PROXY=PROXY)

@@ -39,10 +39,10 @@ else:
 
 try:
     from .client import _force_rmtree
-    from .process import build_child_env, resolve_agy_command, setup_isolated_home
+    from .process import _no_window, build_child_env, resolve_agy_command, setup_isolated_home
 except ImportError:
     from client import _force_rmtree
-    from process import build_child_env, resolve_agy_command, setup_isolated_home
+    from process import _no_window, build_child_env, resolve_agy_command, setup_isolated_home
 
 logger = logging.getLogger(__name__)
 
@@ -261,6 +261,7 @@ def _query_agy_usage(timeout: float = 8.0) -> SubscriptionUsage | None:
             capture_output=True,
             text=True,
             timeout=timeout,
+            **_no_window(),
         )
         if res.returncode != 0:
             logger.warning(

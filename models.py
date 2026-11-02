@@ -121,9 +121,9 @@ def load_catalog(
     """
     global _catalog_cache
     try:
-        from .process import resolve_agy_command
+        from .process import _no_window, resolve_agy_command
     except ImportError:
-        from process import resolve_agy_command
+        from process import _no_window, resolve_agy_command
 
     with _catalog_lock:
         if only_if_stale:
@@ -136,6 +136,7 @@ def load_catalog(
                 capture_output=True,
                 text=True,
                 timeout=timeout,
+                **_no_window(),
             )
             catalog = parse_catalog(res.stdout)
         except Exception as exc:

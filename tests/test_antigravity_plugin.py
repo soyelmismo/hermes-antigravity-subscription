@@ -240,6 +240,8 @@ class AntigravityPluginTests(unittest.TestCase):
                     # Output is captured as bytes: no text mode, no encoding to get wrong.
                     self.assertFalse(call.get("text") or call.get("encoding") or call.get("universal_newlines"))
                     self.assertLessEqual(call.get("timeout"), 3)
+                    # Runs on every auth check: must not flash a console from a GUI-hosted Hermes.
+                    self.assertEqual(call.get("creationflags"), 0x08000000)
 
     def test_auth_check_explicit_dir_wins_over_windows_credential(self):
         # ANTIGRAVITY_CONFIG_DIR is an override: an empty explicit dir stays
@@ -2092,7 +2094,8 @@ class AntigravityPluginTests(unittest.TestCase):
         from client import _own_process_group
         with patch("os.name", "nt"):
             flags = _own_process_group()
-            self.assertEqual(flags, {"creationflags": 0x00000200})
+            # CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW
+            self.assertEqual(flags, {"creationflags": 0x08000200})
         with patch("os.name", "posix"):
             flags = _own_process_group()
             self.assertEqual(flags, {"start_new_session": True})
@@ -2110,7 +2113,37 @@ class AntigravityPluginTests(unittest.TestCase):
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 check=False,
+                creationflags=0x08000000,
             )
+
+    def test_background_agy_runs_hide_their_console_on_windows_only(self):
+        # `agy models` (model discovery) and `agy -p /usage` run in the
+        # background; on Windows they must not open a console window, and on
+        # POSIX they must not receive Windows-only creationflags.
+        import models
+        import usage
+
+        listed = SimpleNamespace(stdout="", returncode=0)
+        for os_name, expected in (("nt", {"creationflags": 0x08000000}), ("posix", {})):
+            with self.subTest(os_name=os_name):
+                with patch("process.os", wraps=os) as mock_os, \
+                        patch("models._catalog_cache", None), \
+                        patch("models.subprocess.run", return_value=listed) as models_run:
+                    mock_os.name = os_name
+                    models.load_catalog()
+                self.assertEqual(
+                    {k: v for k, v in models_run.call_args.kwargs.items() if k == "creationflags"}, expected
+                )
+                with patch("process.os", wraps=os) as mock_os, \
+                        patch("usage.setup_isolated_home", return_value=(Path("unused"), None)), \
+                        patch("usage.build_child_env", return_value={}), \
+                        patch("usage.subprocess.run", return_value=SimpleNamespace(
+                            stdout="", stderr="", returncode=1)) as usage_run:
+                    mock_os.name = os_name
+                    usage._query_agy_usage(timeout=1.0)
+                self.assertEqual(
+                    {k: v for k, v in usage_run.call_args.kwargs.items() if k == "creationflags"}, expected
+                )
 
     def test_child_env_windows_userprofile(self):
         # TemporaryDirectory (not /tmp): on Windows "/tmp" resolves to a

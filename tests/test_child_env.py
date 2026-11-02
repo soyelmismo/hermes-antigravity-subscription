@@ -148,6 +148,16 @@ class ChildEnvSecretScrubbingTests(unittest.TestCase):
         for name, value in self.HARMLESS.items():
             self.assertEqual(child[name], value)
 
+    def test_auto_update_is_disabled_unless_the_parent_sets_it(self):
+        # agy's background updater opens its own console on Windows; an
+        # explicit parent value (kept above) still wins.
+        harmless = {k: v for k, v in self.HARMLESS.items() if k != "AGY_CLI_DISABLE_AUTO_UPDATE"}
+        with patch.dict(os.environ, harmless, clear=True):
+            with patch("process.os.name", "posix"):
+                with patch("process.resolve_real_token_path", return_value=_MOCK_TOKEN_PATH):
+                    child = build_child_env("/isolated/home")
+        self.assertEqual(child["AGY_CLI_DISABLE_AUTO_UPDATE"], "true")
+
     def test_passthrough_keeps_named_variables(self):
         child = self._build({"ANTIGRAVITY_ENV_PASSTHROUGH": "GEMINI_API_KEY, GITHUB_TOKEN"})
         self.assertEqual(child["GEMINI_API_KEY"], "g-secret")

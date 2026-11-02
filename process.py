@@ -44,10 +44,22 @@ def _is_existing_file(path: str | Path) -> bool:
         return False
 
 
+_CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+
+
+def _no_window() -> dict[str, Any]:
+    """Popen kwargs that keep a background console child from opening a window on Windows.
+
+    A GUI-hosted Hermes (no console of its own) otherwise gets a visible
+    console for every console-subsystem child (agy, cmdkey, taskkill).
+    """
+    return {"creationflags": _CREATE_NO_WINDOW} if os.name == "nt" else {}
+
+
 def _own_process_group() -> dict[str, Any]:
-    """Popen kwargs that put native (and any child processes it spawns) in a group we can kill cleanly."""
+    """Popen kwargs for background processes in a group we can kill cleanly."""
     if os.name == "nt":
-        return {"creationflags": getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)}
+        return {"creationflags": getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200) | _CREATE_NO_WINDOW}
     return {"start_new_session": True}
 
 
@@ -62,6 +74,7 @@ def _kill_process_tree(proc: subprocess.Popen) -> None:
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 check=False,
+                **_no_window(),
             )
         return
     try:
@@ -233,7 +246,8 @@ def _windows_credential_present() -> bool:
     """
     try:
         # Bytes, not text: cmdkey prints in the console/OEM code page, so nothing is decoded.
-        out = subprocess.run(["cmdkey", "/list:gemini:antigravity"], capture_output=True, timeout=3, check=False)
+        out = subprocess.run(["cmdkey", "/list:gemini:antigravity"], capture_output=True, timeout=3, check=False,
+                             **_no_window())
     except (OSError, subprocess.SubprocessError):  # missing cmdkey, TimeoutExpired
         return False
     # Fail closed on a failing cmdkey; the listed target keeps the casing it was stored with.
@@ -776,6 +790,9 @@ def build_child_env(isolated_home: Path | str) -> dict[str, str]:
     env["USERPROFILE"] = home_str
     if "HOMEPATH" in env:
         env["HOMEPATH"] = home_str
+    # agy's background updater (`agy --bg-updater`) opens its own console on
+    # Windows even when agy itself is hidden. An explicit parent value wins.
+    env.setdefault("AGY_CLI_DISABLE_AUTO_UPDATE", "true")
 
     # agy 1.2.16 detects SSH sessions via SSH_CONNECTION, SSH_CLIENT, or SSH_TTY
     # and forces file-based token storage ("Using file-based token storage because
