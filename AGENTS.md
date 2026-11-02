@@ -24,6 +24,11 @@ This repository implements the `antigravity-subscription-directsdk` provider plu
   ```bash
   PYTHONPATH=/usr/local/lib/hermes-agent:. pytest
   ```
+  The suite is hermetic. `conftest.py` isolates `$HERMES_HOME` (so provider
+  discovery cannot re-register a copy of the plugin installed there) and
+  re-registers the source tree's profile before every test (the repository root
+  is a Python package, so pytest and the test modules each import
+  `__init__.py` again, and the registry is last-writer-wins).
 - **Security Boundaries**:
   - Do not add `--dangerously-skip-permissions` to default arguments.
   - Preserve isolated HOME directory sandboxing and token symlink safeguards.

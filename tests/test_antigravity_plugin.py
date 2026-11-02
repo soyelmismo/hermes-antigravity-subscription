@@ -91,6 +91,31 @@ class AntigravityPluginTests(unittest.TestCase):
         self.assertEqual(profile.auth_type, "external_process")
         self.assertEqual(profile.api_mode, "chat_completions")
 
+    def test_registry_profile_is_the_source_tree_under_test(self):
+        # $HERMES_HOME/plugins/ can hold a second copy of this plugin: a dev box
+        # with the plugin installed, or a fork branch checked out elsewhere.
+        # get_provider_profile() runs provider discovery, which re-registers
+        # that copy under the same name and replaces the profile registered from
+        # the source tree. Field differences between the two copies then fail
+        # assertions that pass on a clean checkout.
+        # conftest.py points HERMES_HOME at an empty directory and re-registers
+        # the source tree's profile before every test; assert the isolation
+        # holds instead of trusting it. The check is on the defining file, not
+        # object identity, because pytest imports the repository root as a
+        # package (the plugin entry point lives there) and the suite imports it
+        # again under its own name, so the same file legitimately loads twice.
+        import inspect
+
+        profile = get_provider_profile("antigravity-subscription-directsdk")
+        self.assertIsNotNone(profile)
+        defining_file = inspect.getsourcefile(type(profile))
+        if defining_file is None:
+            self.fail(f"cannot resolve the defining file of {type(profile)!r}")
+        self.assertEqual(
+            Path(defining_file).resolve(),
+            (Path(__file__).resolve().parents[1] / "__init__.py").resolve(),
+        )
+
     def test_alias_lookup(self):
         profile = get_provider_profile("antigravity")
         self.assertIsNotNone(profile)

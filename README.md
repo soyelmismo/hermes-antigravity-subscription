@@ -267,6 +267,23 @@ Run the test suite:
 PYTHONPATH=/usr/local/lib/hermes-agent:. pytest
 ```
 
+The suite is hermetic. `conftest.py` isolates two host facts that would
+otherwise decide which copy of the plugin answers `get_provider_profile()`:
+
+- `$HERMES_HOME/plugins/` may hold another copy of this plugin, for example on a
+  development box where the plugin is installed. Hermes discovers it on the
+  first lookup and re-registers it under the same name, so field differences
+  between the two copies fail assertions that pass on a clean checkout.
+- The repository root is itself a Python package, because the plugin entry
+  point is `__init__.py`. pytest imports it while collecting and the test
+  modules import it again under their own names. Each import runs
+  `register_provider()` and the registry is last-writer-wins, so which copy
+  answers depends on collection order.
+
+`HERMES_HOME` is pointed at an empty throwaway directory for the first case,
+and the source tree's profile is re-registered before every test for the
+second.
+
 ---
 
 ## License
