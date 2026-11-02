@@ -814,6 +814,19 @@ class AntigravityPluginTests(unittest.TestCase):
         profile = get_provider_profile("antigravity-subscription-directsdk")
         self.assertEqual(profile.fallback_models, ())
 
+    def test_profile_opts_into_host_streaming_when_supported(self):
+        # Hermes keeps external-process providers non-streaming unless the
+        # profile sets supports_streaming=True; hosts without the field must
+        # still construct the profile.
+        from dataclasses import fields
+        from providers.base import ProviderProfile
+
+        profile = get_provider_profile("antigravity-subscription-directsdk")
+        if "supports_streaming" in {f.name for f in fields(ProviderProfile)}:
+            self.assertIs(profile.supports_streaming, True)
+        else:
+            self.assertNotIn("supports_streaming", vars(profile))
+
     def test_fetch_models_lists_every_family_once(self):
         import models
 
@@ -1643,10 +1656,40 @@ class AntigravityPluginTests(unittest.TestCase):
         self.assertIn("Antigravity execution failed", str(ctx.exception))
         self.assertIn("no result event", str(ctx.exception))
         self.assertIn("return code 0", str(ctx.exception))
+        self.assertIn("stdout closed after", str(ctx.exception))
         history_spy.assert_not_called()
         self.assertIsNone(client._worker_proc)
         proc.terminate.assert_called_once()
         self.assertFalse(client._worker_lock.locked())
+
+    def test_structured_host_timeout_uses_read_budget(self):
+        # Hermes' streaming caller passes httpx.Timeout; it must not be
+        # silently replaced by the 300s default and then enforced as the
+        # whole-turn deadline.
+        import httpx
+
+        tmp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp_dir.cleanup)
+        cases = (
+            (httpx.Timeout(connect=5.0, read=900.0, write=10.0, pool=5.0), 900.0),
+            (httpx.Timeout(None), float("inf")),
+            (45.0, 45.0),
+            (None, 300.0),
+        )
+        for timeout, expected in cases:
+            with self.subTest(timeout=timeout):
+                client = AntigravityClient(cwd=tmp_dir.name)
+                proc = self._scripted_proc([], alive=False)
+                with patch("subprocess.Popen", return_value=proc):
+                    stream = client.chat.completions.create(
+                        model="gemini-3.8-flash-high",
+                        messages=[{"role": "user", "content": "hello"}],
+                        stream=True,
+                        timeout=timeout,
+                    )
+                    self.assertEqual(stream.timeout, expected)
+                    stream.close()
+                client.close()
 
     def test_oneshot_eof_without_result_event_is_not_success(self):
         # Same blind spot for oneshots: exit code 0 passed
@@ -1734,6 +1777,7 @@ class AntigravityPluginTests(unittest.TestCase):
         self.assertIn("Antigravity execution failed", str(ctx.exception))
         self.assertIn("no result event", str(ctx.exception))
         self.assertIn("process still alive", str(ctx.exception))
+        self.assertIn("stream deadline 30s reached", str(ctx.exception))
         history_spy.assert_not_called()
         self.assertIsNone(client._worker_proc)
         proc.terminate.assert_called_once()

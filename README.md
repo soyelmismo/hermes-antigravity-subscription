@@ -12,7 +12,8 @@ This plugin lets Hermes use Gemini and Claude models through your existing Antig
 
 ## How It Works
 
-- **Token streaming**: Reads stdout chunks from `agy --output-format stream-json` and yields standard completion deltas.
+- **Token streaming**: Reads stdout chunks from `agy --output-format stream-json` and yields standard completion deltas. On Hermes versions that support `ProviderProfile.supports_streaming`, the profile opts in, so Hermes consumes these deltas as they arrive instead of waiting for the assembled response. Older Hermes versions keep the non-streaming path.
+- **Stream timeouts**: Streaming calls use the read budget of the `httpx.Timeout` Hermes passes (for `agy://local`, normally `HERMES_API_TIMEOUT`, 1800 s) as the turn deadline. Scalar timeouts are unchanged; with no timeout the 300 s default applies. A turn that ends without agy's `result` event reports why reading stopped (`stream deadline` or `stdout closed`), the elapsed time, and the age of the last stdout line.
 - **Tool call routing**: The model emits `<tool_call>` tags in text. The plugin parses these into OpenAI function call deltas, so Hermes executes tools on the host instead of `agy`.
 - **Tool execution guard**: `agy` registers local system tools by default. This plugin runs `agy` in headless mode without permissions skip flags. If `agy` attempts to execute an internal tool step, the stream closes and terminates the child process.
 - **Thinking effort mapping**: Maps Hermes reasoning effort settings (`low`, `medium`, `high`) to backend model variants (`gemini-3.8-flash-low`, `gemini-3.8-flash-high`).

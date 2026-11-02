@@ -497,6 +497,7 @@ class AntigravityStream(Iterator[Any]):
         status: str,
         process_exit: int | None,
         has_evidence: bool,
+        stop_detail: str = "",
     ) -> str:
         """Detail for a turn that ended without proving success.
 
@@ -527,9 +528,10 @@ class AntigravityStream(Iterator[Any]):
             if process_exit not in (None, 0):
                 detail += f", process exited with return code {process_exit}"
             return detail
+        suffix = f" ({stop_detail})" if stop_detail else ""
         if process_exit is None:
-            return "no result event, process still alive"
-        return f"no result event, process exited with return code {process_exit}"
+            return "no result event, process still alive" + suffix
+        return f"no result event, process exited with return code {process_exit}" + suffix
 
     def _get_stderr_tail(self) -> str:
         """Retrieve bounded stderr tail from the drainer, or fall back to direct read."""
@@ -561,6 +563,10 @@ class AntigravityStream(Iterator[Any]):
         neutralized_tool_step = False
         success = False
         start_time = time.monotonic()
+        # Why the read loop ended (diagnostics for missing-result failures):
+        # None after the loop means the absolute deadline expired.
+        stop_reason: str | None = None
+        last_stdout_at: float | None = None
 
         gemini_dir = getattr(self.client, "_isolated_gemini_dir", None)
         watchdog_stop = threading.Event()
@@ -599,10 +605,12 @@ class AntigravityStream(Iterator[Any]):
 
                 if not line:
                     if self.proc.poll() is not None:
+                        stop_reason = "stdout closed"
                         break
                     time.sleep(0.01)
                     continue
 
+                last_stdout_at = time.monotonic()
                 line = line.strip()
                 if not line.startswith("{"):
                     continue
@@ -742,6 +750,15 @@ class AntigravityStream(Iterator[Any]):
                     )
                     break
 
+            if not saw_result and stop_reason is None:
+                stop_reason = f"stream deadline {self.timeout:g}s reached"
+            now = time.monotonic()
+            stop_detail = f"{stop_reason or 'result'} after {now - start_time:.1f}s"
+            stop_detail += (
+                f", last stdout {now - last_stdout_at:.1f}s ago"
+                if last_stdout_at is not None
+                else ", no stdout received"
+            )
             if text_buffer and not has_tool_calls:
                 if self.has_tools or "<tool_call>" in text_buffer:
                     parsed_calls, extra_text = _parse_tool_block(text_buffer)
@@ -835,6 +852,7 @@ class AntigravityStream(Iterator[Any]):
                             status=status,
                             process_exit=returncode,
                             has_evidence=has_content or has_tool_calls,
+                            stop_detail=stop_detail,
                         )
                     )
             else:
@@ -908,6 +926,7 @@ class AntigravityStream(Iterator[Any]):
                             status=status,
                             process_exit=worker_exit,
                             has_evidence=has_content or has_tool_calls,
+                            stop_detail=stop_detail,
                         )
                     )
 

@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+from dataclasses import fields
 from typing import Any
 
 from providers import register_provider
@@ -227,6 +228,15 @@ def _classify_antigravity_error(
     return None
 
 
+# Hermes keeps external-process providers on its non-streaming path unless the
+# profile opts in. Hermes releases that predate the opt-in (including the CI
+# pin v2026.9.21) have no such field, so pass it only when the host declares it.
+_STREAMING_OPT_IN: dict[str, Any] = (
+    {"supports_streaming": True}
+    if "supports_streaming" in {f.name for f in fields(ProviderProfile)}
+    else {}
+)
+
 antigravity_profile = AntigravitySubscriptionDirectSDKProfile(
     name="antigravity-subscription-directsdk",
     aliases=("antigravity", "agy", "antigravity-directsdk"),
@@ -244,6 +254,7 @@ antigravity_profile = AntigravitySubscriptionDirectSDKProfile(
     supports_vision=True,
     unsupported_response_formats=("json_schema",),
     classify_api_error=_classify_antigravity_error,
+    **_STREAMING_OPT_IN,
 )
 
 register_provider(antigravity_profile)

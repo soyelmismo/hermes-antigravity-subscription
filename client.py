@@ -682,6 +682,11 @@ class AntigravityClient:
         effort_param = reasoning_effort or extra_kwargs.get("reasoning_effort")
         resolved_model, effort = self._resolve_model_and_effort(model, effort_param)
         messages_list = list(messages or [])
+        # Hermes' streaming caller passes an httpx.Timeout, not a scalar; use
+        # its read budget instead of silently falling back to the default.
+        if hasattr(timeout, "read"):
+            read_timeout = getattr(timeout, "read")
+            timeout = float("inf") if read_timeout is None else read_timeout
         effective_timeout = (
             float(timeout)
             if isinstance(timeout, (int, float)) and timeout > 0
