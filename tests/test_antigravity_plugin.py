@@ -675,8 +675,13 @@ class AntigravityPluginTests(unittest.TestCase):
         self.assertEqual(client._resolve_model_and_effort("claude-opus-4-6-thinking", "high"), ("claude-opus-4-6-thinking", None))
 
         # Phantom/legacy 5-5 requests alias safely to 4-6 without --effort.
-        self.assertEqual(client._resolve_model_and_effort("claude-sonnet-5-5", "low"), ("claude-sonnet-4-6", None))
-        self.assertEqual(client._resolve_model_and_effort("claude-opus-5-5", "high"), ("claude-opus-4-6-thinking", None))
+        # Pin an empty catalogue: this assertion is about the built-in alias
+        # map, but an unpinned cache would load the host's live `agy models`
+        # (where a 5-5 entry makes the family matcher win over the alias).
+        with patch("models._catalog_cache", None), \
+                patch("models.load_catalog", return_value={}):
+            self.assertEqual(client._resolve_model_and_effort("claude-sonnet-5-5", "low"), ("claude-sonnet-4-6", None))
+            self.assertEqual(client._resolve_model_and_effort("claude-opus-5-5", "high"), ("claude-opus-4-6-thinking", None))
 
         # Aliases dynamically resolve against available catalog (5.5 with effort vs 4.6 without effort)
         catalog_5_5 = {
