@@ -17,8 +17,8 @@ try:
     from .process import _check_early_quota_error
     from .prompt import (
         _TOOL_CALL_CLOSE,
-        _TOOL_CALL_OPEN,
         _find_tool_call_close,
+        _has_unfinished_tool_call_frame,
         _longest_tool_call_prefix_match,
         _parse_tool_block,
     )
@@ -26,8 +26,8 @@ except ImportError:
     from process import _check_early_quota_error
     from prompt import (
         _TOOL_CALL_CLOSE,
-        _TOOL_CALL_OPEN,
         _find_tool_call_close,
+        _has_unfinished_tool_call_frame,
         _longest_tool_call_prefix_match,
         _parse_tool_block,
     )
@@ -697,7 +697,10 @@ class AntigravityStream(Iterator[Any]):
                         # on purpose, and the empty completion assembled
                         # afterwards is the pinned behavior (see
                         # test_native_tool_step_neutralization_in_stream).
+                        # The stop cause is recorded too, so diagnostics do
+                        # not misreport this deliberate abort as a deadline.
                         neutralized_tool_step = True
+                        stop_reason = "native tool step neutralized"
                         break
                     if "usage" in step:
                         usage_data = step["usage"]
@@ -811,16 +814,26 @@ class AntigravityStream(Iterator[Any]):
             # The old flush then re-emitted the raw block as assistant text
             # and sealed the turn with finish_reason="stop", presenting a
             # broken tool call as a successful answer. Fail the turn instead.
-            # Checked even after a complete call so a truncated second block
-            # is not silently dropped.
-            if self.has_tools and (
-                in_tool_call or (text_buffer and _TOOL_CALL_OPEN in text_buffer)
+            # The same frame scanner as the incremental splitter decides what
+            # is unfinished, so a complete block delivered only in
+            # result.response is parsed rather than rejected, and a stream cut
+            # inside the opening tag, JSON body, or closing tag fails. Checked
+            # even after a complete call so a truncated second block is not
+            # silently dropped. Native-tool neutralization is a deliberate
+            # abort, not truncation, and keeps its pinned empty-stop behavior.
+            if (
+                self.has_tools
+                and not neutralized_tool_step
+                and (
+                    in_tool_call
+                    or (text_buffer and _has_unfinished_tool_call_frame(text_buffer))
+                )
             ):
                 raise RuntimeError(
                     "Antigravity execution failed: incomplete tool call block "
                     f"in stream ({stop_detail})"
                 )
-            if text_buffer and not has_tool_calls:
+            if text_buffer and not has_tool_calls and not neutralized_tool_step:
                 if self.has_tools or "<tool_call>" in text_buffer:
                     parsed_calls, extra_text = _parse_tool_block(text_buffer)
                     if parsed_calls:

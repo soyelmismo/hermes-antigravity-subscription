@@ -14,6 +14,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from prompt import _parse_tool_block
 from stream import AntigravityStream
 
 TOOL_CALL_CLOSE = "</tool_call>"
@@ -272,3 +273,207 @@ def test_nonzero_exit_with_stale_quota_log_reports_exit_code(
     assert "Antigravity execution failed" in message
     assert "return code 1" in message
     assert "RESOURCE_EXHAUSTED" not in message
+
+
+# ---------------------------------------------------------------------------
+# result.response uses the same frame parser as streamed deltas
+# ---------------------------------------------------------------------------
+
+
+def test_complete_tool_call_only_in_result_response_is_parsed():
+    stream, _proc_mock, _client = _stream(_events(final=_block("valid")))
+
+    calls, contents, finishes = _consumed(list(stream))
+
+    assert [call.function.name for call in calls] == ["write_file"]
+    assert json.loads(calls[0].function.arguments)["content"] == "valid"
+    assert contents == []
+    assert finishes == ["tool_calls"]
+
+
+def test_result_only_call_with_literal_closing_tag_in_arguments_is_parsed():
+    stream, _proc_mock, _client = _stream(
+        _events(final=_block("text </tool_call> text"))
+    )
+
+    calls, contents, finishes = _consumed(list(stream))
+
+    assert len(calls) == 1
+    assert json.loads(calls[0].function.arguments)["content"] == (
+        "text </tool_call> text"
+    )
+    assert contents == []
+    assert finishes == ["tool_calls"]
+
+
+def test_two_complete_tool_calls_only_in_result_response_are_unique():
+    stream, _proc_mock, _client = _stream(
+        _events(final=_block("one") + _block("two"))
+    )
+
+    calls, contents, finishes = _consumed(list(stream))
+
+    assert [call.index for call in calls] == [0, 1]
+    assert [call.id for call in calls] == ["same", "call_2"]
+    assert [json.loads(call.function.arguments)["content"] for call in calls] == [
+        "one",
+        "two",
+    ]
+    assert contents == []
+    assert finishes == ["tool_calls"]
+
+
+def test_result_only_plain_text_with_tools_stays_content():
+    stream, _proc_mock, _client = _stream(_events(final="all done"))
+
+    calls, contents, finishes = _consumed(list(stream))
+
+    assert calls == []
+    assert contents == ["all done"]
+    assert finishes == ["stop"]
+
+
+@pytest.mark.parametrize(
+    "final, expected",
+    [(_block("valid"), 1), (_block("one") + _block("two"), 2)],
+)
+def test_result_only_tool_calls_still_parse_without_tools_configured(final, expected):
+    stream, _proc_mock, _client = _stream(_events(final=final), tools=False)
+
+    calls, contents, finishes = _consumed(list(stream))
+
+    assert len(calls) == expected
+    assert contents == []
+    assert finishes == ["tool_calls"]
+
+
+def test_result_only_prose_mentioning_tag_stays_text_without_tools():
+    response = "Use <tool_call> to call tools."
+    stream, _proc_mock, _client = _stream(_events(final=response), tools=False)
+
+    calls, contents, finishes = _consumed(list(stream))
+
+    assert calls == []
+    assert contents == [response]
+    assert finishes == ["stop"]
+
+
+@pytest.mark.parametrize(
+    "obj",
+    [
+        {},
+        {"function": {"name": "", "arguments": "{}"}},
+        {"function": {"name": "   ", "arguments": "{}"}},
+        {"function": {"name": 123, "arguments": "{}"}},
+        {"function": "not-a-dict"},
+    ],
+)
+def test_tool_objects_without_a_nonblank_function_name_are_rejected(obj):
+    calls, _text = _parse_tool_block(f"<tool_call>{json.dumps(obj)}</tool_call>")
+
+    assert calls == []
+
+
+def test_tool_call_function_name_is_stripped():
+    body = '{"function": {"name": "  write_file  ", "arguments": "{}"}}'
+
+    calls, _text = _parse_tool_block(f"<tool_call>{body}</tool_call>")
+
+    assert [call.function.name for call in calls] == ["write_file"]
+
+
+@pytest.mark.parametrize("identifier", [None, 123, "", "   "])
+def test_tool_call_blank_or_non_string_id_falls_back(identifier):
+    obj = {"id": identifier, "function": {"name": "write_file", "arguments": "{}"}}
+
+    calls, _text = _parse_tool_block(f"<tool_call>{json.dumps(obj)}</tool_call>")
+
+    assert [call.id for call in calls] == ["call_1"]
+
+
+def test_tool_call_string_id_is_preserved():
+    obj = {"id": "call_x", "function": {"name": "write_file", "arguments": "{}"}}
+
+    calls, _text = _parse_tool_block(f"<tool_call>{json.dumps(obj)}</tool_call>")
+
+    assert [call.id for call in calls] == ["call_x"]
+
+
+# ---------------------------------------------------------------------------
+# A stream cut inside any part of a frame fails closed
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("tail", ["<tool_cal", "<tool_call"])
+def test_stream_cut_inside_opening_tag_after_a_complete_call_fails(tail):
+    stream, _proc_mock, _client = _stream(_events(_block("one"), tail))
+
+    chunks = []
+    with pytest.raises(RuntimeError) as ctx:
+        for chunk in stream:
+            chunks.append(chunk)
+
+    assert "incomplete tool call block" in str(ctx.value)
+    calls, contents, finishes = _consumed(chunks)
+    assert [call.id for call in calls] == ["same"]
+    assert contents == []
+    assert finishes == []
+
+
+@pytest.mark.parametrize("tail", ["<tool_cal", "<tool_call"])
+def test_stream_cut_inside_opening_tag_without_a_call_fails(tail):
+    stream, _proc_mock, _client = _stream(_events(tail))
+
+    chunks = []
+    with pytest.raises(RuntimeError) as ctx:
+        for chunk in stream:
+            chunks.append(chunk)
+
+    assert "incomplete tool call block" in str(ctx.value)
+    calls, contents, finishes = _consumed(chunks)
+    assert calls == []
+    assert contents == []
+    assert finishes == []
+
+
+def test_stream_cut_inside_closing_tag_after_a_complete_call_fails():
+    partial = (
+        '<tool_call>{"id":"b","function":{"name":"write_file",'
+        '"arguments":"{}"}</tool_ca'
+    )
+    stream, _proc_mock, _client = _stream(_events(_block("one"), partial))
+
+    chunks = []
+    with pytest.raises(RuntimeError) as ctx:
+        for chunk in stream:
+            chunks.append(chunk)
+
+    assert "incomplete tool call block" in str(ctx.value)
+    calls, _contents, finishes = _consumed(chunks)
+    assert [call.id for call in calls] == ["same"]
+    assert finishes == []
+
+
+# ---------------------------------------------------------------------------
+# Native tool neutralization keeps its pinned empty-stop behavior
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("partial", ['<tool_call>{"id":"x",', "<tool_cal"])
+def test_native_tool_step_neutralization_with_partial_block_does_not_fail(partial):
+    events = [
+        {"event": "step_update", "step_update": {"text_delta": partial}},
+        {
+            "event": "step_update",
+            "step_update": {"step_type": "tool", "tool_name": "run_command"},
+        },
+    ]
+    stream, _proc_mock, client = _stream(events)
+
+    chunks = list(stream)
+
+    calls, contents, finishes = _consumed(chunks)
+    assert calls == []
+    assert contents == []
+    assert finishes == ["stop"]
+    client._terminate_process.assert_called()

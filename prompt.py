@@ -413,15 +413,44 @@ def _longest_tool_call_prefix_match(text: str) -> int:
     return 0
 
 
+def _has_unfinished_tool_call_frame(text: str) -> bool:
+    """True when *text* ends inside a ``<tool_call>`` frame.
+
+    Uses the incremental splitter's frame boundary (:func:`_find_tool_call_close`)
+    so a complete block whose JSON contains a literal closing tag is not
+    mistaken for a truncated one. An opening tag without a matching close, or
+    a trailing fragment of the opening tag (``<tool_cal``), is unfinished.
+    """
+    cursor = 0
+    while True:
+        start = text.find(_TOOL_CALL_OPEN, cursor)
+        if start == -1:
+            return _longest_tool_call_prefix_match(text) > 0
+        close = _find_tool_call_close(text, start + len(_TOOL_CALL_OPEN))
+        if close == -1:
+            return True
+        cursor = close + len(_TOOL_CALL_CLOSE)
+
+
 def _tool_call_from_object(obj: Any, ordinal: int) -> Any | None:
-    """Build one tool-call delta object from a decoded JSON value."""
+    """Build one tool-call delta object from a decoded JSON value.
+
+    Mirrors the core ACP parser: the value must be an object whose
+    ``function`` is an object with a non-blank string name. Anything else is
+    malformed and returns None, so a nameless call is never emitted.
+    """
     if not isinstance(obj, dict):
         return None
-    fn = obj.get("function", {})
+    fn = obj.get("function")
     if not isinstance(fn, dict):
-        fn = {}
-    call_id = obj.get("id") or f"call_{ordinal}"
-    fn_name = fn.get("name", "")
+        return None
+    fn_name = fn.get("name")
+    if not isinstance(fn_name, str) or not fn_name.strip():
+        return None
+    fn_name = fn_name.strip()
+    call_id = obj.get("id")
+    if not isinstance(call_id, str) or not call_id.strip():
+        call_id = f"call_{ordinal}"
     fn_args = fn.get("arguments", "{}")
     if not isinstance(fn_args, str):
         fn_args = json.dumps(fn_args, ensure_ascii=False)
@@ -437,7 +466,8 @@ def _extract_tagged_tool_calls(block: str) -> tuple[list[Any], str]:
 
     The frame boundary is :func:`_find_tool_call_close`, so a literal closing
     tag inside a JSON string does not terminate the block. Text outside valid
-    frames is returned as ``cleaned_text``.
+    frames, and a frame whose body is not a valid call, are returned as
+    ``cleaned_text``.
     """
     calls: list[Any] = []
     text_parts: list[str] = []
@@ -465,6 +495,11 @@ def _extract_tagged_tool_calls(block: str) -> tuple[list[Any], str]:
         else:
             calls.append(call)
         cursor = end
+    if not calls:
+        # No frame was consumed: hand the input back untouched. Joining the
+        # pieces would insert separators at every tag boundary and corrupt
+        # ordinary prose that merely mentions the markup.
+        return [], block.strip()
     return calls, "\n".join(part.strip() for part in text_parts if part and part.strip()).strip()
 
 
