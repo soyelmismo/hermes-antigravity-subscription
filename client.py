@@ -530,9 +530,16 @@ class AntigravityClient:
         timer.start()
 
     def _reap_idle_worker(self, proc: subprocess.Popen) -> None:
-        # A held worker lock means a turn is running on the worker; that turn
-        # re-arms the countdown when it finishes, so there is nothing to do.
+        # A held worker lock means a turn is running on the worker.
         if not self._worker_lock.acquire(blocking=False):
+            # Re-arm rather than give up. The countdown used to be armed only
+            # by a turn that FINISHED, so a wedged or abandoned turn left the
+            # worker with no timer at all and it survived the idle bound
+            # entirely. Re-arming repeats the check without ever reaching the
+            # terminate below, so a genuinely busy worker is still safe.
+            with self._lock:
+                if self._worker_proc is proc:
+                    self._arm_idle_timer_locked()
             return
         try:
             with self._lock:
@@ -588,6 +595,19 @@ class AntigravityClient:
             self._worker_history = list(self._conversation_history) if conversation_id else []
             self._worker_usage_baseline = {}
             self._active_processes.add(proc)
+            # Give every worker a death date at spawn, not only when a turn
+            # finishes. The countdown was armed solely by
+            # _update_worker_history, so a worker whose first turn never
+            # completed -- an abandoned stream (consumer stopped iterating
+            # without close()), a cancelled request, or a capacity retry that
+            # dropped the generator -- had no timer and no close() caller, and
+            # lived for the lifetime of the gateway. Hermes does not call
+            # close() on an evicted client (see _DEFAULT_WORKER_IDLE_SECONDS),
+            # so that was unbounded: 86 such workers were measured holding
+            # 15.3 GB on a 16 GB host. A live turn still holds _worker_lock,
+            # which _reap_idle_worker respects, and the turn's own completion
+            # re-arms the countdown, so arming here cannot cut a turn short.
+            self._arm_idle_timer_locked()
             return proc
 
     def _run_oneshot_completion(
