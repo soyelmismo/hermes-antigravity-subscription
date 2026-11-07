@@ -425,7 +425,11 @@ def _has_unfinished_tool_call_frame(text: str) -> bool:
     while True:
         start = text.find(_TOOL_CALL_OPEN, cursor)
         if start == -1:
-            return _longest_tool_call_prefix_match(text) > 0
+            # A lone "<" is ordinary text (a comparison operator, an unfinished
+            # HTML tag, ...), not evidence of a truncated <tool_call> frame.
+            # Two or more matching characters ("<t" ... "<tool_call") remain
+            # fail-closed: the shortest useful proof of protocol framing.
+            return _longest_tool_call_prefix_match(text) > 1
         close = _find_tool_call_close(text, start + len(_TOOL_CALL_OPEN))
         if close == -1:
             return True
@@ -458,6 +462,25 @@ def _tool_call_from_object(obj: Any, ordinal: int) -> Any | None:
         id=call_id,
         type="function",
         function=SimpleNamespace(name=fn_name, arguments=fn_args),
+    )
+
+
+def _has_unparseable_tool_call_frame(text: str) -> bool:
+    """True when *text* keeps a closed ``<tool_call>`` frame after parsing.
+
+    :func:`_parse_tool_block` consumes every frame it can turn into a call and
+    leaves the unparseable ones in its cleaned text: invalid JSON, a missing
+    or blank ``function`` name, a non-object value, or an empty body. A
+    closed frame surviving in that cleaned text is therefore an explicit
+    protocol frame with no call, which must fail the turn instead of being
+    published as assistant text. Unclosed frames are
+    :func:`_has_unfinished_tool_call_frame`'s concern.
+    """
+    _calls, cleaned = _parse_tool_block(text)
+    start = cleaned.find(_TOOL_CALL_OPEN)
+    return (
+        start != -1
+        and _find_tool_call_close(cleaned, start + len(_TOOL_CALL_OPEN)) != -1
     )
 
 

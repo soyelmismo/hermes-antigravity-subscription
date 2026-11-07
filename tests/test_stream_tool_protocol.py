@@ -14,7 +14,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from prompt import _parse_tool_block
+from prompt import _has_unfinished_tool_call_frame, _parse_tool_block
 from stream import AntigravityStream
 
 TOOL_CALL_CLOSE = "</tool_call>"
@@ -477,3 +477,120 @@ def test_native_tool_step_neutralization_with_partial_block_does_not_fail(partia
     assert contents == []
     assert finishes == ["stop"]
     client._terminate_process.assert_called()
+
+
+# ---------------------------------------------------------------------------
+# A closed but unparseable frame is invalid protocol, never assistant text
+# ---------------------------------------------------------------------------
+
+# One representative per rejected shape: broken JSON, absent function, blank
+# function name, non-object function, non-object top level, empty body.
+UNPARSEABLE_FRAME_BODIES = [
+    '{"id":"x","function":{"name":"write_file","arguments":"{"}',
+    '{"id":"x"}',
+    '{"function":{"name":"   ","arguments":"{}"}}',
+    '{"function":[]}',
+    "[]",
+    "",
+]
+
+
+def _consume_until_error(stream):
+    chunks = []
+    with pytest.raises(RuntimeError) as ctx:
+        for chunk in stream:
+            chunks.append(chunk)
+    return _consumed(chunks), str(ctx.value)
+
+
+@pytest.mark.parametrize("body", UNPARSEABLE_FRAME_BODIES)
+def test_closed_unparseable_frame_fails_in_stream(body):
+    stream, _proc_mock, _client = _stream(_events(f"<tool_call>{body}</tool_call>"))
+
+    (calls, contents, finishes), message = _consume_until_error(stream)
+
+    assert "invalid tool call block" in message
+    assert calls == []
+    assert contents == []
+    assert finishes == []
+
+
+@pytest.mark.parametrize("body", UNPARSEABLE_FRAME_BODIES)
+def test_closed_unparseable_frame_in_result_response_fails(body):
+    stream, _proc_mock, _client = _stream(
+        _events(final=f"<tool_call>{body}</tool_call>")
+    )
+
+    (calls, contents, finishes), message = _consume_until_error(stream)
+
+    assert "invalid tool call block" in message
+    assert calls == []
+    assert contents == []
+    assert finishes == []
+
+
+@pytest.mark.parametrize("body", UNPARSEABLE_FRAME_BODIES)
+def test_closed_unparseable_frame_after_a_complete_call_fails_in_stream(body):
+    stream, _proc_mock, _client = _stream(
+        _events(_block("one"), f"<tool_call>{body}</tool_call>")
+    )
+
+    (calls, contents, finishes), message = _consume_until_error(stream)
+
+    assert "invalid tool call block" in message
+    assert [call.id for call in calls] == ["same"]
+    assert contents == []
+    assert finishes == []
+
+
+def test_closed_unparseable_frame_after_a_complete_call_in_result_response_fails():
+    stream, _proc_mock, _client = _stream(
+        _events(final=_block("one") + "<tool_call>{}</tool_call>")
+    )
+
+    (calls, contents, finishes), message = _consume_until_error(stream)
+
+    assert "invalid tool call block" in message
+    # The result-only buffer is validated before anything is emitted.
+    assert calls == []
+    assert contents == []
+    assert finishes == []
+
+
+# ---------------------------------------------------------------------------
+# A lone "<" ending prose is text, a longer tag prefix remains a frame
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "text, unfinished",
+    [
+        ("Compare a <", False),
+        ("Compare a <t", True),
+        ("Compare a <tool_cal", True),
+        ("Compare a <tool_call", True),
+        ('<tool_call>{"id":"x",', True),
+    ],
+)
+def test_lone_angle_bracket_is_text_but_longer_prefixes_are_frames(text, unfinished):
+    assert _has_unfinished_tool_call_frame(text) is unfinished
+
+
+@pytest.mark.parametrize("tools", [True, False])
+def test_prose_ending_with_lone_angle_bracket_stays_content(tools):
+    stream, _proc_mock, _client = _stream(_events("Compare a <"), tools=tools)
+
+    calls, contents, finishes = _consumed(list(stream))
+
+    assert calls == []
+    assert "".join(contents) == "Compare a <"
+    assert finishes == ["stop"]
+
+
+def test_prose_ending_with_lone_angle_bracket_after_a_complete_call_succeeds():
+    stream, _proc_mock, _client = _stream(_events(_block("one"), "Compare a <"))
+
+    calls, _contents, finishes = _consumed(list(stream))
+
+    assert [call.id for call in calls] == ["same"]
+    assert finishes == ["tool_calls"]

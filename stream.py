@@ -19,6 +19,7 @@ try:
         _TOOL_CALL_CLOSE,
         _find_tool_call_close,
         _has_unfinished_tool_call_frame,
+        _has_unparseable_tool_call_frame,
         _longest_tool_call_prefix_match,
         _parse_tool_block,
     )
@@ -28,6 +29,7 @@ except ImportError:
         _TOOL_CALL_CLOSE,
         _find_tool_call_close,
         _has_unfinished_tool_call_frame,
+        _has_unparseable_tool_call_frame,
         _longest_tool_call_prefix_match,
         _parse_tool_block,
     )
@@ -721,6 +723,15 @@ class AntigravityStream(Iterator[Any]):
                                         text_buffer = text_buffer[full_end:]
                                         in_tool_call = False
                                         parsed_calls, extra_text = _parse_tool_block(block)
+                                        if (
+                                            not parsed_calls
+                                            and self.has_tools
+                                            and _has_unparseable_tool_call_frame(block)
+                                        ):
+                                            raise RuntimeError(
+                                                "Antigravity execution failed: "
+                                                "invalid tool call block in stream"
+                                            )
                                         if parsed_calls:
                                             has_tool_calls = True
                                             for call_delta in identify_calls(parsed_calls):
@@ -831,6 +842,24 @@ class AntigravityStream(Iterator[Any]):
             ):
                 raise RuntimeError(
                     "Antigravity execution failed: incomplete tool call block "
+                    f"in stream ({stop_detail})"
+                )
+            # A closed frame that parsed to no call is explicit protocol
+            # markup without a usable call (invalid JSON, missing/blank
+            # function, non-object body, or empty body). Publishing it as
+            # assistant text with a normal stop would present broken protocol
+            # as a successful answer, so fail the turn. Checked even when a
+            # complete call was already emitted (a later bad frame must not be
+            # silently dropped); native-tool neutralization keeps its pinned
+            # empty-stop behavior, and tools=False stays plain text.
+            if (
+                self.has_tools
+                and not neutralized_tool_step
+                and text_buffer
+                and _has_unparseable_tool_call_frame(text_buffer)
+            ):
+                raise RuntimeError(
+                    "Antigravity execution failed: invalid tool call block "
                     f"in stream ({stop_detail})"
                 )
             if text_buffer and not has_tool_calls and not neutralized_tool_step:
