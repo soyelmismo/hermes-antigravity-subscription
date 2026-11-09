@@ -611,6 +611,10 @@ class AntigravityStream(Iterator[Any]):
                     continue
 
                 last_stdout_at = time.monotonic()
+                if self.is_worker:
+                    # The idle countdown reads this to tell a busy worker from
+                    # one whose turn died holding the worker lock.
+                    self.client._note_worker_activity(self.proc)
                 line = line.strip()
                 if not line.startswith("{"):
                     continue

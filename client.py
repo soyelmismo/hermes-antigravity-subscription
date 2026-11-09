@@ -108,6 +108,52 @@ _DEFAULT_TIMEOUT_SECONDS = 300.0
 # ANTIGRAVITY_WORKER_IDLE_SECONDS overrides the bound; 0 or less disables it.
 _DEFAULT_WORKER_IDLE_SECONDS = 900.0
 
+# A turn abandoned mid-stream keeps _worker_lock held: the stream's generator is
+# reclaimable only by the cyclic GC, so its finally block -- the only place that
+# releases the lock -- can be postponed indefinitely by a lingering reference.
+# The countdown then re-arms forever, which is how three dashboard workers were
+# measured still alive past the bound (November 2026) while the gateway reaped
+# Such a turn is dead by then -- but silence alone is not proof: a long
+# reasoning turn or a slow first token can emit nothing for minutes while the
+# worker is busy, and a caller may set a read deadline well past the default.
+# So the second opinion needs BOTH no output for the abandon grace AND no CPU
+# burned since the last output (_worker_cpu_seconds). An abandoned worker sits
+# at 0% -- measured at 2.5 s CPU across sixteen minutes of life -- whereas a
+# live reasoning turn does not. Where CPU time cannot be read (non-Linux, or a
+# /proc entry that has gone) the worker is left alone: refusing to kill is
+# always the safe failure here.
+# ANTIGRAVITY_WORKER_ABANDON_SECONDS overrides the grace verbatim; 0 or less
+# disables the second opinion and restores the old re-arm-forever behaviour.
+# The default grace is one idle window, floored at one read deadline plus a
+# minute, so it lands at ~15 minutes -- inside the external reaper's fence,
+# which is what keeps that backstop silent.
+_WORKER_ABANDON_GRACE_WINDOWS = 1.0
+_WORKER_ABANDON_MIN_SECONDS = _DEFAULT_TIMEOUT_SECONDS + 60.0
+# CPU seconds a worker may burn between signs of life before it counts as busy
+# rather than abandoned. agy's own start-up costs a few tenths of a second, so
+# this clears a worker that has barely started but not one that is thinking.
+_WORKER_ABANDON_CPU_SECONDS = 1.0
+
+
+def _worker_cpu_seconds(proc: subprocess.Popen) -> float | None:
+    """Total CPU seconds the worker has consumed, or None when unreadable.
+
+    Linux only: /proc/<pid>/stat carries utime and stime as fields 14 and 15,
+    measured from *after* the comm field, which is parenthesised and may itself
+    contain spaces and parentheses -- hence the split on the last ')'.
+    """
+    pid = getattr(proc, "pid", None)
+    if not pid or not os.path.isdir("/proc"):
+        return None
+    try:
+        with open(f"/proc/{pid}/stat", "rb") as handle:
+            data = handle.read().decode("ascii", "replace")
+        fields = data[data.rindex(")") + 2:].split()
+        ticks = os.sysconf("SC_CLK_TCK")
+        return (int(fields[11]) + int(fields[12])) / ticks
+    except (OSError, ValueError, IndexError):
+        return None
+
 
 def _worker_idle_seconds() -> float:
     raw = os.environ.get("ANTIGRAVITY_WORKER_IDLE_SECONDS", "").strip()
@@ -117,6 +163,21 @@ def _worker_idle_seconds() -> float:
         return float(raw)
     except ValueError:
         return _DEFAULT_WORKER_IDLE_SECONDS
+
+
+def _worker_abandon_seconds() -> float:
+    raw = os.environ.get("ANTIGRAVITY_WORKER_ABANDON_SECONDS", "").strip()
+    if raw:
+        try:
+            return float(raw)
+        except ValueError:
+            pass
+    # Never shorter than one read deadline plus a margin, so a live turn that is
+    # merely slow to speak cannot be mistaken for an abandoned one.
+    return max(
+        _WORKER_ABANDON_GRACE_WINDOWS * _worker_idle_seconds(),
+        _WORKER_ABANDON_MIN_SECONDS,
+    )
 
 # Issue #4 (Windows, WinError 32): terminating agy's process tree
 # (taskkill /F /T) is asynchronous, so a child -- or a grandchild -- can
@@ -345,6 +406,14 @@ class AntigravityClient:
         self._worker_usage_baseline: dict[str, int] = {}
         self._worker_lock = threading.Lock()
         self._worker_idle_timer: threading.Timer | None = None
+        # Last moment each worker showed a sign of life: its spawn, or the last
+        # stdout line it produced (stamped by AntigravityStream). Read by the
+        # abandon check in _reap_idle_worker, which needs to tell a genuinely
+        # busy worker from one whose turn died still holding _worker_lock.
+        self._worker_last_activity: dict[subprocess.Popen, float] = {}
+        # CPU seconds at the last sign of life: the discriminator between a
+        # silent abandoned turn and a silent busy one.
+        self._worker_cpu_at_activity: dict[subprocess.Popen, float] = {}
 
     @staticmethod
     def _resolve_real_token_path() -> Path | None:
@@ -381,6 +450,8 @@ class AntigravityClient:
             self._terminate_worker_locked()
             procs = tuple(self._active_processes)
             self._active_processes.clear()
+            self._worker_last_activity.clear()
+            self._worker_cpu_at_activity.clear()
         for proc in procs:
             self._terminate_process(proc)
         # Phase 2 -- remove the private workspace, retrying transient
@@ -476,6 +547,8 @@ class AntigravityClient:
             self._worker_effort = None
             self._worker_history = []
             self._active_processes.discard(proc)
+            self._worker_last_activity.pop(proc, None)
+            self._worker_cpu_at_activity.pop(proc, None)
             self._terminate_process(proc)
         # The session is gone: any later usage from it belongs to a dead
         # session, and the next spawn must start from a clean baseline.
@@ -536,10 +609,24 @@ class AntigravityClient:
             # by a turn that FINISHED, so a wedged or abandoned turn left the
             # worker with no timer at all and it survived the idle bound
             # entirely. Re-arming repeats the check without ever reaching the
-            # terminate below, so a genuinely busy worker is still safe.
+            # terminate below, which is still what a genuinely busy worker
+            # wants -- but a worker that has shown no sign of life for the
+            # abandon grace is not busy, its turn is gone.
             with self._lock:
-                if self._worker_proc is proc:
-                    self._arm_idle_timer_locked()
+                if self._worker_proc is not proc:
+                    self._worker_last_activity.pop(proc, None)
+                    return
+                if self._worker_is_abandoned_locked(proc):
+                    last_seen = self._worker_last_activity.get(proc)
+                    logger.warning(
+                        "Terminating abandoned agy worker pid=%s: no output for %.0fs "
+                        "while its turn still held the worker lock",
+                        getattr(proc, "pid", None),
+                        time.monotonic() - (last_seen if last_seen is not None else time.monotonic()),
+                    )
+                    self._terminate_worker_locked(keep_conversation=True)
+                    return
+                self._arm_idle_timer_locked()
             return
         try:
             with self._lock:
@@ -549,6 +636,54 @@ class AntigravityClient:
                 self._terminate_worker_locked(keep_conversation=True)
         finally:
             self._worker_lock.release()
+
+    def _note_worker_activity(self, proc: subprocess.Popen) -> None:
+        """Stamp a worker as alive; AntigravityStream calls this per stdout line.
+
+        The CPU reading is taken outside the lock: it must never extend the
+        critical section the reader thread shares with the timer thread.
+        """
+        cpu = _worker_cpu_seconds(proc)
+        with self._lock:
+            if self._worker_proc is proc:
+                self._worker_last_activity[proc] = time.monotonic()
+                if cpu is not None:
+                    self._worker_cpu_at_activity[proc] = cpu
+
+    def _worker_is_abandoned_locked(self, proc: subprocess.Popen) -> bool:
+        """True when a lock-holding worker has shown no sign of life for too long.
+
+        A held _worker_lock normally means a turn is running, and killing it
+        would be a regression. But an abandoned turn never releases the lock:
+        the stream generator's finally block -- the only place that releases it
+        -- runs when the client/stream reference cycle is collected, and a
+        lingering reference (a traceback, a cached response object) can postpone
+        that indefinitely. The grace runs from the worker's last output, not
+        from when the lock was taken, which nobody records -- and it is only
+        acted upon when the worker has also stopped burning CPU, so a live but
+        quiet turn (long reasoning, slow first token, generous read deadline) is
+        never mistaken for a dead one.
+        """
+        abandon_after = _worker_abandon_seconds()
+        if abandon_after <= 0:
+            return False
+        last_seen = self._worker_last_activity.get(proc)
+        if last_seen is None:
+            # Unknown baseline (a worker installed by an older code path): stay
+            # conservative and keep re-arming rather than guess.
+            return False
+        if (time.monotonic() - last_seen) < abandon_after:
+            return False
+        # Silence is necessary but not sufficient. A live turn can be silent for
+        # minutes -- a long reasoning block, a slow first token, a caller whose
+        # read deadline is longer than the grace -- and it burns CPU while it
+        # runs. An abandoned worker burns none. Unmeasurable CPU means unproven
+        # abandonment: keep re-arming rather than risk a live turn.
+        cpu_now = _worker_cpu_seconds(proc)
+        cpu_then = self._worker_cpu_at_activity.get(proc)
+        if cpu_now is None or cpu_then is None:
+            return False
+        return (cpu_now - cpu_then) < _WORKER_ABANDON_CPU_SECONDS
 
     def _get_or_spawn_worker(
         self,
@@ -563,7 +698,18 @@ class AntigravityClient:
                 and self._worker_model == model
                 and self._worker_effort == effort
             ):
-                return self._worker_proc
+                # A continuation turn reuses the worker without respawning it.
+                # Without a fresh baseline the abandon grace would be measured
+                # from the PREVIOUS turn's last output, so a worker idle for
+                # almost a full window and then handed a new turn could be
+                # reaped mid-turn. The grace also has to restart, not merely
+                # re-measure: a silent first token is normal at turn start.
+                proc = self._worker_proc
+                self._worker_last_activity[proc] = time.monotonic()
+                cpu = _worker_cpu_seconds(proc)
+                if cpu is not None:
+                    self._worker_cpu_at_activity[proc] = cpu
+                return proc
 
             self._terminate_worker_locked(keep_conversation=bool(conversation_id))
 
@@ -595,6 +741,7 @@ class AntigravityClient:
             self._worker_history = list(self._conversation_history) if conversation_id else []
             self._worker_usage_baseline = {}
             self._active_processes.add(proc)
+            self._worker_last_activity[proc] = time.monotonic()
             # Give every worker a death date at spawn, not only when a turn
             # finishes. The countdown was armed solely by
             # _update_worker_history, so a worker whose first turn never
