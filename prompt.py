@@ -179,14 +179,30 @@ def _render_message_content(content: Any) -> str:
                 item_type = item.get("type")
                 if item_type == "text":
                     parts.append(str(item.get("text") or ""))
-                elif item_type == "image_url":
-                    img_url_obj = item.get("image_url")
+                elif item_type in ("image_url", "image", "video_url", "video"):
+                    img_url_obj = (
+                        item.get(item_type)
+                        if item_type in item
+                        else (
+                            item.get("image_url")
+                            or item.get("image")
+                            or item.get("video_url")
+                            or item.get("video")
+                        )
+                    )
                     if isinstance(img_url_obj, dict):
                         url_val = img_url_obj.get("url", "")
                     else:
                         url_val = str(img_url_obj or "")
+                    if not url_val and isinstance(item.get("url"), str):
+                        url_val = item["url"]
                     if url_val:
-                        parts.append(f"[Image: {url_val}]")
+                        fpath, mtype = _materialize_media(url_val)
+                        if fpath:
+                            parts.append(f"[{mtype}]({fpath})")
+                        else:
+                            fallback_type = "Video" if "video" in str(item_type) else "Image"
+                            parts.append(f"[{fallback_type}]({url_val})")
                 elif item_type == "input_audio":
                     parts.append("[Audio input]")
                 elif "text" in item:

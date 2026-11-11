@@ -228,14 +228,13 @@ def _classify_antigravity_error(
     return None
 
 
-# Hermes keeps external-process providers on its non-streaming path unless the
-# profile opts in. Hermes releases that predate the opt-in (including the CI
-# pin v2026.9.21) have no such field, so pass it only when the host declares it.
-_STREAMING_OPT_IN: dict[str, Any] = (
-    {"supports_streaming": True}
-    if "supports_streaming" in {f.name for f in fields(ProviderProfile)}
-    else {}
-)
+# ProviderProfile optional field opt-ins.
+_PROFILE_EXTRA_FIELDS: dict[str, Any] = {}
+_profile_field_names = {f.name for f in fields(ProviderProfile)}
+if "supports_streaming" in _profile_field_names:
+    _PROFILE_EXTRA_FIELDS["supports_streaming"] = True
+if "models_dev_id" in _profile_field_names:
+    _PROFILE_EXTRA_FIELDS["models_dev_id"] = "google"
 
 antigravity_profile = AntigravitySubscriptionDirectSDKProfile(
     name="antigravity-subscription-directsdk",
@@ -254,7 +253,7 @@ antigravity_profile = AntigravitySubscriptionDirectSDKProfile(
     supports_vision=True,
     unsupported_response_formats=("json_schema",),
     classify_api_error=_classify_antigravity_error,
-    **_STREAMING_OPT_IN,
+    **_PROFILE_EXTRA_FIELDS,
 )
 
 register_provider(antigravity_profile)
