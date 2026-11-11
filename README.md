@@ -1,5 +1,9 @@
 # Antigravity Subscription DirectSDK Provider for Hermes Agent
 
+<p align="center">
+  <img src="assets/banner.jpg" alt="Antigravity Subscription DirectSDK Banner" width="100%" />
+</p>
+
 [![Hermes Agent Plugin](https://img.shields.io/badge/Hermes%20Agent-Plugin-purple.svg)](https://hermes-agent.nousresearch.com)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Tested with Hermes](https://img.shields.io/badge/Hermes-v0.21%2B-green.svg)](https://github.com/nousresearch/hermes-agent)
