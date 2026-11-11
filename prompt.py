@@ -2,9 +2,98 @@
 
 from __future__ import annotations
 
+import base64
+import hashlib
 import json
+import logging
+import mimetypes
+import os
+import urllib.request
 from types import SimpleNamespace
-from typing import Any, Sequence
+from typing import Any, Callable, Optional
+
+logger = logging.getLogger(__name__)
+
+_MEDIA_CACHE_DIR = os.path.expanduser("~/.hermes/cache/scratch/agy_media")
+_VIDEO_EXTS = {".mp4", ".mov", ".webm", ".mkv", ".avi", ".ogv"}
+_IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"}
+
+
+def _materialize_media(url_or_data: str) -> tuple[str, str]:
+    """Materialize an image/video reference (data URL, local path, or remote URL)
+    into a local file on disk so the official `agy` CLI's `ConvertImagesToMedia`
+    can resolve it natively via its built-in media regex.
+
+    Returns:
+        (local_file_path, "Image" | "Video") or ("", "") on failure.
+    """
+    url = (url_or_data or "").strip()
+    if not url:
+        return "", ""
+
+    try:
+        os.makedirs(_MEDIA_CACHE_DIR, exist_ok=True)
+    except OSError:
+        pass
+
+    # 1. Base64 data URL
+    if url.startswith("data:"):
+        try:
+            header, b64_data = url.split(",", 1)
+            mime = header.split(";")[0].replace("data:", "").strip().lower()
+            is_video = mime.startswith("video/")
+            raw = base64.b64decode(b64_data)
+            h = hashlib.sha256(raw).hexdigest()[:16]
+            ext = mimetypes.guess_extension(mime) or (".mp4" if is_video else ".jpg")
+            if ext == ".jpe":
+                ext = ".jpg"
+            fpath = os.path.join(_MEDIA_CACHE_DIR, f"{h}{ext}")
+            if not os.path.exists(fpath):
+                with open(fpath, "wb") as f:
+                    f.write(raw)
+            return fpath, "Video" if is_video else "Image"
+        except Exception as exc:
+            logger.debug("Failed to materialize base64 media data URL: %s", exc)
+            return "", ""
+
+    # 2. file:// URI
+    if url.startswith("file://"):
+        fpath = url[7:]
+        if os.path.exists(fpath):
+            ext = os.path.splitext(fpath)[1].lower()
+            is_video = ext in _VIDEO_EXTS
+            return fpath, "Video" if is_video else "Image"
+        return "", ""
+
+    # 3. Local filesystem path
+    if os.path.exists(url):
+        fpath = os.path.abspath(url)
+        ext = os.path.splitext(fpath)[1].lower()
+        is_video = ext in _VIDEO_EXTS
+        return fpath, "Video" if is_video else "Image"
+
+    # 4. HTTP / HTTPS URL
+    if url.startswith(("http://", "https://")):
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "Hermes-Agent"})
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                raw = resp.read()
+                content_type = resp.headers.get_content_type().lower()
+                is_video = content_type.startswith("video/")
+                h = hashlib.sha256(raw).hexdigest()[:16]
+                ext = mimetypes.guess_extension(content_type) or (".mp4" if is_video else ".jpg")
+                if ext == ".jpe":
+                    ext = ".jpg"
+                fpath = os.path.join(_MEDIA_CACHE_DIR, f"{h}{ext}")
+                if not os.path.exists(fpath):
+                    with open(fpath, "wb") as f:
+                        f.write(raw)
+                return fpath, "Video" if is_video else "Image"
+        except Exception as exc:
+            logger.debug("Failed to download remote media URL %s: %s", url, exc)
+            return "", ""
+
+    return "", ""
 
 _ROLE_LABELS = {
     "system": "System",
