@@ -15,10 +15,24 @@ from typing import Any, Iterator, NamedTuple
 
 try:
     from .process import _check_early_quota_error
-    from .prompt import _longest_tool_call_prefix_match, _parse_tool_block
+    from .prompt import (
+        _TOOL_CALL_CLOSE,
+        _find_tool_call_close,
+        _has_unfinished_tool_call_frame,
+        _has_unparseable_tool_call_frame,
+        _longest_tool_call_prefix_match,
+        _parse_tool_block,
+    )
 except ImportError:
     from process import _check_early_quota_error
-    from prompt import _longest_tool_call_prefix_match, _parse_tool_block
+    from prompt import (
+        _TOOL_CALL_CLOSE,
+        _find_tool_call_close,
+        _has_unfinished_tool_call_frame,
+        _has_unparseable_tool_call_frame,
+        _longest_tool_call_prefix_match,
+        _parse_tool_block,
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -552,6 +566,33 @@ class AntigravityStream(Iterator[Any]):
         text_buffer = ""
         usage_data: dict[str, Any] = {}
         has_tool_calls = False
+        used_tool_call_ids: set[str] = set()
+        next_tool_call_index = 0
+
+        def identify_calls(calls: list[Any]) -> Iterator[Any]:
+            """Give every emitted call a unique OpenAI index and id.
+
+            ``_parse_tool_block`` numbers calls from zero inside a single
+            block. Several blocks in one turn would therefore all report
+            index 0, and repeated or missing model ids would collide. The
+            host keys deltas by (index, id), so both must be unique for the
+            whole turn.
+            """
+            nonlocal next_tool_call_index
+            for call in calls:
+                call.index = next_tool_call_index
+                next_tool_call_index += 1
+                call_id = getattr(call, "id", "")
+                if not call_id or call_id in used_tool_call_ids:
+                    suffix = next_tool_call_index
+                    call_id = f"call_{suffix}"
+                    while call_id in used_tool_call_ids:
+                        suffix += 1
+                        call_id = f"call_{suffix}"
+                    call.id = call_id
+                used_tool_call_ids.add(call_id)
+                yield call
+
         has_content = False
         in_tool_call = False
         error_msg = ""
@@ -563,6 +604,11 @@ class AntigravityStream(Iterator[Any]):
         neutralized_tool_step = False
         success = False
         start_time = time.monotonic()
+        # File mtimes are wall-clock epoch seconds; durations and deadlines
+        # use the monotonic clock. Keep the two apart: passing a monotonic
+        # value as a file-date bound made every log look newer than the turn,
+        # so a stale quota line from a previous run could abort a healthy one.
+        start_wall = time.time()
         # Why the read loop ended (diagnostics for missing-result failures):
         # None after the loop means the absolute deadline expired.
         stop_reason: str | None = None
@@ -577,7 +623,7 @@ class AntigravityStream(Iterator[Any]):
                 while not watchdog_stop.wait(timeout=0.3):
                     if time.monotonic() - start_time < 1.0:
                         continue
-                    quota_err = _check_early_quota_error(gemini_dir, min_mtime=start_time)
+                    quota_err = _check_early_quota_error(gemini_dir, min_mtime=start_wall)
                     if quota_err:
                         self._early_error = quota_err
                         logger.warning(
@@ -624,9 +670,13 @@ class AntigravityStream(Iterator[Any]):
                 except Exception:
                     continue
 
-                watchdog_stop.set()
-
                 event_type = event.get("event")
+                # init alone is handshake, not progress: an early quota
+                # abort can arrive after it and before any content. Every
+                # other parsed event (step_update, result, an unknown future
+                # type) proves the turn moved past the early-quota window.
+                if event_type != "init":
+                    watchdog_stop.set()
                 if not self.conversation_id:
                     self.conversation_id = event.get("conversation_id", "")
 
@@ -653,7 +703,10 @@ class AntigravityStream(Iterator[Any]):
                         # on purpose, and the empty completion assembled
                         # afterwards is the pinned behavior (see
                         # test_native_tool_step_neutralization_in_stream).
+                        # The stop cause is recorded too, so diagnostics do
+                        # not misreport this deliberate abort as a deadline.
                         neutralized_tool_step = True
+                        stop_reason = "native tool step neutralized"
                         break
                     if "usage" in step:
                         usage_data = step["usage"]
@@ -667,16 +720,25 @@ class AntigravityStream(Iterator[Any]):
                             text_buffer += text_delta
                             while text_buffer:
                                 if in_tool_call:
-                                    end_idx = text_buffer.find("</tool_call>")
+                                    end_idx = _find_tool_call_close(text_buffer)
                                     if end_idx != -1:
-                                        full_end = end_idx + len("</tool_call>")
+                                        full_end = end_idx + len(_TOOL_CALL_CLOSE)
                                         block = text_buffer[:full_end]
                                         text_buffer = text_buffer[full_end:]
                                         in_tool_call = False
                                         parsed_calls, extra_text = _parse_tool_block(block)
+                                        if (
+                                            not parsed_calls
+                                            and self.has_tools
+                                            and _has_unparseable_tool_call_frame(block)
+                                        ):
+                                            raise RuntimeError(
+                                                "Antigravity execution failed: "
+                                                "invalid tool call block in stream"
+                                            )
                                         if parsed_calls:
                                             has_tool_calls = True
-                                            for call_delta in parsed_calls:
+                                            for call_delta in identify_calls(parsed_calls):
                                                 yield self._make_chunk(tool_calls=[call_delta])
                                         if extra_text and not has_tool_calls:
                                             has_content = True
@@ -763,12 +825,53 @@ class AntigravityStream(Iterator[Any]):
                 if last_stdout_at is not None
                 else ", no stdout received"
             )
-            if text_buffer and not has_tool_calls:
+            # A stream that ends inside a <tool_call> frame was truncated.
+            # The old flush then re-emitted the raw block as assistant text
+            # and sealed the turn with finish_reason="stop", presenting a
+            # broken tool call as a successful answer. Fail the turn instead.
+            # The same frame scanner as the incremental splitter decides what
+            # is unfinished, so a complete block delivered only in
+            # result.response is parsed rather than rejected, and a stream cut
+            # inside the opening tag, JSON body, or closing tag fails. Checked
+            # even after a complete call so a truncated second block is not
+            # silently dropped. Native-tool neutralization is a deliberate
+            # abort, not truncation, and keeps its pinned empty-stop behavior.
+            if (
+                self.has_tools
+                and not neutralized_tool_step
+                and (
+                    in_tool_call
+                    or (text_buffer and _has_unfinished_tool_call_frame(text_buffer))
+                )
+            ):
+                raise RuntimeError(
+                    "Antigravity execution failed: incomplete tool call block "
+                    f"in stream ({stop_detail})"
+                )
+            # A closed frame that parsed to no call is explicit protocol
+            # markup without a usable call (invalid JSON, missing/blank
+            # function, non-object body, or empty body). Publishing it as
+            # assistant text with a normal stop would present broken protocol
+            # as a successful answer, so fail the turn. Checked even when a
+            # complete call was already emitted (a later bad frame must not be
+            # silently dropped); native-tool neutralization keeps its pinned
+            # empty-stop behavior, and tools=False stays plain text.
+            if (
+                self.has_tools
+                and not neutralized_tool_step
+                and text_buffer
+                and _has_unparseable_tool_call_frame(text_buffer)
+            ):
+                raise RuntimeError(
+                    "Antigravity execution failed: invalid tool call block "
+                    f"in stream ({stop_detail})"
+                )
+            if text_buffer and not has_tool_calls and not neutralized_tool_step:
                 if self.has_tools or "<tool_call>" in text_buffer:
                     parsed_calls, extra_text = _parse_tool_block(text_buffer)
                     if parsed_calls:
                         has_tool_calls = True
-                        for call_delta in parsed_calls:
+                        for call_delta in identify_calls(parsed_calls):
                             yield self._make_chunk(tool_calls=[call_delta])
                     if extra_text and not has_tool_calls:
                         has_content = True
@@ -824,7 +927,7 @@ class AntigravityStream(Iterator[Any]):
                 # not this exit-code one. A real nonzero exit keeps the
                 # quota/exit-code raise's priority over the generic one.
                 if not neutralized_tool_step and not has_tool_calls and not has_content and returncode not in (None, 0):
-                    quota_err = _check_early_quota_error(gemini_dir, min_mtime=start_time)
+                    quota_err = _check_early_quota_error(gemini_dir, min_mtime=start_wall)
                     if quota_err:
                         raise RuntimeError(f"Antigravity model error: {quota_err}")
                     err_detail = error_msg or stderr_out.strip() or f"Process exited with return code {returncode}"
@@ -882,7 +985,7 @@ class AntigravityStream(Iterator[Any]):
 
                 worker_exit = self.proc.poll()
                 if not neutralized_tool_step and not has_tool_calls and not has_content and worker_exit not in (None, 0):
-                    quota_err = _check_early_quota_error(gemini_dir, min_mtime=start_time)
+                    quota_err = _check_early_quota_error(gemini_dir, min_mtime=start_wall)
                     if quota_err:
                         raise RuntimeError(f"Antigravity model error: {quota_err}")
                     stderr_out = self._get_stderr_tail()

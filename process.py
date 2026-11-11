@@ -816,6 +816,10 @@ def _check_early_quota_error(
 
     agy internally retries 429s up to 8 times with exponential backoff (~140s)
     without emitting anything to stdout. Detecting this early allows fast failover.
+
+    ``min_mtime`` is wall-clock epoch seconds (``time.time()``), the same clock
+    as ``st_mtime``. Callers must not pass ``time.monotonic()``: it is not an
+    epoch timestamp, so the comparison would treat every log as current.
     """
     if not gemini_dir:
         return None
