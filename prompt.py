@@ -87,10 +87,21 @@ def _render_message_content(content: Any) -> str:
             if isinstance(item, str):
                 parts.append(item.strip())
             elif isinstance(item, dict):
-                if item.get("type") == "text":
-                    parts.append(str(item.get("text") or "").strip())
-                elif "content" in item:
-                    parts.append(str(item.get("content") or "").strip())
+                item_type = item.get("type")
+                if item_type == "text":
+                    parts.append(str(item.get("text") or ""))
+                elif item_type == "image_url":
+                    img_url_obj = item.get("image_url")
+                    if isinstance(img_url_obj, dict):
+                        url_val = img_url_obj.get("url", "")
+                    else:
+                        url_val = str(img_url_obj or "")
+                    if url_val:
+                        parts.append(f"[Image: {url_val}]")
+                elif item_type == "input_audio":
+                    parts.append("[Audio input]")
+                elif "text" in item:
+                    parts.append(str(item.get("text") or ""))
         return "\n".join(p for p in parts if p).strip()
     return str(content).strip()
 
