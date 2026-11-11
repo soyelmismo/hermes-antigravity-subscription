@@ -343,6 +343,21 @@ class AntigravityPluginTests(unittest.TestCase):
         self.assertIn("### LATEST TOOL RESULTS RECEIVED.", prompt)
         self.assertIn("Tool Result (c1):\nresult 1", prompt)
 
+    def test_strip_attachment_annotations_multimodal(self):
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "Mira mi diseno\n\n[Image attached at: /path/to/img.png]"},
+                    {"type": "image_url", "image_url": {"url": "file:///root/sample.png"}},
+                ],
+            }
+        ]
+        prompt = _format_messages_as_prompt(messages)
+        self.assertIn("Mira mi diseno", prompt)
+        self.assertNotIn("[Image attached at:", prompt)
+        self.assertIn("[Image](/root/sample.png)", prompt)
+
     def test_format_delta_prompt_user_vs_tool(self):
         from client import _format_delta_prompt
         # Delta ending with user

@@ -8,6 +8,7 @@ import json
 import logging
 import mimetypes
 import os
+import re
 import urllib.request
 from types import SimpleNamespace
 from typing import Any, Callable, Optional
@@ -17,6 +18,17 @@ logger = logging.getLogger(__name__)
 _MEDIA_CACHE_DIR = os.path.expanduser("~/.hermes/cache/scratch/agy_media")
 _VIDEO_EXTS = {".mp4", ".mov", ".webm", ".mkv", ".avi", ".ogv"}
 _IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"}
+
+_ATTACHMENT_ANNOTATION_RE = re.compile(
+    r"\n*\s*\[(?:Image attached at|screenshot):\s*[^\]]+\]",
+    re.IGNORECASE,
+)
+
+
+def _clean_rendered_text(text: str) -> str:
+    if not text:
+        return ""
+    return _ATTACHMENT_ANNOTATION_RE.sub("", text).strip()
 
 
 def _materialize_media(url_or_data: str) -> tuple[str, str]:
@@ -59,11 +71,9 @@ def _materialize_media(url_or_data: str) -> tuple[str, str]:
     # 2. file:// URI
     if url.startswith("file://"):
         fpath = url[7:]
-        if os.path.exists(fpath):
-            ext = os.path.splitext(fpath)[1].lower()
-            is_video = ext in _VIDEO_EXTS
-            return fpath, "Video" if is_video else "Image"
-        return "", ""
+        ext = os.path.splitext(fpath)[1].lower()
+        is_video = ext in _VIDEO_EXTS
+        return fpath, "Video" if is_video else "Image"
 
     # 3. Local filesystem path
     if os.path.exists(url):
@@ -168,17 +178,21 @@ def _render_message_content(content: Any) -> str:
         return ""
     if isinstance(content, dict):
         if "text" in content:
-            return str(content.get("text") or "").strip()
-        return str(content.get("content") or "").strip()
+            return _clean_rendered_text(str(content.get("text") or ""))
+        return _clean_rendered_text(str(content.get("content") or ""))
     if isinstance(content, list):
         parts = []
         for item in content:
             if isinstance(item, str):
-                parts.append(item.strip())
+                cleaned = _clean_rendered_text(item)
+                if cleaned:
+                    parts.append(cleaned)
             elif isinstance(item, dict):
                 item_type = item.get("type")
                 if item_type == "text":
-                    parts.append(str(item.get("text") or ""))
+                    cleaned = _clean_rendered_text(str(item.get("text") or ""))
+                    if cleaned:
+                        parts.append(cleaned)
                 elif item_type in ("image_url", "image", "video_url", "video"):
                     img_url_obj = (
                         item.get(item_type)
@@ -206,9 +220,11 @@ def _render_message_content(content: Any) -> str:
                 elif item_type == "input_audio":
                     parts.append("[Audio input]")
                 elif "text" in item:
-                    parts.append(str(item.get("text") or ""))
+                    cleaned = _clean_rendered_text(str(item.get("text") or ""))
+                    if cleaned:
+                        parts.append(cleaned)
         return "\n".join(p for p in parts if p).strip()
-    return str(content).strip()
+    return _clean_rendered_text(str(content))
 
 
 def _latest_user_request_section(user_text: str) -> str:
