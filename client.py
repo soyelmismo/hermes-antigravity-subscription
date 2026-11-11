@@ -406,6 +406,9 @@ class AntigravityClient:
         # agy reads permissions only at spawn, so a turn referencing new
         # media paths must respawn the worker (conversation preserved).
         self._worker_media_rules: frozenset[str] = frozenset()
+        # Media files this session materialized (downloads, cache files);
+        # deleted at close() so no fetched media outlives the session.
+        self._materialized_media: set[str] = set()
         # Cumulative usage snapshot of the current worker session. agy 1.2.10+
         # persistent workers report cumulative session usage, so per-turn
         # deltas need this baseline. The reference is replaced on every spawn
@@ -464,6 +467,17 @@ class AntigravityClient:
             self._worker_cpu_at_activity.clear()
         for proc in procs:
             self._terminate_process(proc)
+        # Phase 1.5 -- delete the media files this session materialized.
+        # After every child is dead (they may still have had the files open),
+        # before the workspace removal; must never raise (issue #4 contract).
+        with self._lock:
+            materialized = set(self._materialized_media)
+            self._materialized_media.clear()
+        for path in materialized:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
         # Phase 2 -- remove the private workspace, retrying transient
         # failures. close() must never raise from cleanup and must never
         # leave the client half-closed (issue #4).
@@ -805,7 +819,11 @@ class AntigravityClient:
         stream: bool,
     ) -> Any:
         prompt_text = _format_messages_as_prompt(
-            messages, model=model, tools=tools, tool_choice=tool_choice
+            messages,
+            model=model,
+            tools=tools,
+            tool_choice=tool_choice,
+            media_sink=self._materialized_media,
         )
         dump_prompt_debug(
             prompt=prompt_text,
@@ -904,7 +922,9 @@ class AntigravityClient:
         # decision — both the worker and the oneshot process read settings.json
         # at spawn. A live worker lacking the new paths is respawned with its
         # agy conversation preserved.
-        turn_media_paths = media_reference_paths(messages_list)
+        turn_media_paths = media_reference_paths(
+            messages_list, self._materialized_media
+        )
         if turn_media_paths:
             self._ensure_worker_media_permissions(turn_media_paths)
 
@@ -927,7 +947,9 @@ class AntigravityClient:
                     )
                     delta_msgs = messages_list[len(ref_history):]
                     prompt_payload = _format_delta_prompt(
-                        delta_msgs, pending_user_text=_latest_user_text(messages_list)
+                        delta_msgs,
+                        pending_user_text=_latest_user_text(messages_list),
+                        media_sink=self._materialized_media,
                     )
                     dump_prompt_debug(
                         prompt=prompt_payload,
@@ -942,7 +964,11 @@ class AntigravityClient:
                             self._purge_isolated_conversations()
                     proc = self._get_or_spawn_worker(resolved_model, effort, conversation_id=None)
                     prompt_payload = _format_messages_as_prompt(
-                        messages_list, model=resolved_model, tools=tools, tool_choice=tool_choice
+                        messages_list,
+                        model=resolved_model,
+                        tools=tools,
+                        tool_choice=tool_choice,
+                        media_sink=self._materialized_media,
                     )
                     dump_prompt_debug(
                         prompt=prompt_payload,
@@ -962,7 +988,11 @@ class AntigravityClient:
                         self._purge_isolated_conversations()
                     proc = self._get_or_spawn_worker(resolved_model, effort, conversation_id=None)
                     prompt_payload = _format_messages_as_prompt(
-                        messages_list, model=resolved_model, tools=tools, tool_choice=tool_choice
+                        messages_list,
+                        model=resolved_model,
+                        tools=tools,
+                        tool_choice=tool_choice,
+                        media_sink=self._materialized_media,
                     )
                     dump_prompt_debug(
                         prompt=prompt_payload,

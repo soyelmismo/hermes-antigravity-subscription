@@ -54,12 +54,19 @@ _NATIVE_MEDIA_TOOLS = frozenset({"read_file", "view_file"})
 
 
 def _native_media_roots() -> tuple[str, ...]:
+    try:
+        from hermes_constants import get_hermes_home
+    except ImportError:
+        def get_hermes_home():
+            return os.path.join(os.path.expanduser("~"), ".hermes")
+
+    hermes_home = str(get_hermes_home())
     roots = [
-        os.path.expanduser("~/.hermes/cache"),
-        os.path.expanduser("~/.hermes/uploads"),
-        os.path.expanduser("~/.hermes/attachments"),
-        os.path.expanduser("~/.hermes/browser_screenshots"),
-        os.path.expanduser("~/.hermes/composer-pastes"),
+        os.path.join(hermes_home, "cache"),
+        os.path.join(hermes_home, "uploads"),
+        os.path.join(hermes_home, "attachments"),
+        os.path.join(hermes_home, "browser_screenshots"),
+        os.path.join(hermes_home, "composer-pastes"),
     ]
     try:
         import tempfile

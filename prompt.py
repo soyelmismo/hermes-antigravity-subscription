@@ -4,20 +4,55 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import ipaddress
 import json
 import logging
 import mimetypes
 import os
 import re
+import socket
+import tempfile
+import urllib.error
+import urllib.parse
 import urllib.request
 from types import SimpleNamespace
 from typing import Any, Callable, Optional
 
+try:
+    from hermes_constants import get_hermes_home
+except ImportError:  # standalone use (tests, plugin dev)
+    def get_hermes_home():
+        return os.path.join(os.path.expanduser("~"), ".hermes")
+
 logger = logging.getLogger(__name__)
 
-_MEDIA_CACHE_DIR = os.path.expanduser("~/.hermes/cache/agy_media")
+# Media materialized for agy lives under the active Hermes home (profile-aware)
+# and is deleted when the owning client session closes.
+_MEDIA_CACHE_DIR = os.path.join(get_hermes_home(), "cache", "agy_media")
 _VIDEO_EXTS = {".mp4", ".mov", ".webm", ".mkv", ".avi", ".ogv"}
 _IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"}
+_AUDIO_EXTS = {".mp3", ".wav", ".m4a", ".ogg", ".oga", ".flac", ".opus", ".aac"}
+
+# Remote fetch hardening: only public hosts, only media content types, and a
+# hard size cap (the body is streamed, never read() whole).
+_MAX_REMOTE_MEDIA_BYTES = 25 * 1024 * 1024
+_MAX_DATA_URL_BYTES = 25 * 1024 * 1024
+
+# mimetypes.guess_extension is OS-dependent (image/webp -> None on some
+# systems); this explicit map keeps the extension gate deterministic.
+_MEDIA_MIME_EXT = {
+    "image/png": ".png",
+    "image/jpeg": ".jpg",
+    "image/gif": ".gif",
+    "image/webp": ".webp",
+    "image/bmp": ".bmp",
+    "video/mp4": ".mp4",
+    "video/webm": ".webm",
+    "video/quicktime": ".mov",
+    "video/x-matroska": ".mkv",
+    "video/x-msvideo": ".avi",
+    "video/ogg": ".ogv",
+}
 
 # agy's headless media contract: pixels reach the model only through
 # [Image](/abs/path) / [Video](/abs/path) markdown references in the turn text.
@@ -92,27 +127,53 @@ def _consume_bracket_block(text: str, start: int) -> int:
     return -1
 
 
+_MEDIA_LOCAL_EXTS = _IMAGE_EXTS | _VIDEO_EXTS | _AUDIO_EXTS
+
+
 def _path_to_kind(path: str) -> str:
     ext = os.path.splitext(path)[1].lower()
     return "Video" if ext in _VIDEO_EXTS else "Image"
 
 
-def _media_reference_for(path: str, fallback_kind: str) -> Optional[str]:
+def _local_media_kind(path: str) -> Optional[str]:
+    """Image/Video/Audio for a local path with an allowed media extension.
+
+    Fail-closed gate: a local file without a known media extension is never
+    handed to agy (agy uploads what it reads to Google).
+    """
+    ext = os.path.splitext(path)[1].lower()
+    if ext in _IMAGE_EXTS:
+        return "Image"
+    if ext in _VIDEO_EXTS:
+        return "Video"
+    if ext in _AUDIO_EXTS:
+        return "Audio"
+    return None
+
+
+def _media_reference_for(
+    path: str, fallback_kind: str, media_sink: Optional[set] = None
+) -> Optional[str]:
     """Canonical agy reference for a note-embedded path, or None.
 
     Per the normalization contract the reference is emitted by PATH, not by
     existence: a file that vanished (scratch pruning, replay from another
     host) must still surface as `[Image](/abs/path)` so the turn keeps its
-    media intent instead of silently degrading to text-only.
+    media intent instead of silently degrading to text-only. The extension
+    gate applies regardless of existence: an unknown-extension path is
+    dropped entirely.
     """
     if not path:
         return None
-    fpath, mtype = _materialize_media(path)
-    kind = mtype or fallback_kind or _path_to_kind(path)
+    kind = _local_media_kind(path)
+    if kind is None:
+        return None
+    fpath, mtype = _materialize_media(path, media_sink)
+    kind = mtype or kind
     return f"[{kind}]({fpath or path})"
 
 
-def _normalize_media_notes(text: str) -> str:
+def _normalize_media_notes(text: str, media_sink: Optional[set] = None) -> str:
     """Replace every synthetic media note with its canonical reference."""
     if not text or "[" not in text:
         return text
@@ -148,7 +209,7 @@ def _normalize_media_notes(text: str) -> str:
             match = _MEDIA_NOTE_SAVED_AT_RE.search(block)
             path = match.group(1).rstrip(".").strip() if match else None
         if path:
-            reference = _media_reference_for(path, kind)
+            reference = _media_reference_for(path, kind, media_sink)
             if reference and reference not in emitted:
                 emitted.add(reference)
                 out.append(reference)
@@ -160,77 +221,257 @@ def _normalize_media_notes(text: str) -> str:
     return "\n".join(part.strip("\n") for part in out if part and part.strip("\n")).strip() or ""
 
 
-def _materialize_media(url_or_data: str) -> tuple[str, str]:
-    """Materialize an image/video reference (data URL, local path, or remote URL)
-    into a local file on disk so the official `agy` CLI's `ConvertImagesToMedia`
-    can resolve it natively via its built-in media regex.
+def _host_is_publicly_fetchable(hostname: str) -> bool:
+    """True only when *hostname* resolves exclusively to public unicast addresses.
+
+    SSRF gate for remote media fetches: loopback, private, link-local
+    (which covers cloud metadata endpoints like 169.254.169.254), reserved,
+    multicast and unspecified addresses make the host refuseable — every
+    address the resolver returns counts, so a mixed-resolution hostname
+    (one public, one private A record) is refused too.
+    """
+    if not hostname:
+        return False
+    try:
+        infos = socket.getaddrinfo(hostname.rstrip("."), None)
+    except (socket.gaierror, OSError, UnicodeError):
+        return False
+    if not infos:
+        return False
+    for info in infos:
+        try:
+            ip_text = str(info[4][0])
+            address = ipaddress.ip_address(ip_text.split("%", 1)[0])
+        except (ValueError, IndexError):
+            return False
+        if (
+            address.is_loopback
+            or address.is_private
+            or address.is_link_local
+            or address.is_reserved
+            or address.is_multicast
+            or address.is_unspecified
+        ):
+            return False
+    return True
+
+
+def _assert_fetchable_http_url(url: str) -> None:
+    """Raise ValueError unless *url* is http(s) to a publicly resolvable host."""
+    parsed = urllib.parse.urlsplit(url)
+    if parsed.scheme not in ("http", "https"):
+        raise ValueError(f"refused media URL scheme: {parsed.scheme!r}")
+    hostname = parsed.hostname or ""
+    if not _host_is_publicly_fetchable(hostname):
+        raise ValueError(f"refused non-public media host: {hostname!r}")
+
+
+class _SafeMediaRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Re-validate every redirect hop exactly like the initial URL."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        try:
+            _assert_fetchable_http_url(newurl)
+        except ValueError as exc:
+            raise urllib.error.URLError(f"media redirect refused: {exc}") from exc
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+_MEDIA_OPENER = urllib.request.build_opener(_SafeMediaRedirectHandler)
+
+# Materialized-by-URL memo: prompt assembly renders the same messages more
+# than once per turn (permission collection, prompt assembly, latest-user
+# extraction), and without a memo every render would re-download. Entries are
+# hints: a path whose file was deleted (session close) re-downloads on next
+# use instead of handing agy a dead reference.
+_REMOTE_MEDIA_MEMO: dict[str, tuple[str, str]] = {}
+_REMOTE_MEDIA_MEMO_LIMIT = 512
+
+
+def _register_materialized(
+    fpath: str, mtype: str, media_sink: Optional[set]
+) -> tuple[str, str]:
+    if fpath and media_sink is not None:
+        media_sink.add(fpath)
+    return fpath, mtype
+
+
+def _media_ext_for_mime(mime: str) -> Optional[str]:
+    ext = mimetypes.guess_extension(mime)
+    if ext == ".jpe":
+        ext = ".jpg"
+    return ext or _MEDIA_MIME_EXT.get(mime)
+
+
+def _mime_kind(mime: str) -> str:
+    if mime.startswith("video/"):
+        return "Video"
+    if mime.startswith("audio/"):
+        return "Audio"
+    return "Image"
+
+
+def unquote_path(path: str) -> str:
+    return urllib.parse.unquote(path or "")
+
+
+def _stream_download_to_cache(resp: Any, ext: str) -> Optional[tuple[str, str]]:
+    """Stream a media response into the cache dir under a hard size cap.
+
+    Writes to a temp file and renames only after the whole body passed the
+    cap, so an aborted download never leaves a partial file behind for agy
+    to read. Returns (path, kind) or None when the cap is exceeded.
+    """
+    digest = hashlib.sha256()
+    os.makedirs(_MEDIA_CACHE_DIR, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(dir=_MEDIA_CACHE_DIR, suffix=".part")
+    total = 0
+    try:
+        with os.fdopen(fd, "wb") as out:
+            while True:
+                chunk = resp.read(65536)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > _MAX_REMOTE_MEDIA_BYTES:
+                    logger.debug("Remote media exceeds %d byte cap", _MAX_REMOTE_MEDIA_BYTES)
+                    return None
+                digest.update(chunk)
+                out.write(chunk)
+        fpath = os.path.join(_MEDIA_CACHE_DIR, f"{digest.hexdigest()[:16]}{ext}")
+        os.replace(tmp_path, fpath)
+        return fpath, _mime_kind(resp.headers.get_content_type().lower())
+    except Exception:
+        logger.debug("Streaming media download failed", exc_info=True)
+        return None
+    finally:
+        if os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+
+
+def _materialize_media(
+    url_or_data: str, media_sink: Optional[set] = None
+) -> tuple[str, str]:
+    """Materialize a media reference (data URL, local path, or remote URL)
+    into a local file so the official `agy` CLI can resolve it natively.
+
+    Every input is gated fail-closed:
+    - data URLs: only image/* and video/* mimes, capped decoded size;
+    - local paths and file:// URIs: only when the extension is a known
+      media extension (nothing unknown is ever handed to agy, which
+      uploads what it reads);
+    - http(s) URLs: only media content types, streamed with a hard size
+      cap, only to publicly resolvable hosts, re-validated on redirects.
 
     Returns:
-        (local_file_path, "Image" | "Video") or ("", "") on failure.
+        (local_file_path, "Image" | "Video" | "Audio") or ("", "") when the
+        reference is refused or cannot be materialized.
     """
     url = (url_or_data or "").strip()
     if not url:
         return "", ""
-
-    try:
-        os.makedirs(_MEDIA_CACHE_DIR, exist_ok=True)
-    except OSError:
-        pass
 
     # 1. Base64 data URL
     if url.startswith("data:"):
         try:
             header, b64_data = url.split(",", 1)
             mime = header.split(";")[0].replace("data:", "").strip().lower()
-            is_video = mime.startswith("video/")
+            if not (mime.startswith("image/") or mime.startswith("video/") or mime.startswith("audio/")):
+                logger.debug("Refused non-media data URL mime: %s", mime)
+                return "", ""
             raw = base64.b64decode(b64_data)
+            if len(raw) > _MAX_DATA_URL_BYTES:
+                logger.debug("Refused oversized data URL media (%d bytes)", len(raw))
+                return "", ""
+            ext = _media_ext_for_mime(mime)
+            if not ext:
+                logger.debug("Refused data URL mime with no media extension: %s", mime)
+                return "", ""
             h = hashlib.sha256(raw).hexdigest()[:16]
-            ext = mimetypes.guess_extension(mime) or (".mp4" if is_video else ".jpg")
-            if ext == ".jpe":
-                ext = ".jpg"
             fpath = os.path.join(_MEDIA_CACHE_DIR, f"{h}{ext}")
             if not os.path.exists(fpath):
-                with open(fpath, "wb") as f:
-                    f.write(raw)
-            return fpath, "Video" if is_video else "Image"
+                try:
+                    os.makedirs(_MEDIA_CACHE_DIR, exist_ok=True)
+                    with open(fpath, "wb") as f:
+                        f.write(raw)
+                except OSError as exc:
+                    logger.debug("Failed to write materialized data URL media: %s", exc)
+                    return "", ""
+            return _register_materialized(fpath, _mime_kind(mime), media_sink)
         except Exception as exc:
             logger.debug("Failed to materialize base64 media data URL: %s", exc)
             return "", ""
 
-    # 2. file:// URI
+    # 2. file:// URI (local host only, no credentials/host indirection)
     if url.startswith("file://"):
-        fpath = url[7:]
-        ext = os.path.splitext(fpath)[1].lower()
-        is_video = ext in _VIDEO_EXTS
-        return fpath, "Video" if is_video else "Image"
+        parsed = urllib.parse.urlsplit(url)
+        if parsed.netloc not in ("", "localhost"):
+            logger.debug("Refused file:// URI with host: %s", parsed.netloc)
+            return "", ""
+        local = unquote_path(parsed.path)
+        kind = _local_media_kind(local)
+        if kind is None:
+            return "", ""
+        # Emitted by path even when the file vanished: the media intent must
+        # survive (agy's read of a missing file fails harmlessly).
+        return _register_materialized(os.path.abspath(local), kind, media_sink)
 
-    # 3. Local filesystem path
-    if os.path.exists(url):
-        fpath = os.path.abspath(url)
-        ext = os.path.splitext(fpath)[1].lower()
-        is_video = ext in _VIDEO_EXTS
-        return fpath, "Video" if is_video else "Image"
-
-    # 4. HTTP / HTTPS URL
+    # 3. HTTP / HTTPS URL (SSRF-gated, capped, media content types only)
     if url.startswith(("http://", "https://")):
         try:
-            req = urllib.request.Request(url, headers={"User-Agent": "Hermes-Agent"})
-            with urllib.request.urlopen(req, timeout=15) as resp:
-                raw = resp.read()
+            _assert_fetchable_http_url(url)
+        except ValueError as exc:
+            logger.debug("Refused remote media URL %s: %s", url, exc)
+            return "", ""
+        memo = _REMOTE_MEDIA_MEMO.get(url)
+        if memo is not None:
+            if os.path.exists(memo[0]):
+                return _register_materialized(memo[0], memo[1], media_sink)
+            _REMOTE_MEDIA_MEMO.pop(url, None)
+        try:
+            req = urllib.request.Request(
+                url, headers={"User-Agent": "Hermes-Agent"}
+            )
+            with _MEDIA_OPENER.open(req, timeout=15) as resp:
                 content_type = resp.headers.get_content_type().lower()
-                is_video = content_type.startswith("video/")
-                h = hashlib.sha256(raw).hexdigest()[:16]
-                ext = mimetypes.guess_extension(content_type) or (".mp4" if is_video else ".jpg")
-                if ext == ".jpe":
-                    ext = ".jpg"
-                fpath = os.path.join(_MEDIA_CACHE_DIR, f"{h}{ext}")
-                if not os.path.exists(fpath):
-                    with open(fpath, "wb") as f:
-                        f.write(raw)
-                return fpath, "Video" if is_video else "Image"
+                if not (
+                    content_type.startswith("image/")
+                    or content_type.startswith("video/")
+                    or content_type.startswith("audio/")
+                ):
+                    logger.debug(
+                        "Refused remote media content type %s for %s",
+                        content_type,
+                        url,
+                    )
+                    return "", ""
+                ext = _media_ext_for_mime(content_type)
+                if not ext:
+                    logger.debug(
+                        "Refused remote media content type with no extension: %s",
+                        content_type,
+                    )
+                    return "", ""
+                result = _stream_download_to_cache(resp, ext)
+            if result is None:
+                return "", ""
+            if len(_REMOTE_MEDIA_MEMO) >= _REMOTE_MEDIA_MEMO_LIMIT:
+                for stale in list(_REMOTE_MEDIA_MEMO)[: _REMOTE_MEDIA_MEMO_LIMIT // 2]:
+                    _REMOTE_MEDIA_MEMO.pop(stale, None)
+            _REMOTE_MEDIA_MEMO[url] = result
+            return _register_materialized(result[0], result[1], media_sink)
         except Exception as exc:
             logger.debug("Failed to download remote media URL %s: %s", url, exc)
             return "", ""
+
+    # 4. Local filesystem path (checked last: URL shapes never reach it).
+    # Extension gate only; emitted by path even when the file vanished.
+    kind = _local_media_kind(url)
+    if kind is not None:
+        return _register_materialized(os.path.abspath(url), kind, media_sink)
 
     return "", ""
 
@@ -333,11 +574,13 @@ def _find_tool_call_close(text: str, start: int = 0) -> int:
     return -1
 
 
-def _render_message_content(content: Any) -> str:
+def _render_message_content(content: Any, media_sink: Optional[set] = None) -> str:
     """Normalize multimodal or structured message content into a string.
 
     Synthetic media notes are translated to canonical agy references so the
     CLI's media pipeline can attach the real pixels (see _normalize_media_notes).
+    Refused media (unknown extension, non-public host, non-media type) is
+    dropped entirely: nothing unverifiable is ever handed to agy.
     """
     rendered: str
     if content is None:
@@ -347,7 +590,7 @@ def _render_message_content(content: Any) -> str:
             rendered = _clean_rendered_text(str(content.get("text") or ""))
         else:
             rendered = _clean_rendered_text(str(content.get("content") or ""))
-        return _normalize_media_notes(rendered)
+        return _normalize_media_notes(rendered, media_sink)
     if isinstance(content, list):
         parts = []
         for item in content:
@@ -379,20 +622,26 @@ def _render_message_content(content: Any) -> str:
                     if not url_val and isinstance(item.get("url"), str):
                         url_val = item["url"]
                     if url_val:
-                        fpath, mtype = _materialize_media(url_val)
+                        fpath, mtype = _materialize_media(url_val, media_sink)
                         if fpath:
                             parts.append(f"[{mtype}]({fpath})")
                         else:
-                            fallback_type = "Video" if "video" in str(item_type) else "Image"
-                            parts.append(f"[{fallback_type}]({url_val})")
+                            # Fail-closed: a refused or unmaterializable
+                            # reference must NOT degrade into a raw URL /
+                            # path handed to agy as pseudo-media.
+                            logger.debug(
+                                "Dropped %s part (materialization refused): %.120s",
+                                item_type,
+                                url_val,
+                            )
                 elif item_type == "input_audio":
                     parts.append("[Audio input]")
                 elif "text" in item:
                     cleaned = _clean_rendered_text(str(item.get("text") or ""))
                     if cleaned:
                         parts.append(cleaned)
-        return _normalize_media_notes("\n".join(p for p in parts if p).strip())
-    return _normalize_media_notes(_clean_rendered_text(str(content)))
+        return _normalize_media_notes("\n".join(p for p in parts if p).strip(), media_sink)
+    return _normalize_media_notes(_clean_rendered_text(str(content)), media_sink)
 
 
 def _latest_user_request_section(user_text: str) -> str:
@@ -467,6 +716,7 @@ def _format_messages_as_prompt(
     model: str | None = None,
     tools: list[dict[str, Any]] | None = None,
     tool_choice: Any = None,
+    media_sink: Optional[set] = None,
 ) -> str:
     """Assemble Hermes message history, system prompt, and tool schemas into a canonical prompt."""
     try:
@@ -492,7 +742,7 @@ def _format_messages_as_prompt(
     for msg in valid_messages:
         role = str(msg.get("role") or "unknown").strip().lower()
         if role == "system":
-            rendered = _render_message_content(msg.get("content"))
+            rendered = _render_message_content(msg.get("content"), media_sink)
             if rendered:
                 system_parts.append(rendered)
         else:
@@ -572,7 +822,7 @@ def _format_messages_as_prompt(
         if objective:
             sections.append(_tool_loop_objective_section(objective))
     elif last_role == "user" and last_msg is not None and len(history_messages) > 1:
-        user_text = _render_message_content(last_msg.get("content"))
+        user_text = _render_message_content(last_msg.get("content"), media_sink)
         sections.append(
             "### ACTIVE OBJECTIVE:\n"
             f"The user has submitted a new request:\n\"{user_text}\"\n\n"
@@ -627,6 +877,7 @@ def _messages_match_prefix(history: Sequence[dict[str, Any]], incoming: Sequence
 def _format_delta_prompt(
     new_messages: Sequence[dict[str, Any]],
     pending_user_text: str = "",
+    media_sink: Optional[set] = None,
 ) -> str:
     """Format only the incremental messages in an ongoing multi-turn interaction.
 
@@ -650,7 +901,7 @@ def _format_delta_prompt(
     parts: list[str] = []
     for msg in prior_messages:
         role = str(msg.get("role") or "").strip().lower()
-        rendered_content = _render_message_content(msg.get("content"))
+        rendered_content = _render_message_content(msg.get("content"), media_sink)
         if role == "tool":
             tool_id = str(msg.get("tool_call_id") or msg.get("name") or "tool").strip()
             if len(rendered_content) > 20000:
@@ -697,7 +948,7 @@ def _format_delta_prompt(
         if pending_user_text:
             parts.append(_pending_user_request_section(pending_user_text))
     elif last_role == "user":
-        user_text = (pending_user_text or _latest_user_text(valid_messages)) if recovery_turn else _render_message_content(last_msg.get("content"))
+        user_text = (pending_user_text or _latest_user_text(valid_messages)) if recovery_turn else _render_message_content(last_msg.get("content"), media_sink)
         if user_text:
             parts.append(_latest_user_request_section(user_text))
     else:
@@ -705,17 +956,19 @@ def _format_delta_prompt(
     return "\n\n".join(s.strip() for s in _apply_media_viewing_protocol(parts) if s and s.strip())
 
 
-def media_reference_paths(messages: Any) -> set[str]:
+def media_reference_paths(messages: Any, media_sink: Optional[set] = None) -> set[str]:
     """Every media path the rendered messages reference: ``[Image](/abs/path)``.
 
     Shared by the stream's native-tool allowlist and the client's worker
-    permissions stamp, so both describe the same media contract.
+    permissions stamp, so both describe the same media contract. Rendering
+    materializes references (downloads, cache files) into *media_sink* when
+    given, so the caller can clean them up at session close.
     """
     paths: set[str] = set()
     for message in messages or []:
         if not isinstance(message, dict):
             continue
-        rendered = _render_message_content(message.get("content"))
+        rendered = _render_message_content(message.get("content"), media_sink)
         for path in _MEDIA_REF_RE.findall(rendered):
             if path:
                 paths.add(os.path.normpath(path))
