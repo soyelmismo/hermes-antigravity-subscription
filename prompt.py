@@ -15,12 +15,22 @@ from typing import Any, Callable, Optional
 
 logger = logging.getLogger(__name__)
 
-_MEDIA_CACHE_DIR = os.path.expanduser("~/.hermes/cache/scratch/agy_media")
+_MEDIA_CACHE_DIR = os.path.expanduser("~/.hermes/cache/agy_media")
 _VIDEO_EXTS = {".mp4", ".mov", ".webm", ".mkv", ".avi", ".ogv"}
 _IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"}
 
+# agy's headless media contract: pixels reach the model only through
+# [Image](/abs/path) / [Video](/abs/path) markdown references in the turn text.
+_MEDIA_REF_RE = re.compile(r"\[(?:Image|Video|Audio)\]\(([^)]+)\)")
+
 _ATTACHMENT_ANNOTATION_RE = re.compile(
-    r"\n*\s*\[(?:Image attached at|screenshot):\s*[^\]]+\]",
+    # Bare [screenshot] (and any arg'd variant) carries no path: pure noise,
+    # stripped as an annotation. [Image attached at: <path>] carries the ONLY
+    # copy of the attachment path in a native-routed text message, so it is
+    # NOT stripped here — _normalize_media_notes translates it into the
+    # canonical reference. Stripping it first is what made native-routed
+    # turns arrive at agy with no media reference at all.
+    r"\n*\s*\[screenshot(?::\s*[^\]]+)?\]",
     re.IGNORECASE,
 )
 
@@ -29,6 +39,125 @@ def _clean_rendered_text(text: str) -> str:
     if not text:
         return ""
     return _ATTACHMENT_ANNOTATION_RE.sub("", text).strip()
+
+
+# --- Synthetic media notes -> canonical agy references -----------------------
+#
+# The Hermes core prepends several shapes of synthetic notes when a user turn
+# carries media. In native routing the pixels travel as structured image_url
+# parts; in text routing the turn text carries an auxiliary-vision description
+# plus the local cache path. agy can only attach pixels from a markdown media
+# reference, so every note shape is translated in place: the description block
+# is dropped (the model receives the real pixels, a description of its own
+# input is noise) and ONE canonical `[Image](/abs/path)` / `[Video](...)` is
+# emitted where the note stood.
+
+_NOTE_HEADS: tuple[tuple[str, str], ...] = (
+    ("[The user sent a video attachment:", "Video"),
+    ("[The user sent an audio file attachment:", "Audio"),
+    ("[The user sent an image", "Image"),
+    ("[The user attached an image", "Image"),
+    ("[The tool result attached an image", "Image"),
+    ("[The assistant attached an image", "Image"),
+    ("[User sent an image:", "Image"),
+    ("[Image attached at:", "Image"),
+    # The paired "closer look" bracket that follows a description block (both
+    # the gateway and the CLI variants). Consuming it here is what turns the
+    # pair into exactly one reference instead of leaving the instruction
+    # (and the path) as literal text the model can read.
+    ("[If you need a closer look, use vision_analyze with", "Image"),
+)
+
+_VISION_NOTE_PATH_RE = re.compile(r"image_url:\s*([^\s\]~]+)")
+_MEDIA_NOTE_SAVED_AT_RE = re.compile(r"It is saved at:\s*([^\s\]]+)")
+_ATTACHED_AT_RE = re.compile(r"^\[Image attached at:\s*([^\]]+)\]\s*$")
+
+
+def _consume_bracket_block(text: str, start: int) -> int:
+    """Index just past the balanced ``[...]`` block opening at *start*, or -1.
+
+    Balanced scanning instead of a lazy ``[^]]*`` regex: auxiliary vision
+    descriptions may themselves contain ``]`` (markdown in the analysis), and
+    the note only truly ends at depth zero.
+    """
+    depth = 0
+    for index in range(start, len(text)):
+        char = text[index]
+        if char == "[":
+            depth += 1
+        elif char == "]":
+            depth -= 1
+            if depth == 0:
+                return index + 1
+    return -1
+
+
+def _path_to_kind(path: str) -> str:
+    ext = os.path.splitext(path)[1].lower()
+    return "Video" if ext in _VIDEO_EXTS else "Image"
+
+
+def _media_reference_for(path: str, fallback_kind: str) -> Optional[str]:
+    """Canonical agy reference for a note-embedded path, or None.
+
+    Per the normalization contract the reference is emitted by PATH, not by
+    existence: a file that vanished (scratch pruning, replay from another
+    host) must still surface as `[Image](/abs/path)` so the turn keeps its
+    media intent instead of silently degrading to text-only.
+    """
+    if not path:
+        return None
+    fpath, mtype = _materialize_media(path)
+    kind = mtype or fallback_kind or _path_to_kind(path)
+    return f"[{kind}]({fpath or path})"
+
+
+def _normalize_media_notes(text: str) -> str:
+    """Replace every synthetic media note with its canonical reference."""
+    if not text or "[" not in text:
+        return text
+    out: list[str] = []
+    emitted: set[str] = set()
+    cursor = 0
+    while True:
+        hit: Optional[tuple[int, str, str]] = None
+        for head, kind in _NOTE_HEADS:
+            pos = text.find(head, cursor)
+            if pos != -1 and (hit is None or pos < hit[0]):
+                hit = (pos, head, kind)
+        if hit is None:
+            out.append(text[cursor:])
+            break
+        pos, head, kind = hit
+        out.append(text[cursor:pos])
+        end = _consume_bracket_block(text, pos)
+        if end == -1:
+            # Unterminated note head: keep the rest verbatim (an echo of the
+            # marker in prose must not truncate the message).
+            out.append(text[pos:])
+            break
+        block = text[pos:end]
+        path: Optional[str] = None
+        if head == "[Image attached at:":
+            match = _ATTACHED_AT_RE.match(block.strip())
+            path = match.group(1).strip() if match else None
+        elif "image_url:" in block:
+            match = _VISION_NOTE_PATH_RE.search(block)
+            path = match.group(1).rstrip("~").strip() if match else None
+        elif "saved at:" in block:
+            match = _MEDIA_NOTE_SAVED_AT_RE.search(block)
+            path = match.group(1).rstrip(".").strip() if match else None
+        if path:
+            reference = _media_reference_for(path, kind)
+            if reference and reference not in emitted:
+                emitted.add(reference)
+                out.append(reference)
+        # Notes with no resolvable path are pure noise (failed analysis,
+        # duplicated attachment marker): dropped, never re-described.
+        cursor = end
+    if not out:
+        return text
+    return "\n".join(part.strip("\n") for part in out if part and part.strip("\n")).strip() or ""
 
 
 def _materialize_media(url_or_data: str) -> tuple[str, str]:
@@ -133,6 +262,38 @@ _PROMPT_PREAMBLE = (
     "- When the user's latest message introduces a new question or task, do NOT continue prior completed tasks or tool loops. Address the user's latest request directly.",
 )
 
+# agy attaches media pixels through its own native read step: the model must
+# call read_file/view_file on the referenced path, and the CLI then inlines the
+# file as a media block. The blanket "native tools are disabled" preamble would
+# otherwise forbid the one tool call the media pipeline requires (verified in
+# session transcripts: reference present + read denied -> no pixels -> "no
+# puedo verlo"). This section is injected ONLY on turns whose assembled prompt
+# actually carries a media reference.
+_MEDIA_VIEWING_SECTION = (
+    "### MEDIA VIEWING PROTOCOL (applies ONLY to this turn's media references):\n"
+    "Messages may contain markdown media references: [Image](/abs/path), [Video](/abs/path) or [Audio](/abs/path).\n"
+    "These are real attachments, not prose. To see the media, call your native read_file (or view_file) "
+    "tool on that exact path once — the runtime then attaches the file's pixels to your context, and you "
+    "answer from what you see.\n"
+    "This read is the ONLY permitted use of a native tool in this mode; every other native tool stays "
+    "disabled. Never describe media you have not loaded this way, and never narrate loading steps — "
+    "just read the file, then answer."
+)
+
+
+def _apply_media_viewing_protocol(sections: list[str]) -> list[str]:
+    """Insert the media viewing section when the assembled prompt carries a reference."""
+    if not any(_MEDIA_REF_RE.search(section) for section in sections):
+        return sections
+    insert_at = 0
+    for index, section in enumerate(sections):
+        if section.startswith("Conversation transcript:"):
+            insert_at = index
+            break
+    sections.insert(insert_at, _MEDIA_VIEWING_SECTION)
+    return sections
+
+
 _TOOL_CALL_PREFIXES = tuple(
     "<tool_call>"[:i] for i in range(len("<tool_call>"), 0, -1)
 )
@@ -173,13 +334,20 @@ def _find_tool_call_close(text: str, start: int = 0) -> int:
 
 
 def _render_message_content(content: Any) -> str:
-    """Normalize multimodal or structured message content into a string."""
+    """Normalize multimodal or structured message content into a string.
+
+    Synthetic media notes are translated to canonical agy references so the
+    CLI's media pipeline can attach the real pixels (see _normalize_media_notes).
+    """
+    rendered: str
     if content is None:
         return ""
     if isinstance(content, dict):
         if "text" in content:
-            return _clean_rendered_text(str(content.get("text") or ""))
-        return _clean_rendered_text(str(content.get("content") or ""))
+            rendered = _clean_rendered_text(str(content.get("text") or ""))
+        else:
+            rendered = _clean_rendered_text(str(content.get("content") or ""))
+        return _normalize_media_notes(rendered)
     if isinstance(content, list):
         parts = []
         for item in content:
@@ -223,8 +391,8 @@ def _render_message_content(content: Any) -> str:
                     cleaned = _clean_rendered_text(str(item.get("text") or ""))
                     if cleaned:
                         parts.append(cleaned)
-        return "\n".join(p for p in parts if p).strip()
-    return _clean_rendered_text(str(content))
+        return _normalize_media_notes("\n".join(p for p in parts if p).strip())
+    return _normalize_media_notes(_clean_rendered_text(str(content)))
 
 
 def _latest_user_request_section(user_text: str) -> str:
@@ -436,7 +604,7 @@ def _format_messages_as_prompt(
             sections.append(_latest_user_request_section(user_text))
     else:
         sections.append("Continue the conversation from the latest message.")
-    return "\n\n".join(s.strip() for s in sections if s and s.strip())
+    return "\n\n".join(s.strip() for s in _apply_media_viewing_protocol(sections) if s and s.strip())
 
 
 def _messages_match_prefix(history: Sequence[dict[str, Any]], incoming: Sequence[dict[str, Any]]) -> bool:
@@ -534,7 +702,24 @@ def _format_delta_prompt(
             parts.append(_latest_user_request_section(user_text))
     else:
         parts.append("Continue the conversation from the latest message above.")
-    return "\n\n".join(s.strip() for s in parts if s and s.strip())
+    return "\n\n".join(s.strip() for s in _apply_media_viewing_protocol(parts) if s and s.strip())
+
+
+def media_reference_paths(messages: Any) -> set[str]:
+    """Every media path the rendered messages reference: ``[Image](/abs/path)``.
+
+    Shared by the stream's native-tool allowlist and the client's worker
+    permissions stamp, so both describe the same media contract.
+    """
+    paths: set[str] = set()
+    for message in messages or []:
+        if not isinstance(message, dict):
+            continue
+        rendered = _render_message_content(message.get("content"))
+        for path in _MEDIA_REF_RE.findall(rendered):
+            if path:
+                paths.add(os.path.normpath(path))
+    return paths
 
 
 def _longest_tool_call_prefix_match(text: str) -> int:

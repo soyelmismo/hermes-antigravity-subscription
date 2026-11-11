@@ -6,6 +6,8 @@ import asyncio
 import contextlib
 import json
 import logging
+import os
+import re
 import subprocess
 import threading
 import time
@@ -22,6 +24,7 @@ try:
         _has_unparseable_tool_call_frame,
         _longest_tool_call_prefix_match,
         _parse_tool_block,
+        media_reference_paths,
     )
 except ImportError:
     from process import _check_early_quota_error
@@ -32,9 +35,51 @@ except ImportError:
         _has_unparseable_tool_call_frame,
         _longest_tool_call_prefix_match,
         _parse_tool_block,
+        media_reference_paths,
     )
 
 logger = logging.getLogger(__name__)
+
+# agy's media pipeline attaches pixels THROUGH a native read: the model calls
+# read_file/view_file on the path referenced as [Image](path) and the CLI then
+# inlines the file as a media block into the turn. Blanket-neutralizing every
+# native tool step (the pre-multimodality posture) made that attach impossible,
+# which is exactly why media turns answered "no puedo verlo". The allowlist is
+# scoped to the media contract only: read-only tools, targeting paths that this
+# turn references as media, or that sit under Hermes' media cache roots. Every
+# other native tool (run_command, write_to_file, edit_file, ...) stays
+# neutralized: the host executes nothing unreviewed, and credential locations
+# (~/.gemini, ~/.hermes/auth.json, ~/.ssh) are outside every allowed root.
+_NATIVE_MEDIA_TOOLS = frozenset({"read_file", "view_file"})
+
+
+def _native_media_roots() -> tuple[str, ...]:
+    roots = [
+        os.path.expanduser("~/.hermes/cache"),
+        os.path.expanduser("~/.hermes/uploads"),
+        os.path.expanduser("~/.hermes/attachments"),
+        os.path.expanduser("~/.hermes/browser_screenshots"),
+        os.path.expanduser("~/.hermes/composer-pastes"),
+    ]
+    try:
+        import tempfile
+
+        roots.append(tempfile.gettempdir())
+    except Exception:
+        roots.append("/tmp")
+    return tuple(os.path.realpath(r) for r in roots)
+
+
+_NATIVE_MEDIA_ROOTS = _native_media_roots()
+_TOOL_INFO_PATH_RE = re.compile(r"/[A-Za-z0-9_\-./]+")
+
+
+def _path_is_native_media_target(path: str, referenced: set[str]) -> bool:
+    normalized = os.path.normpath(path)
+    if normalized in referenced:
+        return True
+    real = os.path.realpath(normalized)
+    return any(real == root or real.startswith(root + os.sep) for root in _NATIVE_MEDIA_ROOTS)
 
 
 class _UsageDeltas(NamedTuple):
@@ -187,6 +232,9 @@ class AntigravityStream(Iterator[Any]):
         self.is_worker = is_worker
         self.worker_lock = worker_lock
         self.messages = messages
+        # Media paths referenced by this turn's messages: the allowlist for
+        # agy's native media-attach reads (see _is_permitted_native_media_step).
+        self._media_paths = self._collect_media_reference_paths()
         # Ownership record for the worker request lock. threading.Lock is
         # NOT owner-bound: locked() is true and release() succeeds from any
         # thread, so a lock()/locked() probe cannot tell "my lock" from
@@ -420,6 +468,29 @@ class AntigravityStream(Iterator[Any]):
         # _retire_executor); a second call is a harmless no-op because an
         # already-shut-down executor accepts shutdown() again.
         self._retire_executor()
+
+    def _collect_media_reference_paths(self) -> set[str]:
+        """Paths this turn's messages reference as media (``[Image](/abs/path)``).
+
+        agy attaches pixels through a native read on that exact path, so the
+        references ARE the allowlist for the media-attach tool steps.
+        """
+        return media_reference_paths(self.messages)
+
+    def _is_permitted_native_media_step(self, tool_name: str, tool_info: str) -> bool:
+        """True when a native tool step is exactly the media-attach read.
+
+        Read-only tools only, and the target must be a path this turn
+        references as media (or sit under Hermes' media cache roots, so a
+        resumed conversation can still re-read an earlier attachment). A
+        read whose target cannot be verified is denied: fail closed.
+        """
+        if tool_name not in _NATIVE_MEDIA_TOOLS:
+            return False
+        for candidate in _TOOL_INFO_PATH_RE.findall(tool_info):
+            if _path_is_native_media_target(candidate, self._media_paths):
+                return True
+        return False
 
     def close(self) -> None:
         if self._closed:
@@ -692,22 +763,34 @@ class AntigravityStream(Iterator[Any]):
                     if not self.conversation_id:
                         self.conversation_id = step.get("conversation_id", "")
                     if step.get("step_type") == "tool":
-                        logger.warning(
-                            "Antigravity attempted native tool invocation '%s'; neutralizing to prevent host execution.",
-                            step.get("tool_name"),
-                        )
-                        self.close()
-                        # Recorded so the post-loop positive-evidence check
-                        # does not treat this security abort as an empty
-                        # failed turn: the process is terminated right here
-                        # on purpose, and the empty completion assembled
-                        # afterwards is the pinned behavior (see
-                        # test_native_tool_step_neutralization_in_stream).
-                        # The stop cause is recorded too, so diagnostics do
-                        # not misreport this deliberate abort as a deadline.
-                        neutralized_tool_step = True
-                        stop_reason = "native tool step neutralized"
-                        break
+                        tool_name = str(step.get("tool_name") or "")
+                        if self._is_permitted_native_media_step(
+                            tool_name, str(step.get("tool_info") or "")
+                        ):
+                            # The media-attach read: agy copies the referenced
+                            # file into its session media store and inlines the
+                            # pixels. The step carries no content; the next
+                            # agent_response deltas carry the visual answer.
+                            logger.info(
+                                "Antigravity native media attach allowed: %s", tool_name
+                            )
+                        else:
+                            logger.warning(
+                                "Antigravity attempted native tool invocation '%s'; neutralizing to prevent host execution.",
+                                step.get("tool_name"),
+                            )
+                            self.close()
+                            # Recorded so the post-loop positive-evidence check
+                            # does not treat this security abort as an empty
+                            # failed turn: the process is terminated right here
+                            # on purpose, and the empty completion assembled
+                            # afterwards is the pinned behavior (see
+                            # test_native_tool_step_neutralization_in_stream).
+                            # The stop cause is recorded too, so diagnostics do
+                            # not misreport this deliberate abort as a deadline.
+                            neutralized_tool_step = True
+                            stop_reason = "native tool step neutralized"
+                            break
                     if "usage" in step:
                         usage_data = step["usage"]
 

@@ -230,11 +230,46 @@ def _classify_antigravity_error(
 
 # ProviderProfile optional field opt-ins.
 _PROFILE_EXTRA_FIELDS: dict[str, Any] = {}
-_profile_field_names = {f.name for f in fields(ProviderProfile)}
-if "supports_streaming" in _profile_field_names:
+
+
+class _LazyModelCapabilities(dict):
+    """dict answering exact-model capability lookups without enumerating the catalog.
+
+    The core reads this mapping only via ``.get(model, {})``
+    (``agent/models_dev._provider_model_capabilities``), so a dynamic ``get`` lets
+    the plugin resolve aliases and effort suffixes on demand against the live agy
+    catalog. Declaring ``modalities.input`` here makes ``decide_image_input_mode``
+    resolve ``native`` deterministically — offline, with no models.dev fetch —
+    because ``_apply_overrides`` merges the plugin declaration even when the
+    catalog entry (or the network) is missing. Without it the verdict flip-flops
+    between native and text on identical turns depending on catalog cache state,
+    which is exactly the multimodality flakiness this plugin must not have.
+    """
+
+    def get(self, model: Any, default: Any = None) -> Any:
+        name = str(model or "").strip()
+        if not name:
+            return default
+        try:
+            resolved = resolve_model_alias(name, _cached_catalog())
+            base, _suffix = split_effort_suffix(resolved.lower())
+        except Exception:
+            return default
+        if base.startswith("gemini"):
+            return {"modalities": {"input": ["text", "image", "video"], "output": ["text"]}}
+        if base.startswith("claude"):
+            return {"modalities": {"input": ["text", "image"], "output": ["text"]}}
+        # gpt-oss and unknown families: no declaration -> the core's own probes decide.
+        return default
+
+
+_PROFILE_FIELD_NAMES = {f.name for f in fields(ProviderProfile)}
+if "supports_streaming" in _PROFILE_FIELD_NAMES:
     _PROFILE_EXTRA_FIELDS["supports_streaming"] = True
-if "models_dev_id" in _profile_field_names:
+if "models_dev_id" in _PROFILE_FIELD_NAMES:
     _PROFILE_EXTRA_FIELDS["models_dev_id"] = "google"
+if "model_capabilities" in _PROFILE_FIELD_NAMES:
+    _PROFILE_EXTRA_FIELDS["model_capabilities"] = _LazyModelCapabilities()
 
 antigravity_profile = AntigravitySubscriptionDirectSDKProfile(
     name="antigravity-subscription-directsdk",

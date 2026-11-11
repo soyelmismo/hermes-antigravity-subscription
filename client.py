@@ -41,11 +41,13 @@ try:
         _own_process_group,
         build_child_env,
         is_authenticated,
+        read_media_rules,
         resolve_agy_command,
         resolve_real_token_path,
         setup_isolated_home,
         start_stderr_drainer,
         terminate_process,
+        write_media_read_permissions,
     )
     from .prompt import (
         _PROMPT_PREAMBLE,
@@ -57,6 +59,7 @@ try:
         _messages_match_prefix,
         _parse_tool_block,
         _render_message_content,
+        media_reference_paths,
     )
     from .delivery import DeliveryWatch
     from .stream import AntigravityStream, collect_stream_completion
@@ -74,11 +77,13 @@ except ImportError:
         _own_process_group,
         build_child_env,
         is_authenticated,
+        read_media_rules,
         resolve_agy_command,
         resolve_real_token_path,
         setup_isolated_home,
         start_stderr_drainer,
         terminate_process,
+        write_media_read_permissions,
     )
     from prompt import (
         _PROMPT_PREAMBLE,
@@ -90,6 +95,7 @@ except ImportError:
         _messages_match_prefix,
         _parse_tool_block,
         _render_message_content,
+        media_reference_paths,
     )
     from delivery import DeliveryWatch
     from stream import AntigravityStream, collect_stream_completion
@@ -396,6 +402,10 @@ class AntigravityClient:
         self._worker_history: list[dict[str, Any]] = []
         self._worker_conversation_id: str | None = None
         self._conversation_history: list[dict[str, Any]] = []
+        # Media rules the LIVE worker's settings.json contained at spawn:
+        # agy reads permissions only at spawn, so a turn referencing new
+        # media paths must respawn the worker (conversation preserved).
+        self._worker_media_rules: frozenset[str] = frozenset()
         # Cumulative usage snapshot of the current worker session. agy 1.2.10+
         # persistent workers report cumulative session usage, so per-turn
         # deltas need this baseline. The reference is replaced on every spawn
@@ -685,6 +695,28 @@ class AntigravityClient:
             return False
         return (cpu_now - cpu_then) < _WORKER_ABANDON_CPU_SECONDS
 
+    def _ensure_worker_media_permissions(self, paths: set[str]) -> None:
+        """Grant agy's headless read permission for this turn's media paths.
+
+        agy auto-denies read_file/view_file without an explicit per-target
+        ``read_file(<path>)`` rule in settings.json, and reads that file only
+        at spawn. So: merge the rules into the isolated settings.json, and if
+        a live worker was spawned without them, terminate it KEEPING the agy
+        conversation — the next ``_get_or_spawn_worker`` respawns with
+        ``--conversation`` and the fresh rules, so delta resume still works.
+        """
+        if not paths:
+            return
+        rules = write_media_read_permissions(self._isolated_gemini_dir, paths)
+        with self._lock:
+            live = (
+                self._worker_proc is not None
+                and self._worker_proc.poll() is None
+            )
+            if live and not paths <= self._worker_media_rules:
+                self._terminate_worker_locked(keep_conversation=True)
+            self._worker_media_rules = frozenset(rules)
+
     def _get_or_spawn_worker(
         self,
         model: str,
@@ -739,6 +771,10 @@ class AntigravityClient:
             self._worker_model = model
             self._worker_effort = effort
             self._worker_history = list(self._conversation_history) if conversation_id else []
+            # Stamp what the fresh worker's settings.json granted: agy reads
+            # permissions only at spawn (verified: rewriting the file under a
+            # live worker changes nothing for its next turn).
+            self._worker_media_rules = read_media_rules(self._isolated_gemini_dir)
             self._worker_usage_baseline = {}
             self._active_processes.add(proc)
             self._worker_last_activity[proc] = time.monotonic()
@@ -817,6 +853,9 @@ class AntigravityClient:
             tools=tools,
             is_worker=False,
             prompt_chars=len(prompt_text),
+            # The turn's messages feed the native media-attach allowlist
+            # (read_file/view_file on referenced media paths only).
+            messages=messages,
             # Oneshots run concurrently when the worker is busy. They have no
             # comparable prior sample and must not mutate the worker watch.
             delivery_watch=None,
@@ -859,6 +898,15 @@ class AntigravityClient:
             if isinstance(timeout, (int, float)) and timeout > 0
             else _DEFAULT_TIMEOUT_SECONDS
         )
+
+        # Multimodal translation: grant agy's headless read permission for
+        # every media path this turn's messages reference, BEFORE any spawn
+        # decision — both the worker and the oneshot process read settings.json
+        # at spawn. A live worker lacking the new paths is respawned with its
+        # agy conversation preserved.
+        turn_media_paths = media_reference_paths(messages_list)
+        if turn_media_paths:
+            self._ensure_worker_media_permissions(turn_media_paths)
 
         worker_acquired = self._worker_lock.acquire(blocking=False)
         if worker_acquired:

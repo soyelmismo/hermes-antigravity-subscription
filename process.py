@@ -44,6 +44,70 @@ def _is_existing_file(path: str | Path) -> bool:
         return False
 
 
+# --- Native media-attach permissions -----------------------------------------
+#
+# agy's headless mode auto-denies read_file/view_file unless settings.json
+# carries an explicit per-target rule (`read_file(<abs path>)`, verified from
+# agy's own stderr guidance: "a tool required the read_file permission that
+# headless mode cannot prompt for"). The file is read ONLY at process spawn,
+# so callers must (re)write it before spawning any worker that will serve a
+# turn referencing new media paths.
+
+import json as _json
+
+_MEDIA_RULE_TOOLS = ("read_file", "view_file")
+
+
+def read_media_rules(isolated_gemini_dir: str | Path) -> frozenset[str]:
+    """The media rules currently present in the isolated settings.json."""
+    settings_path = Path(isolated_gemini_dir) / "settings.json"
+    try:
+        settings = _json.loads(settings_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return frozenset()
+    allow = settings.get("permissions", {}).get("allow", [])
+    if not isinstance(allow, list):
+        return frozenset()
+    return frozenset(str(rule) for rule in allow)
+
+
+def write_media_read_permissions(
+    isolated_gemini_dir: str | Path, paths: "set[str] | frozenset[str]"
+) -> frozenset[str]:
+    """Merge ``read_file(<path>)`` / ``view_file(<path>)`` rules for *paths*.
+
+    Rules accumulate: an earlier turn's paths stay allowed so a resumed
+    conversation can re-read an old attachment. Atomic replace; returns the
+    full media-rule set now present in the file.
+    """
+    settings_path = Path(isolated_gemini_dir) / "settings.json"
+    try:
+        settings = _json.loads(settings_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        settings = {}
+    if not isinstance(settings, dict):
+        settings = {}
+    permissions = settings.get("permissions")
+    if not isinstance(permissions, dict):
+        permissions = {}
+    allow = permissions.get("allow")
+    if not isinstance(allow, list):
+        allow = []
+    existing = {str(rule) for rule in allow}
+    for path in paths:
+        for tool in _MEDIA_RULE_TOOLS:
+            rule = f"{tool}({path})"
+            if rule not in existing:
+                allow.append(rule)
+                existing.add(rule)
+    permissions["allow"] = allow
+    settings["permissions"] = permissions
+    tmp_path = settings_path.with_suffix(".json.tmp")
+    tmp_path.write_text(_json.dumps(settings, indent=1), encoding="utf-8")
+    os.replace(tmp_path, settings_path)
+    return read_media_rules(isolated_gemini_dir)
+
+
 _CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
 
 
