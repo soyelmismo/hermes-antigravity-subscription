@@ -235,6 +235,13 @@ class LazyModelCapabilitiesTests(unittest.TestCase):
     def test_unknown_family_stays_undeclared(self):
         self.assertIsNone(self.caps.get("totally-unknown-model"))
 
+    def test_declaration_uses_canonical_vision_key(self):
+        # agent/models_dev._override_to_catalog_shape translates ``supports_vision``;
+        # a modalities-only declaration is dropped by the catalog merge and the
+        # capability silently resolves None -> the auxiliary describer wins.
+        for model in ("gemini-3.8-flash", "gemini-4-hydrogen-medium", "claude-sonnet-4-6"):
+            self.assertIs(self.caps.get(model).get("supports_vision"), True)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -236,31 +236,58 @@ class _LazyModelCapabilities(dict):
     """dict answering exact-model capability lookups without enumerating the catalog.
 
     The core reads this mapping only via ``.get(model, {})``
-    (``agent/models_dev._provider_model_capabilities``), so a dynamic ``get`` lets
-    the plugin resolve aliases and effort suffixes on demand against the live agy
-    catalog. Declaring ``modalities.input`` here makes ``decide_image_input_mode``
-    resolve ``native`` deterministically — offline, with no models.dev fetch —
-    because ``_apply_overrides`` merges the plugin declaration even when the
-    catalog entry (or the network) is missing. Without it the verdict flip-flops
-    between native and text on identical turns depending on catalog cache state,
-    which is exactly the multimodality flakiness this plugin must not have.
+    (``agent/models_dev._provider_model_capabilities``), so a dynamic ``get``
+    lets the plugin declare per-model vision on demand. Declaring
+    ``modalities.input`` here makes ``decide_image_input_mode`` resolve
+    ``native`` deterministically — offline, with no models.dev fetch and
+    WITHOUT depending on the agy catalog: the family is visible from the
+    model id's own prefix (``gemini-*`` / ``claude-*``), so a cold catalog
+    cache (first turn after gateway start, TTL expiry, agy unavailable)
+    cannot flip the verdict to ``text``. Effort-suffixed ids
+    (``gemini-3.8-flash-high``) and future families (``gemini-4-*``,
+    ``claude-5-*``) are covered by the same prefix rule. Alias ids are
+    resolved as a best-effort second pass. Without this declaration the
+    verdict flip-flops between native and text on identical turns depending
+    on catalog cache state, which is exactly the multimodality flakiness
+    this plugin must not have.
     """
 
     def get(self, model: Any, default: Any = None) -> Any:
         name = str(model or "").strip()
         if not name:
             return default
+        verdict = self._declare(name.lower())
+        if verdict is not None:
+            return verdict
+        # Alias ids ("flash", "opus"): resolve through the live catalog when
+        # available and re-check the resolved family. Failure keeps the
+        # fail-closed default — the core's own probes decide.
         try:
-            resolved = resolve_model_alias(name, _cached_catalog())
-            base, _suffix = split_effort_suffix(resolved.lower())
+            resolved = resolve_model_alias(name, _cached_catalog()).lower()
+            if resolved != name.lower():
+                return self._declare(resolved)
         except Exception:
-            return default
-        if base.startswith("gemini"):
-            return {"modalities": {"input": ["text", "image", "video"], "output": ["text"]}}
-        if base.startswith("claude"):
-            return {"modalities": {"input": ["text", "image"], "output": ["text"]}}
-        # gpt-oss and unknown families: no declaration -> the core's own probes decide.
+            pass
         return default
+
+    @staticmethod
+    def _declare(base: str) -> dict[str, Any] | None:
+        base, _suffix = split_effort_suffix(base)
+        if base.startswith("gemini"):
+            # Canonical override schema (agent/models_dev._override_to_catalog_shape):
+            # ``supports_vision`` is the key the core's vision derivation honors;
+            # ``modalities`` is kept for raw readers.
+            return {
+                "supports_vision": True,
+                "modalities": {"input": ["text", "image", "video"], "output": ["text"]},
+            }
+        if base.startswith("claude"):
+            return {
+                "supports_vision": True,
+                "modalities": {"input": ["text", "image"], "output": ["text"]},
+            }
+        # gpt-oss and unknown families: no declaration -> the core's own probes decide.
+        return None
 
 
 _PROFILE_FIELD_NAMES = {f.name for f in fields(ProviderProfile)}
