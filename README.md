@@ -146,6 +146,8 @@ Hardening of the materialization path (`prompt.py`):
 
 `agy` reads `settings.json` permissions only at spawn. When a turn references media the live worker's permission set does not cover, the plugin writes exact `read_file(<path>)` rules and respawns the worker with `--conversation`, preserving the agy conversation (verified end to end: red image on turn 1, worker respawn, blue image on turn 2, both read natively).
 
+The plugin also declares vision capability to Hermes' image router (`agent/models_dev` canonical schema): `gemini-*` and `claude-*` model ids (any effort suffix, aliases resolved, future families included) advertise `supports_vision`, so with `agent.vision_capability_first: true` user-attached images attach natively to the plugin's models and the configured `auxiliary.vision` describer stays reserved for text-only models. The declaration is prefix-based and does not depend on the agy model catalog being warm.
+
 ## Ephemeral sessions and cleanup
 
 Every client runs `agy` with an isolated `HOME` inside a temp dir (`hermes_agy_*`); the user's real `~/.gemini` sessions, conversation index and brain are never touched. Cleanup layers:
