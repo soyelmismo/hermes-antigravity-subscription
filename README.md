@@ -133,6 +133,31 @@ Strict baseline: `PATH`, `LANG`, `LANGUAGE`, `LC_*`, `TZ`, `TERM`, `TMPDIR`/`TEM
 └─────────────────────────────────────────────────────────────┘
 ```
 
+## Multimodal media
+
+Image, video and audio attachments are embedded natively: the plugin materializes each attachment (local path, `file://` URI or remote URL) to a cache file and references it in the prompt as `[Image](/abs/path)`, which `agy` reads through its native `read_file` tool and uploads to Google as real pixels. No transcription, no auxiliary descriptions.
+
+Hardening of the materialization path (`prompt.py`):
+
+- Remote downloads only from publicly fetchable hosts: loopback, private, link-local, reserved, multicast and metadata addresses are refused, re-validating every redirect hop.
+- Downloads stream to a `.part` file with a hard cap (25 MB) and are renamed into the cache only after passing the cap.
+- Only `image/*`, `video/*` and `audio/*` content types are accepted; local paths and `file://` URIs must carry a known media extension. Rejected media is dropped fail-closed, never degraded to a raw reference.
+- The cache lives under Hermes' own home (`get_hermes_home()/cache/agy_media`) and files are deleted when the session closes.
+
+`agy` reads `settings.json` permissions only at spawn. When a turn references media the live worker's permission set does not cover, the plugin writes exact `read_file(<path>)` rules and respawns the worker with `--conversation`, preserving the agy conversation (verified end to end: red image on turn 1, worker respawn, blue image on turn 2, both read natively).
+
+## Ephemeral sessions and cleanup
+
+Every client runs `agy` with an isolated `HOME` inside a temp dir (`hermes_agy_*`); the user's real `~/.gemini` sessions, conversation index and brain are never touched. Cleanup layers:
+
+1. `close()` kills the worker and removes the temp dir plus any materialized media files.
+2. A Linux `/proc` sweep on client init (`reap_orphaned_plugin_workers`) terminates leftover plugin workers whose owning temp dir was already deleted — a Hermes process that dies without `close()` would otherwise leave an orphaned worker (PPID 1) holding a conversation open on the account; a 17-hour orphan was observed tangling other sessions' turns (2026-11-11).
+3. Leftover temp dirs under Hermes' scratch are pruned by the normal 24h idle sweep.
+
+Footprint is ~14 MB per live session (conversation DBs and logs). Nothing persists on disk after close, and nothing is created server-side beyond the account's normal conversations.
+
+Multiple agy sessions on one account contend for the shared OAuth token: whoever refreshed last wins, and the loser logs "You are not logged into Antigravity" / "error getting token source" and produces no result. The plugin re-syncs the isolated token before every spawn and retries a turn once when the exact contention signature appears. Concurrent cascades are serialized server-side by subscription capacity: a second simultaneous session can surface a 503 "No capacity available" until the first turn finishes.
+
 ---
 
 ## Requirements
