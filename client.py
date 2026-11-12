@@ -42,6 +42,7 @@ try:
         build_child_env,
         is_authenticated,
         read_media_rules,
+        reap_orphaned_plugin_workers,
         resolve_agy_command,
         resolve_real_token_path,
         setup_isolated_home,
@@ -79,6 +80,7 @@ except ImportError:
         build_child_env,
         is_authenticated,
         read_media_rules,
+        reap_orphaned_plugin_workers,
         resolve_agy_command,
         resolve_real_token_path,
         setup_isolated_home,
@@ -398,6 +400,15 @@ class AntigravityClient:
 
         # Isolate agy state and session index from the user's real ~/.gemini/antigravity-cli
         self._isolated_home, self._isolated_gemini_dir = setup_isolated_home(self._cwd)
+
+        # A Hermes process that died without close() leaves its agy worker
+        # orphaned, holding a conversation open on the shared account (the
+        # 2026-11-11 multi-session interference). Best-effort, Linux-only,
+        # scoped to workers whose owner tempdir is already gone.
+        try:
+            reap_orphaned_plugin_workers()
+        except Exception:
+            logger.debug("Orphaned-worker sweep failed", exc_info=True)
 
         self.chat = SimpleNamespace(completions=SimpleNamespace(create=self._create_chat_completion))
         self.is_closed = False

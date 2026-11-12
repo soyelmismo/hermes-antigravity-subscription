@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import logging
 import os
 import re
 import shutil
@@ -13,6 +14,8 @@ import threading
 from collections import deque
 from pathlib import Path
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 # Marker scheme for Antigravity local provider
 AGY_MARKER_BASE_URL = "agy://local"
@@ -699,6 +702,68 @@ def is_authenticated() -> bool:
         return token_path.is_file() and token_path.stat().st_size > 10
     except OSError:
         return False
+
+
+def reap_orphaned_plugin_workers() -> int:
+    """Kill agy workers whose isolated home was already deleted.
+
+    A Hermes process that dies without close() leaves its agy worker
+    orphaned (PPID=1) holding a conversation open on the shared account;
+    its stream turns then tangle with every NEW session's turns (observed
+    2026-11-11). The owning client's TemporaryDirectory is removed on
+    clean close, so a worker whose HOME points into a nonexistent
+    ``hermes_agy_*`` directory has no owner left. Scoped hard: the
+    cmdline must carry the plugin's stream-json signature AND the env
+    HOME must sit inside a deleted hermes_agy_* tempdir — the user's own
+    interactive agy (HOME=/root) and other sessions' live workers are
+    never touched. Linux-only (/proc); returns the number reaped.
+    """
+    if not sys.platform.startswith("linux"):
+        return 0
+    reaped = 0
+    try:
+        entries = os.listdir("/proc")
+    except OSError:
+        return 0
+    for entry in entries:
+        if not entry.isdigit():
+            continue
+        pid = int(entry)
+        if pid == os.getpid():
+            continue
+        try:
+            cmdline = open(f"/proc/{pid}/cmdline", "rb").read().decode(
+                errors="replace"
+            ).replace("\x00", " ")
+            if "--input-format stream-json" not in cmdline or (
+                "--disable-slash-commands" not in cmdline
+            ):
+                continue
+            env_home = ""
+            with open(f"/proc/{pid}/environ", "rb") as env_file:
+                for pair in env_file.read().decode(errors="replace").split("\x00"):
+                    if pair.startswith("HOME="):
+                        env_home = pair[5:]
+                        break
+        except (OSError, PermissionError):
+            continue
+        marker = "/hermes_agy_"
+        home_index = env_home.find(marker)
+        if home_index == -1:
+            continue
+        if os.path.isdir(env_home):
+            continue  # owning client still alive
+        logger.warning(
+            "Reaping orphaned agy worker pid=%d (owner tempdir %s is gone).",
+            pid,
+            env_home,
+        )
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            continue
+        reaped += 1
+    return reaped
 
 
 def setup_isolated_home(cwd: Path | str) -> tuple[Path, Path]:
