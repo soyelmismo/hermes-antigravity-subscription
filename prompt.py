@@ -9,6 +9,7 @@ import json
 import logging
 import mimetypes
 import os
+import pathlib
 import re
 import socket
 import tempfile
@@ -417,7 +418,12 @@ def _materialize_media(
             return "", ""
         # Emitted by path even when the file vanished: the media intent must
         # survive (agy's read of a missing file fails harmlessly).
-        return _register_materialized(os.path.abspath(local), kind, media_sink)
+        target_path = (
+            local
+            if local.startswith(("/", "\\")) or os.path.isabs(local)
+            else os.path.abspath(local)
+        )
+        return _register_materialized(target_path, kind, media_sink)
 
     # 3. HTTP / HTTPS URL (SSRF-gated, capped, media content types only)
     if url.startswith(("http://", "https://")):
@@ -471,7 +477,16 @@ def _materialize_media(
     # Extension gate only; emitted by path even when the file vanished.
     kind = _local_media_kind(url)
     if kind is not None:
-        return _register_materialized(os.path.abspath(url), kind, media_sink)
+        target_path = (
+            url
+            if (
+                url.startswith(("/", "\\"))
+                or os.path.isabs(url)
+                or pathlib.PureWindowsPath(url).is_absolute()
+            )
+            else os.path.abspath(url)
+        )
+        return _register_materialized(target_path, kind, media_sink)
 
     return "", ""
 

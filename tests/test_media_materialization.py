@@ -122,6 +122,11 @@ class LocalPathGateTests(unittest.TestCase):
         self.assertEqual(mtype, "Image")
         self.assertEqual(fpath, "/nonexistent/dir/photo.png")
 
+    def test_windows_drive_path_still_emitted(self):
+        fpath, mtype = agy_prompt._materialize_media(r"C:\Users\sample.png")
+        self.assertEqual(mtype, "Image")
+        self.assertEqual(fpath, r"C:\Users\sample.png")
+
     def test_vanished_refused_path_dropped(self):
         self.assertEqual(
             agy_prompt._materialize_media("/nonexistent/dir/secrets.env"), ("", "")

@@ -52,7 +52,13 @@ class SyncIsolatedTokenTests(unittest.TestCase):
         with patch.object(agy_process, "resolve_real_token_path", return_value=self.real_token):
             self.assertTrue(agy_process.sync_isolated_token(home))
         self.assertTrue(token.is_symlink())
-        self.assertEqual(Path(os.readlink(token)).resolve(), self.real_token.resolve())
+        try:
+            self.assertTrue(os.path.samefile(Path(os.readlink(token)), self.real_token))
+        except (OSError, ValueError):
+            # Fallback for Windows extended-length prefixes (//?/ or \\?\)
+            target_str = str(Path(os.readlink(token)).resolve()).replace("//?/", "").replace("\\?\\", "")
+            real_str = str(self.real_token.resolve()).replace("//?/", "").replace("\\?\\", "")
+            self.assertEqual(os.path.normcase(target_str), os.path.normcase(real_str))
 
     def test_stale_symlink_relinked(self):
         home = self._isolated()
