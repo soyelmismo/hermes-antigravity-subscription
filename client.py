@@ -46,6 +46,7 @@ try:
         resolve_real_token_path,
         setup_isolated_home,
         start_stderr_drainer,
+        sync_isolated_token,
         terminate_process,
         write_media_read_permissions,
     )
@@ -82,6 +83,7 @@ except ImportError:
         resolve_real_token_path,
         setup_isolated_home,
         start_stderr_drainer,
+        sync_isolated_token,
         terminate_process,
         write_media_read_permissions,
     )
@@ -104,6 +106,42 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 _DEFAULT_TIMEOUT_SECONDS = 300.0
+
+# agy prints these when its token source cannot be built — the signature of
+# OAuth contention with ANOTHER agy session on the same Google account (each
+# process refreshes the shared token; the loser logs this and produces no
+# result). Observed verbatim in isolated-home cli logs, 2026-11-11.
+_AUTH_CONTENTION_SIGNATURES = (
+    "not logged into antigravity",
+    "error getting token source",
+)
+
+
+def _empty_no_result(completion: Any) -> bool:
+    """True when a completion carries neither content, tool calls, nor a
+    finish reason — the shape ``collect_stream_completion`` returns when the
+    worker ended its turn without ever emitting a result event."""
+    try:
+        choice = completion.choices[0]
+    except (AttributeError, IndexError, TypeError):
+        return False
+    message = getattr(choice, "message", None)
+    if getattr(message, "content", None):
+        return False
+    if getattr(message, "tool_calls", None):
+        return False
+    return getattr(choice, "finish_reason", None) is None
+
+
+def _stderr_shows_auth_contention(proc: Any) -> bool:
+    drainer = getattr(proc, "_stderr_drainer", None)
+    if drainer is None:
+        return False
+    try:
+        tail = (drainer.get_tail() or "").lower()
+    except Exception:
+        return False
+    return any(signature in tail for signature in _AUTH_CONTENTION_SIGNATURES)
 
 # The persistent worker is only ever replaced by the next request (model
 # change, non-continuation history) or by close(). Hermes retires an evicted
@@ -759,6 +797,12 @@ class AntigravityClient:
 
             self._terminate_worker_locked(keep_conversation=bool(conversation_id))
 
+            # Multiple agy processes share one Google account; whoever
+            # refreshed last wins. Re-point the isolated token at the real
+            # file right before every spawn so a worker never starts from a
+            # stale copy ("You are not logged into Antigravity").
+            sync_isolated_token(self._isolated_home)
+
             cmd_args = [self._command, "--input-format", "stream-json", *self._args]
             if conversation_id:
                 cmd_args.extend(["--conversation", conversation_id])
@@ -836,6 +880,9 @@ class AntigravityClient:
             cmd_args.extend(["--model", model])
         if effort:
             cmd_args.extend(["--effort", effort])
+
+        # Same account-contention guard as the worker spawn path.
+        sync_isolated_token(self._isolated_home)
 
         proc = subprocess.Popen(
             cmd_args,
@@ -1023,8 +1070,56 @@ class AntigravityClient:
                 )
                 if stream:
                     return stream_iter
+                completion: Any = None
+                auth_retried = False
+                while True:
+                    completion = collect_stream_completion(stream_iter)
+                    if auth_retried or not _empty_no_result(completion):
+                        break
+                    if not _stderr_shows_auth_contention(proc):
+                        break
+                    # Token contention with another agy session on this
+                    # account: the worker produced no result and its stderr
+                    # carries the token-source failure. Re-sync the token and
+                    # retry the turn ONCE with a fresh worker, keeping the
+                    # agy conversation so delta resume still works.
+                    logger.warning(
+                        "Antigravity worker ended with no result amid token-source auth errors; "
+                        "re-syncing token and retrying once."
+                    )
+                    auth_retried = True
+                    sync_isolated_token(self._isolated_home)
+                    with self._lock:
+                        self._terminate_worker_locked(keep_conversation=True)
+                    proc = self._get_or_spawn_worker(
+                        resolved_model, effort, conversation_id=self._worker_conversation_id
+                    )
+                    event_msg = {"event": "user", "message": {"content": prompt_payload}}
+                    try:
+                        if proc.stdin:
+                            proc.stdin.write(json.dumps(event_msg) + "\n")
+                            proc.stdin.flush()
+                    except (BrokenPipeError, OSError):
+                        break
+                    with self._lock:
+                        worker_usage_baseline = self._worker_usage_baseline
+                    stream_iter = AntigravityStream(
+                        proc=proc,
+                        client=self,
+                        model=resolved_model,
+                        timeout=effective_timeout,
+                        tools=tools,
+                        is_worker=True,
+                        worker_lock=self._worker_lock,
+                        worker_lock_held=True,
+                        messages=messages_list,
+                        usage_baseline=worker_usage_baseline,
+                        prompt_chars=len(prompt_payload),
+                        delivery_watch=self._delivery_watch if comparable_full_send else None,
+                        delivery_sample_key=f"{resolved_model}:{effort}",
+                    )
                 try:
-                    return collect_stream_completion(stream_iter)
+                    return completion
                 finally:
                     if self._worker_lock.locked():
                         self._worker_lock.release()

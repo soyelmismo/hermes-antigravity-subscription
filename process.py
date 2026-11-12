@@ -301,6 +301,50 @@ def resolve_real_token_path() -> Path | None:
     return None
 
 
+def sync_isolated_token(isolated_home: str | Path) -> bool:
+    """Point the isolated home's oauth token at the REAL token, freshly.
+
+    Multiple agy processes share one Google account (the user's own `agy`
+    sessions, other Hermes providers). Whoever refreshes last wins, and a
+    worker spawned against a stale copy dies with "You are not logged into
+    Antigravity" (observed 2026-11-11 in hermes_agy_* homes). A symlink
+    follows the real file automatically, so this only relinks when the link
+    went stale or the layout fell back to a hardlink/copy.
+    """
+    real_token = resolve_real_token_path()
+    if not real_token or not _is_existing_file(real_token):
+        return False
+    isolated_token = (
+        Path(isolated_home) / ".gemini" / "antigravity-cli" / real_token.name
+    )
+    try:
+        isolated_token.parent.mkdir(parents=True, exist_ok=True)
+        if isolated_token.is_symlink():
+            if isolated_token.resolve() == Path(real_token).resolve():
+                return True
+            with contextlib.suppress(OSError):
+                isolated_token.unlink()
+        elif isolated_token.exists() and isolated_token.resolve() == Path(real_token).resolve():
+            return True  # hardlink to the same inode: always current
+        if isolated_token.is_file():
+            # An agy refresh writes a NEW file at the real path, so a copy
+            # lags behind; identical bytes need no rewrite.
+            if isolated_token.read_bytes() == Path(real_token).read_bytes():
+                return True
+        tmp_link = isolated_token.with_name(isolated_token.name + ".sync.tmp")
+        try:
+            os.symlink(real_token, tmp_link)
+            os.replace(tmp_link, isolated_token)
+        except OSError:
+            if tmp_link.exists():
+                with contextlib.suppress(OSError):
+                    tmp_link.unlink()
+            shutil.copy2(real_token, isolated_token)
+        return True
+    except OSError:
+        return False
+
+
 def _windows_credential_present() -> bool:
     """True if agy's Windows Credential Manager entry exists.
 
