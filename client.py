@@ -61,6 +61,7 @@ try:
         _messages_match_prefix,
         _parse_tool_block,
         _render_message_content,
+        _is_plugin_owned_media_path,
         media_reference_paths,
     )
     from .delivery import DeliveryWatch
@@ -99,6 +100,7 @@ except ImportError:
         _messages_match_prefix,
         _parse_tool_block,
         _render_message_content,
+        _is_plugin_owned_media_path,
         media_reference_paths,
     )
     from delivery import DeliveryWatch
@@ -524,6 +526,15 @@ class AntigravityClient:
             self._materialized_media.clear()
         for path in materialized:
             try:
+                # Defense in depth: even if a foreign path ever reached the
+                # sink, close() deletes only files inside this plugin's own
+                # media cache dir — never a user-referenced file (review
+                # 5887913331, point 1).
+                if not _is_plugin_owned_media_path(path):
+                    logger.debug(
+                        "Skipping non-plugin-owned media path on close: %s", path
+                    )
+                    continue
                 os.remove(path)
             except OSError:
                 pass

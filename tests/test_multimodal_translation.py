@@ -42,7 +42,7 @@ class _TempCacheTestCase(unittest.TestCase):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         self.tmp_name = tmp.name
-        patcher = patch.object(agy_prompt, "_MEDIA_CACHE_DIR", tmp.name)
+        patcher = patch.object(agy_prompt, "_media_cache_dir", lambda: tmp.name)
         patcher.start()
         self.addCleanup(patcher.stop)
 

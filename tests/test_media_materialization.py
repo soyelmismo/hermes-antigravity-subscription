@@ -232,7 +232,9 @@ class RemoteDownloadTests(unittest.TestCase):
         agy_prompt._REMOTE_MEDIA_MEMO.clear()
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
-        cache_patch = patch.object(agy_prompt, "_MEDIA_CACHE_DIR", self.tmp.name)
+        cache_patch = patch.object(
+            agy_prompt, "_media_cache_dir", lambda: self.tmp.name
+        )
         cache_patch.start()
         self.addCleanup(cache_patch.stop)
         gate_patch = patch.object(
@@ -274,11 +276,31 @@ class RemoteDownloadTests(unittest.TestCase):
 
 
 class CacheDirAndLifecycleTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+
+    def _write(self, name: str, data: bytes = b"x") -> str:
+        path = os.path.join(self.tmp.name, name)
+        Path(path).write_bytes(data)
+        return path
+
     def test_cache_dir_derived_from_hermes_home(self):
         expected = os.path.join(
             str(agy_prompt.get_hermes_home()), "cache", "agy_media"
         )
-        self.assertEqual(agy_prompt._MEDIA_CACHE_DIR, expected)
+        self.assertEqual(agy_prompt._media_cache_dir(), expected)
+
+    def test_cache_dir_resolved_at_use_time_per_profile(self):
+        # Review 5887913331 point 2: the cache dir must follow the ACTIVE
+        # profile's home at every call, not a home captured at import.
+        with patch.object(
+            agy_prompt, "get_hermes_home", return_value=self.tmp.name
+        ):
+            self.assertEqual(
+                agy_prompt._media_cache_dir(),
+                os.path.join(self.tmp.name, "cache", "agy_media"),
+            )
 
     def test_sink_registration(self):
         payload = base64.b64encode(b"\x89PNGfake").decode()
@@ -288,6 +310,37 @@ class CacheDirAndLifecycleTests(unittest.TestCase):
         )
         self.assertIn(fpath, sink)
 
+    def test_passthrough_local_file_never_enters_sink(self):
+        # Review 5887913331 point 1: a user-referenced local file goes to agy
+        # BY PATH; registering it in the sink made session close delete the
+        # user's own photo. Pass-through references must never enter the sink.
+        sink: set[str] = set()
+        fpath, mtype = agy_prompt._materialize_media(self._write("mine.png"), sink)
+        self.assertEqual(mtype, "Image")
+        self.assertNotIn(fpath, sink)
+        self.assertTrue(os.path.isfile(fpath))
+
+    def test_file_uri_never_enters_sink(self):
+        sink: set[str] = set()
+        fpath, _ = agy_prompt._materialize_media(
+            "file://" + self._write("clip.mp4"), sink
+        )
+        self.assertNotIn(fpath, sink)
+
+    def test_client_close_keeps_foreign_sink_paths(self):
+        # Defense-in-depth layer: even a foreign path smuggled into the sink
+        # is NOT deleted by close() unless it sits inside the plugin's own
+        # media cache dir.
+        import client as agy_client
+
+        user_file = self._write("precious.png")
+        cl = agy_client.AntigravityClient()
+        try:
+            cl._materialized_media.add(user_file)
+        finally:
+            cl.close()
+        self.assertTrue(os.path.isfile(user_file))
+
     def test_client_close_deletes_materialized_media(self):
         import client as agy_client
 
@@ -296,6 +349,7 @@ class CacheDirAndLifecycleTests(unittest.TestCase):
         fpath, _ = agy_prompt._materialize_media(
             f"data:image/png;base64,{payload}", sink
         )
+        self.assertIn(fpath, sink)
         self.assertTrue(os.path.isfile(fpath))
         cl = agy_client.AntigravityClient()
         try:
@@ -303,6 +357,40 @@ class CacheDirAndLifecycleTests(unittest.TestCase):
         finally:
             cl.close()
         self.assertFalse(os.path.exists(fpath))
+
+
+class NativeMediaRootsTests(unittest.TestCase):
+    def test_native_media_roots_resolved_at_use_time(self):
+        # Review 5887913331 point 2: _path_is_native_media_target must
+        # evaluate the roots of the ACTIVE profile home on every call.
+        import types
+
+        import stream as agy_stream
+
+        module = types.ModuleType("hermes_constants")
+        holder = {"home": "/home/one"}
+        setattr(module, "get_hermes_home", lambda: holder["home"])
+        saved = sys.modules.get("hermes_constants")
+        sys.modules["hermes_constants"] = module
+        try:
+            inside = os.path.join(holder["home"], "cache", "x.png")
+            self.assertTrue(
+                agy_stream._path_is_native_media_target(inside, set())
+            )
+            holder["home"] = "/home/two"
+            self.assertFalse(
+                agy_stream._path_is_native_media_target(inside, set())
+            )
+            self.assertTrue(
+                agy_stream._path_is_native_media_target(
+                    os.path.join("/home/two", "uploads", "y.png"), set()
+                )
+            )
+        finally:
+            if saved is not None:
+                sys.modules["hermes_constants"] = saved
+            else:
+                sys.modules.pop("hermes_constants", None)
 
 
 if __name__ == "__main__":

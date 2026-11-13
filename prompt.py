@@ -28,8 +28,14 @@ except ImportError:  # standalone use (tests, plugin dev)
 logger = logging.getLogger(__name__)
 
 # Media materialized for agy lives under the active Hermes home (profile-aware)
-# and is deleted when the owning client session closes.
-_MEDIA_CACHE_DIR = os.path.join(get_hermes_home(), "cache", "agy_media")
+# and is deleted when the owning client session closes. The dir is resolved at
+# USE time, not at import: one Hermes process can serve several profiles, and
+# the cache must live under the home of the profile owning the session
+# (review 5887913331, point 2).
+def _media_cache_dir() -> str:
+    return os.path.join(get_hermes_home(), "cache", "agy_media")
+
+
 _VIDEO_EXTS = {".mp4", ".mov", ".webm", ".mkv", ".avi", ".ogv"}
 _IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"}
 _AUDIO_EXTS = {".mp3", ".wav", ".m4a", ".ogg", ".oga", ".flac", ".opus", ".aac"}
@@ -289,10 +295,29 @@ _REMOTE_MEDIA_MEMO: dict[str, tuple[str, str]] = {}
 _REMOTE_MEDIA_MEMO_LIMIT = 512
 
 
+def _is_plugin_owned_media_path(path: str) -> bool:
+    """True only for files this plugin wrote into its own media cache dir.
+
+    Pass-through references (the user's own photos, Hermes' gateway media
+    cache files, anything handed over by bare path or file:// URI) resolve
+    OUTSIDE the dir: they go to agy by reference and must never be registered
+    for deletion, or session close would delete the user's own data (review
+    5887913331, point 1). realpath comparison: the cache dir or the file may
+    sit behind a symlink, and realpath works on vanished paths too.
+    """
+    if not path:
+        return False
+    cache_root = os.path.realpath(_media_cache_dir())
+    real = os.path.realpath(path)
+    return real == cache_root or real.startswith(cache_root + os.sep)
+
+
 def _register_materialized(
     fpath: str, mtype: str, media_sink: Optional[set]
 ) -> tuple[str, str]:
-    if fpath and media_sink is not None:
+    # Only files the plugin itself wrote into its media cache dir enter the
+    # close-deletion sink; pass-through user files never do.
+    if fpath and media_sink is not None and _is_plugin_owned_media_path(fpath):
         media_sink.add(fpath)
     return fpath, mtype
 
@@ -324,8 +349,9 @@ def _stream_download_to_cache(resp: Any, ext: str) -> Optional[tuple[str, str]]:
     to read. Returns (path, kind) or None when the cap is exceeded.
     """
     digest = hashlib.sha256()
-    os.makedirs(_MEDIA_CACHE_DIR, exist_ok=True)
-    fd, tmp_path = tempfile.mkstemp(dir=_MEDIA_CACHE_DIR, suffix=".part")
+    cache_dir = _media_cache_dir()
+    os.makedirs(cache_dir, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(dir=cache_dir, suffix=".part")
     total = 0
     try:
         with os.fdopen(fd, "wb") as out:
@@ -339,7 +365,7 @@ def _stream_download_to_cache(resp: Any, ext: str) -> Optional[tuple[str, str]]:
                     return None
                 digest.update(chunk)
                 out.write(chunk)
-        fpath = os.path.join(_MEDIA_CACHE_DIR, f"{digest.hexdigest()[:16]}{ext}")
+        fpath = os.path.join(cache_dir, f"{digest.hexdigest()[:16]}{ext}")
         os.replace(tmp_path, fpath)
         return fpath, _mime_kind(resp.headers.get_content_type().lower())
     except Exception:
@@ -392,10 +418,11 @@ def _materialize_media(
                 logger.debug("Refused data URL mime with no media extension: %s", mime)
                 return "", ""
             h = hashlib.sha256(raw).hexdigest()[:16]
-            fpath = os.path.join(_MEDIA_CACHE_DIR, f"{h}{ext}")
+            cache_dir = _media_cache_dir()
+            fpath = os.path.join(cache_dir, f"{h}{ext}")
             if not os.path.exists(fpath):
                 try:
-                    os.makedirs(_MEDIA_CACHE_DIR, exist_ok=True)
+                    os.makedirs(cache_dir, exist_ok=True)
                     with open(fpath, "wb") as f:
                         f.write(raw)
                 except OSError as exc:

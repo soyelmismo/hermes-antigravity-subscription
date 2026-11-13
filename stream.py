@@ -77,7 +77,6 @@ def _native_media_roots() -> tuple[str, ...]:
     return tuple(os.path.realpath(r) for r in roots)
 
 
-_NATIVE_MEDIA_ROOTS = _native_media_roots()
 _TOOL_INFO_PATH_RE = re.compile(r"/[A-Za-z0-9_\-./]+")
 
 
@@ -86,7 +85,13 @@ def _path_is_native_media_target(path: str, referenced: set[str]) -> bool:
     if normalized in referenced:
         return True
     real = os.path.realpath(normalized)
-    return any(real == root or real.startswith(root + os.sep) for root in _NATIVE_MEDIA_ROOTS)
+    # Resolved at use time: a Hermes process serving several profiles must
+    # evaluate the roots of the profile owning this session (review
+    # 5887913331, point 2).
+    return any(
+        real == root or real.startswith(root + os.sep)
+        for root in _native_media_roots()
+    )
 
 
 class _UsageDeltas(NamedTuple):
