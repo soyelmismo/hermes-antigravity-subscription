@@ -769,27 +769,34 @@ class AntigravityClient:
             return False
         return (cpu_now - cpu_then) < _WORKER_ABANDON_CPU_SECONDS
 
-    def _ensure_worker_media_permissions(self, paths: set[str]) -> None:
-        """Grant agy's headless read permission for this turn's media paths.
+    def _ensure_worker_media_permissions(
+        self, paths: set[str], *, worker_turn: bool
+    ) -> None:
+        """Merge media permissions, recycling only the turn's own worker.
 
-        agy auto-denies read_file/view_file without an explicit per-target
-        ``read_file(<path>)`` rule in settings.json, and reads that file only
-        at spawn. So: merge the rules into the isolated settings.json, and if
-        a live worker was spawned without them, terminate it KEEPING the agy
-        conversation — the next ``_get_or_spawn_worker`` respawns with
-        ``--conversation`` and the fresh rules, so delta resume still works.
+        ``worker_turn`` is ownership recorded by a successful _worker_lock
+        acquisition, not a locked() probe. Oneshots need the same settings but
+        must leave a concurrent worker and its spawn-time rule snapshot alone.
         """
         if not paths:
             return
-        rules = write_media_read_permissions(self._isolated_gemini_dir, paths)
+        required_rules = {
+            f"{tool}({path})"
+            for path in paths
+            for tool in ("read_file", "view_file")
+        }
         with self._lock:
+            # Serialize the read/merge/replace (including the shared .tmp file)
+            # with other requests and the worker's spawn-time snapshot.
+            write_media_read_permissions(self._isolated_gemini_dir, paths)
             live = (
                 self._worker_proc is not None
                 and self._worker_proc.poll() is None
             )
-            if live and not paths <= self._worker_media_rules:
+            if worker_turn and live and not required_rules <= self._worker_media_rules:
                 self._terminate_worker_locked(keep_conversation=True)
-            self._worker_media_rules = frozenset(rules)
+            # Only _get_or_spawn_worker stamps _worker_media_rules: updating
+            # settings does not change permissions in an already-live worker.
 
     def _get_or_spawn_worker(
         self,
@@ -986,20 +993,16 @@ class AntigravityClient:
             else _DEFAULT_TIMEOUT_SECONDS
         )
 
-        # Multimodal translation: grant agy's headless read permission for
-        # every media path this turn's messages reference, BEFORE any spawn
-        # decision — both the worker and the oneshot process read settings.json
-        # at spawn. A live worker lacking the new paths is respawned with its
-        # agy conversation preserved.
+        # Resolve media before either spawn path. Recycling a worker for new
+        # permissions must wait until this request owns its turn.
         turn_media_paths = media_reference_paths(
             messages_list, self._materialized_media
         )
-        if turn_media_paths:
-            self._ensure_worker_media_permissions(turn_media_paths)
 
         worker_acquired = self._worker_lock.acquire(blocking=False)
         if worker_acquired:
             try:
+                self._ensure_worker_media_permissions(turn_media_paths, worker_turn=True)
                 with self._lock:
                     ref_history = (
                         self._worker_history
@@ -1151,6 +1154,7 @@ class AntigravityClient:
                     self._worker_lock.release()
                 raise
         else:
+            self._ensure_worker_media_permissions(turn_media_paths, worker_turn=False)
             return self._run_oneshot_completion(
                 model=resolved_model,
                 effort=effort,
