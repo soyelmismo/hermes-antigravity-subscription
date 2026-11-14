@@ -787,8 +787,12 @@ class AntigravityClient:
         }
         with self._lock:
             # Serialize the read/merge/replace (including the shared .tmp file)
-            # with other requests and the worker's spawn-time snapshot.
-            write_media_read_permissions(self._isolated_gemini_dir, paths)
+            # with other requests and the worker's spawn-time snapshot. Avoid
+            # rewriting settings when disk already grants this turn's paths.
+            if not required_rules <= read_media_rules(self._isolated_gemini_dir):
+                write_media_read_permissions(self._isolated_gemini_dir, paths)
+            # Disk grants and the live worker's loaded snapshot are independent:
+            # a concurrent oneshot may have updated only the settings file.
             live = (
                 self._worker_proc is not None
                 and self._worker_proc.poll() is None
@@ -1003,6 +1007,12 @@ class AntigravityClient:
         if worker_acquired:
             try:
                 self._ensure_worker_media_permissions(turn_media_paths, worker_turn=True)
+            except Exception:
+                # Permission setup precedes worker I/O. A settings failure must
+                # release our turn without discarding a healthy conversation.
+                self._worker_lock.release()
+                raise
+            try:
                 with self._lock:
                     ref_history = (
                         self._worker_history

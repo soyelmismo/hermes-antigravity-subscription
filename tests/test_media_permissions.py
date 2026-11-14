@@ -212,6 +212,80 @@ def test_concurrent_permission_merges_are_serialized(worker, tmp_path, monkeypat
     cl._terminate_process.assert_not_called()
 
 
+@pytest.mark.parametrize("worker_turn", [False, True])
+@pytest.mark.parametrize("snapshot_current", [False, True])
+def test_disk_granted_media_skips_write_but_checks_worker_snapshot(
+    worker, tmp_path, monkeypatch, worker_turn, snapshot_current
+):
+    cl, proc, _ = worker
+    path, _ = image_turn(cl, tmp_path)
+    disk_rules = write_media_read_permissions(tmp_path, {path})
+    if snapshot_current:
+        cl._worker_media_rules = disk_rules
+    snapshot = cl._worker_media_rules
+    write = MagicMock(wraps=write_media_read_permissions)
+    monkeypatch.setattr(agy_client, "write_media_read_permissions", write)
+    # A busy oneshot does not own this lock, even though it is held.
+    cl._worker_lock.acquire()
+    try:
+        cl._ensure_worker_media_permissions({path}, worker_turn=worker_turn)
+        assert cl._worker_lock.locked()
+        write.assert_not_called()
+        assert read_media_rules(tmp_path) == disk_rules
+        if worker_turn and not snapshot_current:
+            cl._terminate_process.assert_called_once_with(proc)
+            assert cl._worker_proc is None
+            assert cl._worker_conversation_id == "synthetic-conversation"
+        else:
+            cl._terminate_process.assert_not_called()
+            assert cl._worker_proc is proc
+            assert cl._worker_media_rules is snapshot
+    finally:
+        cl._worker_lock.release()
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("busy", [False, True])
+def test_settings_write_failure_preserves_worker_and_turn_lock_ownership(
+    worker, tmp_path, monkeypatch, stream, busy
+):
+    cl, proc, _ = worker
+    path, messages = image_turn(cl, tmp_path)
+    history = cl._worker_history
+    conversation_history = cl._conversation_history
+    baseline = cl._worker_usage_baseline
+    snapshot = cl._worker_media_rules
+    failure = OSError("synthetic settings write failure")
+    write = MagicMock(side_effect=failure)
+    monkeypatch.setattr(agy_client, "write_media_read_permissions", write)
+    if busy:
+        cl._worker_lock.acquire()
+    try:
+        with pytest.raises(OSError, match="synthetic settings write failure") as exc:
+            cl._create_chat_completion(model=MODEL, messages=messages, stream=stream)
+        assert exc.value is failure
+        write.assert_called_once_with(tmp_path, {path})
+        cl._terminate_process.assert_not_called()
+        agy_client.subprocess.Popen.assert_not_called()
+        agy_client.AntigravityStream.assert_not_called()
+        proc.stdin.write.assert_not_called()
+        assert cl._worker_proc is proc
+        assert cl._worker_history is history
+        assert cl._conversation_history is conversation_history
+        assert history == [{"role": "user", "content": "previous turn"}]
+        assert conversation_history == history
+        assert cl._worker_conversation_id == "synthetic-conversation"
+        assert cl._worker_usage_baseline is baseline
+        assert cl._worker_media_rules is snapshot
+        assert cl._worker_lock.locked() is busy
+        if not busy:
+            assert cl._worker_lock.acquire(blocking=False)
+            cl._worker_lock.release()
+    finally:
+        if busy:
+            cl._worker_lock.release()
+
+
 def test_empty_media_does_not_write_or_recycle(worker, monkeypatch):
     cl, proc, _ = worker
     write = MagicMock()
