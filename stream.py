@@ -284,11 +284,20 @@ class AntigravityStream(Iterator[Any]):
     def __iter__(self) -> "AntigravityStream":
         return self
 
+    def _raise_if_cancelled(self) -> None:
+        if getattr(self.client, "_cancelled", False) is True:
+            self._interrupted = True
+            self.close()
+            raise RuntimeError("Antigravity request cancelled.")
+
     def __next__(self) -> Any:
+        self._raise_if_cancelled()
         if self._closed:
             raise StopIteration
         try:
-            return next(self._generator)
+            chunk = next(self._generator)
+            self._raise_if_cancelled()
+            return chunk
         except StopIteration:
             self._closed = True
             # Exhaustion is end of life for the stream even when the worker
@@ -421,6 +430,7 @@ class AntigravityStream(Iterator[Any]):
         is true of an abandoned sync stream's subprocess, and closing the
         client terminates the child, unblocking the read.
         """
+        self._raise_if_cancelled()
         if self._closed:
             raise StopAsyncIteration
         executor = self._async_executor
@@ -431,6 +441,7 @@ class AntigravityStream(Iterator[Any]):
         stream_exhausted, chunk = await asyncio.get_running_loop().run_in_executor(
             executor, self._pull_chunk
         )
+        self._raise_if_cancelled()
         if stream_exhausted:
             raise StopAsyncIteration
         return chunk
@@ -473,8 +484,10 @@ class AntigravityStream(Iterator[Any]):
             self._release_worker_lock_once()
         else:
             with self.client._lock:
+                # A concurrent owner close may delete the workspace as soon
+                # as ownership disappears. Reap before releasing this lock.
+                self.client._terminate_process(self.proc)
                 self.client._active_processes.discard(self.proc)
-            self.client._terminate_process(self.proc)
         # Retire the private async executor, if the async path created one.
         # Same discipline as the exhaustion path in __next__ (see
         # _retire_executor); a second call is a harmless no-op because an
@@ -725,10 +738,12 @@ class AntigravityStream(Iterator[Any]):
 
         try:
             while time.monotonic() < deadline:
+                self._raise_if_cancelled()
                 if self._early_error:
                     raise RuntimeError(f"Antigravity model error: {self._early_error}")
 
                 line = self.proc.stdout.readline() if self.proc.stdout else ""
+                self._raise_if_cancelled()
                 if self._early_error:
                     raise RuntimeError(f"Antigravity model error: {self._early_error}")
 
@@ -1193,7 +1208,8 @@ class AntigravityStream(Iterator[Any]):
             if watchdog_thread and watchdog_thread.is_alive():
                 watchdog_thread.join(timeout=0.2)
             if self.is_worker:
-                if success and not self._interrupted:
+                if (success and not self._interrupted
+                        and getattr(self.client, "_cancelled", False) is not True):
                     self.client._update_worker_history(self.messages)
                     self._release_worker_lock_once()
                 else:
