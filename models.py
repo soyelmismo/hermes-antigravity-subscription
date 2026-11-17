@@ -47,7 +47,16 @@ _MODEL_ALIASES = {
     "claude-opus-5-5": "claude-opus-4-6-thinking",
 }
 
-_EFFORT_SUFFIXES = (("-high", "high"), ("-medium", "medium"), ("-low", "low"))
+# Effort suffixes agy appends to a base model id. `-xhigh` is not an effort
+# agy accepts: it is an incorrect listing duplicate of `-high` (issue #47),
+# so it normalizes into the base model's `high` variant just like
+# `_normalize_effort` maps a requested "xhigh" effort to "high".
+_EFFORT_SUFFIXES = (
+    ("-xhigh", "high"),
+    ("-high", "high"),
+    ("-medium", "medium"),
+    ("-low", "low"),
+)
 _EFFORT_RANK = {"low": 0, "medium": 1, "high": 2}
 
 _SPINNER_CHARS = ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏")
@@ -73,7 +82,13 @@ def _normalize_effort(effort: str | None) -> str | None:
 
 
 def split_effort_suffix(model: str) -> tuple[str, str | None]:
-    """Split `gemini-3.8-flash-high` into (`gemini-3.8-flash`, `high`)."""
+    """Split `gemini-3.8-flash-high` into (`gemini-3.8-flash`, `high`).
+
+    A trailing `-xhigh` splits as an effort alias for `high` (issue #47):
+    agy lists `gemini-4-hydrogen-xhigh` as a lesser duplicate of the real
+    `gemini-4-hydrogen-{low,medium,high}` variants, and it must group into
+    the base model instead of surfacing as a separate bare-name model.
+    """
     for suffix, effort in _EFFORT_SUFFIXES:
         if model.endswith(suffix):
             return model[: -len(suffix)], effort
@@ -85,6 +100,8 @@ def parse_catalog(text: str) -> dict[str, tuple[str, ...]]:
 
     `gemini-3.8-flash-{low,medium,high}` becomes one `gemini-3.8-flash` entry
     with three efforts; an id with no effort suffix maps to an empty tuple.
+    A trailing `-xhigh` groups into its base as the `high` effort (issue #47),
+    so `gemini-4-hydrogen-xhigh` never surfaces as a separate bare-name model.
     Insertion order follows the order agy printed the models in.
     """
     grouped: dict[str, list[str]] = {}
