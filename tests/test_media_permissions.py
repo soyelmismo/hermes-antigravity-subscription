@@ -25,6 +25,9 @@ def worker(tmp_path, monkeypatch):
     # Bypass construction: no command discovery, orphan reaping, home setup,
     # keyring access, timers, token sync or real subprocesses in this fixture.
     cl = agy_client.AntigravityClient.__new__(agy_client.AntigravityClient)
+    # PR #46's cancel fence lives on the instance surface; bypassing __init__
+    # must still provide it.
+    cl._cancelled = False
     cl.is_closed = False
     cl._lock = threading.RLock()
     cl._worker_lock = threading.Lock()
