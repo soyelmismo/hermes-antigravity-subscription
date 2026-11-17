@@ -815,6 +815,54 @@ class AntigravityPluginTests(unittest.TestCase):
             },
         )
 
+    def test_parse_catalog_folds_xhigh_duplicate_into_high_effort(self):
+        # Issue #47: `agy models` lists gemini-4-hydrogen-xhigh as a lesser
+        # duplicate of the real gemini-4-hydrogen-{low,medium,high} variants.
+        import models
+
+        raw_output = (
+            "⠋ Fetching available models...\n"
+            "gemini-4-hydrogen-low\tGemini 4 Hydrogen (Low)\n"
+            "gemini-4-hydrogen-medium\tGemini 4 Hydrogen (Medium)\n"
+            "gemini-4-hydrogen-high\tGemini 4 Hydrogen (High)\n"
+            "gemini-4-hydrogen-xhigh\tGemini 4 Hydrogen (XHigh)\n"
+        )
+        catalog = models.parse_catalog(raw_output)
+        self.assertEqual(catalog, {"gemini-4-hydrogen": ("low", "medium", "high")})
+        # The bogus bare-name duplicate must not surface in list_models().
+        self.assertNotIn("gemini-4-hydrogen-xhigh", catalog)
+
+    def test_split_effort_suffix_xhigh_normalizes_to_high(self):
+        import models
+
+        self.assertEqual(
+            models.split_effort_suffix("gemini-4-hydrogen-xhigh"),
+            ("gemini-4-hydrogen", "high"),
+        )
+        # Non-suffixed and real-effort ids keep their existing behavior.
+        self.assertEqual(
+            models.split_effort_suffix("gemini-4-hydrogen-high"),
+            ("gemini-4-hydrogen", "high"),
+        )
+        self.assertEqual(
+            models.split_effort_suffix("gemini-4-hydrogen"),
+            ("gemini-4-hydrogen", None),
+        )
+
+    def test_resolve_model_and_effort_xhigh_request_resolves_to_high(self):
+        import time as _time
+
+        import models
+
+        models._catalog_cache = (
+            _time.monotonic() + 60.0,
+            {"gemini-4-hydrogen": ("low", "medium", "high")},
+        )
+        self.assertEqual(
+            models.resolve_model_and_effort("gemini-4-hydrogen-xhigh"),
+            ("gemini-4-hydrogen-high", "high"),
+        )
+
     def test_dynamic_alias_precedence_with_claude_5_5(self):
         import models
 
