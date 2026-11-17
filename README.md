@@ -156,6 +156,14 @@ Every client runs `agy` with an isolated `HOME` inside a temp dir (`hermes_agy_*
 2. A Linux `/proc` sweep on client init (`reap_orphaned_plugin_workers`) terminates leftover plugin workers whose owning temp dir was already deleted — a Hermes process that dies without `close()` would otherwise leave an orphaned worker (PPID 1) holding a conversation open on the account; a 17-hour orphan was observed tangling other sessions' turns (2026-11-11).
 3. Leftover temp dirs under Hermes' scratch are pruned by the normal 24h idle sweep.
 
+Hermes Stop calls the client's `cancel()` hook to terminate its worker and concurrent
+oneshots. Cancellation rejects buffered output and prevents automatic retries of the
+stopped request. It retires that request client: Hermes poisons its request slot and
+uses a fresh client for the next turn, sending the current transcript once without
+resuming the stopped agy conversation. Workspace and media deletion remain the
+responsibility of the owner's later `close()`. Inside an asyncio event loop, process
+cleanup runs on a dedicated daemon thread.
+
 Footprint is ~14 MB per live session (conversation DBs and logs). Nothing persists on disk after close, and nothing is created server-side beyond the account's normal conversations.
 
 Multiple agy sessions on one account contend for the shared OAuth token: whoever refreshed last wins, and the loser logs "You are not logged into Antigravity" / "error getting token source" and produces no result. The plugin re-syncs the isolated token before every spawn and retries a turn once when the exact contention signature appears. Concurrent cascades are serialized server-side by subscription capacity: a second simultaneous session can surface a 503 "No capacity available" until the first turn finishes.

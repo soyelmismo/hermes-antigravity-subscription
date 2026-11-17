@@ -7,6 +7,7 @@ existing Antigravity / Gemini subscription quota.
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import json
 import logging
@@ -414,6 +415,7 @@ class AntigravityClient:
 
         self.chat = SimpleNamespace(completions=SimpleNamespace(create=self._create_chat_completion))
         self.is_closed = False
+        self._cancelled = False
         # Valid fresh-context full-send samples only. Worker deltas and
         # concurrent oneshots are not comparable: see delivery.py and issue #29.
         self._delivery_watch = DeliveryWatch()
@@ -502,6 +504,41 @@ class AntigravityClient:
 
     def __exit__(self, *args: Any) -> None:
         self.close()
+
+    def _raise_if_cancelled(self) -> None:
+        if self._cancelled:
+            raise RuntimeError("Antigravity request cancelled.")
+
+    def _cancel_owned_requests(self) -> None:
+        with self._lock:
+            self._terminate_worker_locked()
+            # Keep ownership and the lock until reaping finishes: owner close
+            # must not delete the workspace while a cancelled oneshot lives.
+            for proc in tuple(self._active_processes):
+                self._terminate_process(proc)
+                self._active_processes.discard(proc)
+
+    def cancel(self) -> None:
+        """Retire this request client; owner-thread close() retains its workspace.
+
+        Hermes poisons the request slot before calling this non-HTTP abort
+        hook. Its next turn uses a fresh client, not this cancelled facade.
+        Set the sticky fence before any lock or process wait so even buffered
+        output and a write racing the cleanup cannot complete or replay.
+        """
+        if self._cancelled:
+            return
+        self._cancelled = True
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            self._cancel_owned_requests()
+        else:
+            threading.Thread(
+                target=self._cancel_owned_requests,
+                name="agy-client-cancel",
+                daemon=True,
+            ).start()
 
     def close(self) -> None:
         # Phase 1 -- terminate every child process BEFORE the workspace is
@@ -649,7 +686,7 @@ class AntigravityClient:
 
     def _set_worker_conversation_id(self, conv_id: str) -> None:
         with self._lock:
-            if conv_id:
+            if conv_id and not self._cancelled:
                 self._worker_conversation_id = conv_id
 
     def _purge_isolated_conversations(self) -> None:
@@ -663,6 +700,8 @@ class AntigravityClient:
 
     def _update_worker_history(self, messages: list[dict[str, Any]] | None) -> None:
         with self._lock:
+            if self._cancelled:
+                return
             msg_list = list(messages or [])
             self._worker_history = msg_list
             self._conversation_history = msg_list
@@ -809,6 +848,7 @@ class AntigravityClient:
         conversation_id: str | None = None,
     ) -> subprocess.Popen:
         with self._lock:
+            self._raise_if_cancelled()
             if (
                 self._worker_proc is not None
                 and self._worker_proc.poll() is None
@@ -914,34 +954,36 @@ class AntigravityClient:
         if effort:
             cmd_args.extend(["--effort", effort])
 
-        # Same account-contention guard as the worker spawn path.
-        sync_isolated_token(self._isolated_home)
-
-        proc = subprocess.Popen(
-            cmd_args,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            bufsize=1,
-            cwd=self._cwd,
-            env=self._child_env(),
-            **_own_process_group(),
-        )
-        start_stderr_drainer(proc)
+        # Register ownership atomically with spawn, before stdin can block.
+        # Stop must also reach concurrent oneshots, not just the worker.
+        with self._lock:
+            self._raise_if_cancelled()
+            sync_isolated_token(self._isolated_home)
+            proc = subprocess.Popen(
+                cmd_args,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                bufsize=1,
+                cwd=self._cwd,
+                env=self._child_env(),
+                **_own_process_group(),
+            )
+            self._active_processes.add(proc)
+            start_stderr_drainer(proc)
 
         try:
+            self._raise_if_cancelled()
             if proc.stdin:
                 proc.stdin.write(prompt_text + "\n")
                 proc.stdin.flush()
                 proc.stdin.close()
         except OSError:
-            pass
-
-        with self._lock:
-            self._active_processes.add(proc)
+            self._raise_if_cancelled()
+        self._raise_if_cancelled()
 
         stream_iter = AntigravityStream(
             proc=proc,
@@ -960,7 +1002,9 @@ class AntigravityClient:
         )
         if stream:
             return stream_iter
-        return collect_stream_completion(stream_iter)
+        completion = collect_stream_completion(stream_iter)
+        self._raise_if_cancelled()
+        return completion
 
     def _create_chat_completion(
         self,
@@ -974,6 +1018,7 @@ class AntigravityClient:
         reasoning_effort: str | None = None,
         **extra_kwargs: Any,
     ) -> Any:
+        self._raise_if_cancelled()
         if self.is_closed:
             raise RuntimeError("AntigravityClient is closed.")
 
@@ -1061,9 +1106,11 @@ class AntigravityClient:
 
                 event_msg = {"event": "user", "message": {"content": prompt_payload}}
                 try:
+                    self._raise_if_cancelled()
                     proc.stdin.write(json.dumps(event_msg) + "\n")
                     proc.stdin.flush()
                 except (BrokenPipeError, OSError):
+                    self._raise_if_cancelled()
                     comparable_full_send = True
                     with self._lock:
                         self._terminate_worker_locked(keep_conversation=False)
@@ -1083,6 +1130,7 @@ class AntigravityClient:
                         messages=messages_list,
                     )
                     event_msg = {"event": "user", "message": {"content": prompt_payload}}
+                    self._raise_if_cancelled()
                     proc.stdin.write(json.dumps(event_msg) + "\n")
                     proc.stdin.flush()
 
@@ -1108,7 +1156,9 @@ class AntigravityClient:
                 completion: Any = None
                 auth_retried = False
                 while True:
+                    self._raise_if_cancelled()
                     completion = collect_stream_completion(stream_iter)
+                    self._raise_if_cancelled()
                     if auth_retried or not _empty_no_result(completion):
                         break
                     if not _stderr_shows_auth_contention(proc):
@@ -1131,6 +1181,7 @@ class AntigravityClient:
                     )
                     event_msg = {"event": "user", "message": {"content": prompt_payload}}
                     try:
+                        self._raise_if_cancelled()
                         if proc.stdin:
                             proc.stdin.write(json.dumps(event_msg) + "\n")
                             proc.stdin.flush()
@@ -1154,6 +1205,7 @@ class AntigravityClient:
                         delivery_sample_key=f"{resolved_model}:{effort}",
                     )
                 try:
+                    self._raise_if_cancelled()
                     return completion
                 finally:
                     if self._worker_lock.locked():
