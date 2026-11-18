@@ -19,7 +19,9 @@ try:
     from .process import _check_early_quota_error
     from .prompt import (
         _TOOL_CALL_CLOSE,
+        _MarkdownCodeState,
         _find_tool_call_close,
+        _find_unquoted_tool_call_open,
         _has_unfinished_tool_call_frame,
         _has_unparseable_tool_call_frame,
         _longest_tool_call_prefix_match,
@@ -30,7 +32,9 @@ except ImportError:
     from process import _check_early_quota_error
     from prompt import (
         _TOOL_CALL_CLOSE,
+        _MarkdownCodeState,
         _find_tool_call_close,
+        _find_unquoted_tool_call_open,
         _has_unfinished_tool_call_frame,
         _has_unparseable_tool_call_frame,
         _longest_tool_call_prefix_match,
@@ -691,6 +695,7 @@ class AntigravityStream(Iterator[Any]):
 
         has_content = False
         in_tool_call = False
+        md_state = _MarkdownCodeState()
         error_msg = ""
         status = ""
         # Positive evidence about how the stream ended: did a `result`
@@ -842,38 +847,57 @@ class AntigravityStream(Iterator[Any]):
                                             and self.has_tools
                                             and _has_unparseable_tool_call_frame(block)
                                         ):
-                                            raise RuntimeError(
-                                                "Antigravity execution failed: "
-                                                "invalid tool call block in stream"
+                                            logger.warning(
+                                                "Unparseable <tool_call> block in stream; falling back to plain text"
                                             )
-                                        if parsed_calls:
-                                            has_tool_calls = True
-                                            for call_delta in identify_calls(parsed_calls):
-                                                yield self._make_chunk(tool_calls=[call_delta])
-                                        if extra_text and not has_tool_calls:
-                                            has_content = True
-                                            yield self._make_chunk(content=extra_text)
+                                            md_state.advance(block)
+                                            if not has_tool_calls:
+                                                has_content = True
+                                                yield self._make_chunk(content=block)
+                                        else:
+                                            if parsed_calls:
+                                                has_tool_calls = True
+                                                for call_delta in identify_calls(parsed_calls):
+                                                    yield self._make_chunk(tool_calls=[call_delta])
+                                            if extra_text and not has_tool_calls:
+                                                md_state.advance(extra_text)
+                                                has_content = True
+                                                yield self._make_chunk(content=extra_text)
                                     else:
                                         break
                                 else:
-                                    idx = text_buffer.find("<tool_call")
+                                    idx = _find_unquoted_tool_call_open(text_buffer, md_state)
                                     if idx != -1:
-                                        if idx > 0 and not has_tool_calls:
+                                        if idx > 0:
                                             safe_text = text_buffer[:idx]
-                                            has_content = True
-                                            yield self._make_chunk(content=safe_text)
+                                            md_state.advance(safe_text)
+                                            if not has_tool_calls:
+                                                has_content = True
+                                                yield self._make_chunk(content=safe_text)
                                         text_buffer = text_buffer[idx:]
                                         in_tool_call = True
                                     else:
                                         k = _longest_tool_call_prefix_match(text_buffer)
                                         if k > 0:
                                             safe_text = text_buffer[:-k]
-                                            if safe_text and not has_tool_calls:
-                                                has_content = True
-                                                yield self._make_chunk(content=safe_text)
-                                            text_buffer = text_buffer[-k:]
-                                            break
+                                            probe = md_state.clone()
+                                            probe.advance(safe_text)
+                                            if probe.in_code():
+                                                md_state.advance(text_buffer)
+                                                if not has_tool_calls:
+                                                    has_content = True
+                                                    yield self._make_chunk(content=text_buffer)
+                                                text_buffer = ""
+                                            else:
+                                                if safe_text:
+                                                    md_state.advance(safe_text)
+                                                    if not has_tool_calls:
+                                                        has_content = True
+                                                        yield self._make_chunk(content=safe_text)
+                                                text_buffer = text_buffer[-k:]
+                                                break
                                         else:
+                                            md_state.advance(text_buffer)
                                             if not has_tool_calls:
                                                 has_content = True
                                                 yield self._make_chunk(content=text_buffer)
@@ -958,23 +982,18 @@ class AntigravityStream(Iterator[Any]):
                     "Antigravity execution failed: incomplete tool call block "
                     f"in stream ({stop_detail})"
                 )
-            # A closed frame that parsed to no call is explicit protocol
-            # markup without a usable call (invalid JSON, missing/blank
-            # function, non-object body, or empty body). Publishing it as
-            # assistant text with a normal stop would present broken protocol
-            # as a successful answer, so fail the turn. Checked even when a
-            # complete call was already emitted (a later bad frame must not be
-            # silently dropped); native-tool neutralization keeps its pinned
-            # empty-stop behavior, and tools=False stays plain text.
+            # A closed frame that parsed to no call is malformed protocol markup.
+            # Log a warning and fall back to emitting it as plain assistant text
+            # rather than aborting the stream.
             if (
                 self.has_tools
                 and not neutralized_tool_step
                 and text_buffer
                 and _has_unparseable_tool_call_frame(text_buffer)
             ):
-                raise RuntimeError(
-                    "Antigravity execution failed: invalid tool call block "
-                    f"in stream ({stop_detail})"
+                logger.warning(
+                    "Unparseable <tool_call> block at end of stream (%s); falling back to plain text",
+                    stop_detail,
                 )
             if text_buffer and not has_tool_calls and not neutralized_tool_step:
                 if self.has_tools or "<tool_call>" in text_buffer:
