@@ -16,8 +16,16 @@ import tempfile
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections.abc import Sequence
 from types import SimpleNamespace
 from typing import Any, Callable, Optional
+
+try:
+    from markdown_it import MarkdownIt
+    from markdown_it.rules_inline.backticks import backtick as _orig_backtick
+except ImportError:  # standalone import without hermes_agent / rich deps
+    MarkdownIt = None  # type: ignore[assignment,misc]
+    _orig_backtick = None  # type: ignore[assignment]
 
 try:
     from hermes_constants import get_hermes_home
@@ -585,132 +593,173 @@ _TOOL_CALL_OPEN = "<tool_call>"
 _TOOL_CALL_CLOSE = "</tool_call>"
 
 
-class _MarkdownCodeState:
-    """Track markdown fenced code blocks and inline code spans across stream chunks.
+def _build_md_parser() -> Any:
+    """CommonMark parser that records exact source spans on ``code_inline`` tokens."""
+    if MarkdownIt is None or _orig_backtick is None:
+        return None
+    md = MarkdownIt("commonmark")
 
-    Protocol ``<tool_call>`` tags inside markdown code spans or fenced code blocks
-    are literal prose/documentation, never active tool-call protocol frames.
+    def _tracked_backtick(state: Any, silent: bool) -> bool:
+        start = state.pos
+        n_before = len(state.tokens)
+        ok = _orig_backtick(state, silent)
+        if ok and not silent and len(state.tokens) > n_before:
+            tok = state.tokens[-1]
+            if tok.type == "code_inline":
+                tok.meta["span"] = (start, state.pos)
+        return ok
+
+    md.inline.ruler.at("backticks", _tracked_backtick)
+    return md
+
+
+_MD_PARSER = _build_md_parser()
+
+
+def _map_inline_spans(region: str, content: str, children: Sequence[Any]) -> list[tuple[int, int]]:
+    """Map ``code_inline`` spans from *content* coordinates to *region* coordinates."""
+    spans = [c.meta["span"] for c in children if c.type == "code_inline" and "span" in c.meta]
+    if not spans:
+        return []
+    if region.startswith(content):
+        return spans
+    c_lines = content.split("\n")
+    r_lines = region.splitlines(keepends=True)
+    idx_map: list[int] = []
+    r_pos = 0
+    for idx, c_ln in enumerate(c_lines):
+        r_ln = r_lines[idx] if idx < len(r_lines) else ""
+        r_stripped = r_ln.rstrip("\r\n")
+        lead = r_stripped.find(c_ln)
+        if lead == -1:
+            lead = 0
+        for j in range(len(c_ln)):
+            idx_map.append(r_pos + lead + j)
+        if idx < len(c_lines) - 1:
+            idx_map.append(r_pos + len(r_stripped))
+        r_pos += len(r_ln)
+    idx_map.append(r_pos)
+    max_idx = len(idx_map) - 1
+    return [(idx_map[min(s, max_idx)], idx_map[min(e, max_idx)]) for s, e in spans]
+
+
+def _code_spans(text: str) -> list[tuple[int, int]]:
+    """Return sorted ``(start, end)`` char spans for all CommonMark code constructs."""
+    if not text or _MD_PARSER is None:
+        return []
+    lines = text.splitlines(keepends=True)
+    line_starts = [0]
+    for ln in lines:
+        line_starts.append(line_starts[-1] + len(ln))
+    spans: list[tuple[int, int]] = []
+    for tok in _MD_PARSER.parse(text):
+        if not tok.map:
+            continue
+        s_line, e_line = tok.map
+        region_start = line_starts[s_line]
+        region_end = line_starts[min(e_line, len(lines))]
+        if tok.type in ("fence", "code_block"):
+            spans.append((region_start, region_end))
+        elif tok.type == "inline" and tok.children:
+            region = text[region_start:region_end]
+            for s, e in _map_inline_spans(region, tok.content, tok.children):
+                spans.append((region_start + s, region_start + e))
+    return spans
+
+
+def _trailing_unclosed_fence(tokens: Sequence[Any], lines: list[str]) -> Any | None:
+    """Return the trailing ``fence`` token if it remains unclosed at EOF.
+
+    Walks past trailing container ``*_close`` tokens (e.g. ``blockquote_close``)
+    and relies on ``markdown-it-py``'s own fence-closing decision: a closed
+    fence excludes its closing line from ``tok.content`` (yielding at most
+    ``e_line - s_line - 2`` body lines), whereas an unclosed fence includes all
+    lines through EOF (``e_line - s_line - 1`` body lines).
+    """
+    for tok in reversed(tokens):
+        if tok.type.endswith("_close"):
+            continue
+        if tok.type != "fence" or not tok.map:
+            return None
+        s_line, e_line = tok.map
+        if e_line < len(lines):
+            return None
+        if e_line <= s_line + 1:
+            return tok
+        body_lines = len(tok.content.splitlines())
+        return tok if body_lines >= e_line - s_line - 1 else None
+    return None
+
+
+class _MarkdownCodeState:
+    """Track active CommonMark code context across stream chunks via ``markdown-it-py``.
+
+    Retains only the active unclosed block (an open fence or the current
+    paragraph since the last blank line) so incremental streaming stays bounded
+    while preserving full CommonMark semantics.
     """
 
-    def __init__(
-        self,
-        *,
-        at_line_start: bool = True,
-        leading_spaces: int = 0,
-        fence_char: str = "",
-        fence_len: int = 0,
-        inline_tick_len: int = 0,
-        prev_was_newline: bool = False,
-    ) -> None:
-        self.at_line_start = at_line_start
-        self.leading_spaces = leading_spaces
-        self.fence_char = fence_char
-        self.fence_len = fence_len
-        self.inline_tick_len = inline_tick_len
-        self.prev_was_newline = prev_was_newline
+    def __init__(self, tail: str = "") -> None:
+        self._tail = tail
 
     def clone(self) -> "_MarkdownCodeState":
-        return _MarkdownCodeState(
-            at_line_start=self.at_line_start,
-            leading_spaces=self.leading_spaces,
-            fence_char=self.fence_char,
-            fence_len=self.fence_len,
-            inline_tick_len=self.inline_tick_len,
-            prev_was_newline=self.prev_was_newline,
-        )
+        return _MarkdownCodeState(self._tail)
 
     def in_code(self) -> bool:
-        return bool(self.fence_char) or self.inline_tick_len > 0
+        if not self._tail or _MD_PARSER is None:
+            return False
+        lines = self._tail.splitlines(keepends=True)
+        tokens = _MD_PARSER.parse(self._tail)
+        return _trailing_unclosed_fence(tokens, lines) is not None
 
     def advance(self, text: str) -> None:
-        """Advance markdown code state through *text*."""
-        n = len(text)
-        i = 0
-        while i < n:
-            ch = text[i]
-            if ch == "\n":
-                if self.prev_was_newline and not self.fence_char:
-                    self.inline_tick_len = 0
-                self.at_line_start = True
-                self.leading_spaces = 0
-                self.prev_was_newline = True
-                i += 1
-                continue
-
-            self.prev_was_newline = False
-
-            if self.at_line_start:
-                if ch == " " and self.leading_spaces < 3:
-                    self.leading_spaces += 1
-                    i += 1
-                    continue
-                if ch in ("`", "~") and self.inline_tick_len == 0:
-                    j = i
-                    while j < n and text[j] == ch:
-                        j += 1
-                    run_len = j - i
-                    if self.fence_char:
-                        if ch == self.fence_char and run_len >= self.fence_len:
-                            k = j
-                            while k < n and text[k] in (" ", "\t", "\r"):
-                                k += 1
-                            if k == n or text[k] == "\n":
-                                self.fence_char = ""
-                                self.fence_len = 0
-                                self.at_line_start = False
-                                i = k
-                                continue
-                    elif run_len >= 3:
-                        valid_fence = True
-                        if ch == "`":
-                            k = j
-                            while k < n and text[k] != "\n":
-                                if text[k] == "`":
-                                    valid_fence = False
-                                    break
-                                k += 1
-                        if valid_fence:
-                            self.fence_char = ch
-                            self.fence_len = run_len
-                            self.at_line_start = False
-                            i = j
-                            continue
-                self.at_line_start = False
-
-            if self.fence_char:
-                i += 1
-                continue
-
-            if ch == "`":
-                j = i
-                while j < n and text[j] == "`":
-                    j += 1
-                run_len = j - i
-                if self.inline_tick_len == 0:
-                    self.inline_tick_len = run_len
-                elif run_len == self.inline_tick_len:
-                    self.inline_tick_len = 0
-                i = j
-                continue
-
-            i += 1
+        """Advance markdown code state through *text* and compact completed blocks."""
+        if not text or _MD_PARSER is None:
+            return
+        self._tail += text
+        lines = self._tail.splitlines(keepends=True)
+        tokens = _MD_PARSER.parse(self._tail)
+        fence_tok = _trailing_unclosed_fence(tokens, lines)
+        if fence_tok is not None:
+            s_line = fence_tok.map[0]
+            opener = lines[s_line]
+            if not opener.endswith(("\n", "\r")):
+                opener += "\n"
+            trailing = (
+                lines[-1]
+                if len(lines) > s_line + 1 and not self._tail.endswith(("\n", "\r"))
+                else ""
+            )
+            self._tail = opener + trailing
+            return
+        for sep in ("\r\n\r\n", "\n\n"):
+            pos = self._tail.rfind(sep)
+            if pos != -1:
+                self._tail = self._tail[pos + len(sep):]
+                return
 
 
 def _find_unquoted_tool_call_open(
     text: str, state: _MarkdownCodeState | None = None
 ) -> int:
-    """Return index of first ``<tool_call`` in *text* outside markdown code, or -1."""
-    cur = state.clone() if state is not None else _MarkdownCodeState()
+    """Return index of first ``<tool_call`` in *text* outside CommonMark code, or -1."""
+    if "<tool_call" not in text:
+        return -1
+    prefix = state._tail if state is not None else ""
+    offset = len(prefix)
+    spans = _code_spans(prefix + text)
+    span_idx = 0
     cursor = 0
     while True:
         idx = text.find("<tool_call", cursor)
         if idx == -1:
             return -1
-        cur.advance(text[cursor:idx])
-        if not cur.in_code():
+        abs_pos = offset + idx
+        while span_idx < len(spans) and spans[span_idx][1] <= abs_pos:
+            span_idx += 1
+        if span_idx >= len(spans) or abs_pos < spans[span_idx][0]:
             return idx
         cursor = idx + len("<tool_call")
-        cur.advance("<tool_call")
 
 
 def _find_tool_call_close(text: str, start: int = 0) -> int:
@@ -1218,6 +1267,24 @@ def _tool_call_from_object(obj: Any, ordinal: int) -> Any | None:
     )
 
 
+def _has_closed_tool_call_frame(
+    text: str, state: _MarkdownCodeState | None = None
+) -> bool:
+    """True when *text* contains a closed ``<tool_call>...</tool_call>`` frame."""
+    cur = state.clone() if state is not None else _MarkdownCodeState()
+    cursor = 0
+    while True:
+        rel_start = _find_unquoted_tool_call_open(text[cursor:], cur)
+        if rel_start == -1:
+            return False
+        start = cursor + rel_start
+        if not text.startswith(_TOOL_CALL_OPEN, start):
+            cur.advance(text[cursor : start + len("<tool_call")])
+            cursor = start + len("<tool_call")
+            continue
+        return _find_tool_call_close(text, start + len(_TOOL_CALL_OPEN)) != -1
+
+
 def _has_unparseable_tool_call_frame(
     text: str, state: _MarkdownCodeState | None = None
 ) -> bool:
@@ -1227,25 +1294,11 @@ def _has_unparseable_tool_call_frame(
     leaves the unparseable ones in its cleaned text: invalid JSON, a missing
     or blank ``function`` name, a non-object value, or an empty body. A
     closed frame surviving in that cleaned text is therefore an explicit
-    protocol frame with no call, which must fail the turn instead of being
-    published as assistant text. Unclosed frames are
+    protocol frame with no call. Unclosed frames are
     :func:`_has_unfinished_tool_call_frame`'s concern.
     """
     _calls, cleaned = _parse_tool_block(text, state=state)
-    cur = state.clone() if state is not None else _MarkdownCodeState()
-    cursor = 0
-    while True:
-        rel_start = _find_unquoted_tool_call_open(cleaned[cursor:], cur)
-        if rel_start == -1:
-            return False
-        start = cursor + rel_start
-        if not cleaned.startswith(_TOOL_CALL_OPEN, start):
-            cur.advance(cleaned[cursor : start + len("<tool_call")])
-            cursor = start + len("<tool_call")
-            continue
-        if _find_tool_call_close(cleaned, start + len(_TOOL_CALL_OPEN)) != -1:
-            return True
-        return False
+    return _has_closed_tool_call_frame(cleaned, state=state)
 
 
 def _extract_tagged_tool_calls(

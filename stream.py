@@ -22,6 +22,7 @@ try:
         _MarkdownCodeState,
         _find_tool_call_close,
         _find_unquoted_tool_call_open,
+        _has_closed_tool_call_frame,
         _has_unfinished_tool_call_frame,
         _has_unparseable_tool_call_frame,
         _longest_tool_call_prefix_match,
@@ -35,6 +36,7 @@ except ImportError:
         _MarkdownCodeState,
         _find_tool_call_close,
         _find_unquoted_tool_call_open,
+        _has_closed_tool_call_frame,
         _has_unfinished_tool_call_frame,
         _has_unparseable_tool_call_frame,
         _longest_tool_call_prefix_match,
@@ -845,7 +847,7 @@ class AntigravityStream(Iterator[Any]):
                                         if (
                                             not parsed_calls
                                             and self.has_tools
-                                            and _has_unparseable_tool_call_frame(block)
+                                            and _has_closed_tool_call_frame(extra_text)
                                         ):
                                             logger.warning(
                                                 "Unparseable <tool_call> block in stream; falling back to plain text"
@@ -975,7 +977,7 @@ class AntigravityStream(Iterator[Any]):
                 and not neutralized_tool_step
                 and (
                     in_tool_call
-                    or (text_buffer and _has_unfinished_tool_call_frame(text_buffer))
+                    or (text_buffer and _has_unfinished_tool_call_frame(text_buffer, md_state))
                 )
             ):
                 raise RuntimeError(
@@ -989,7 +991,7 @@ class AntigravityStream(Iterator[Any]):
                 self.has_tools
                 and not neutralized_tool_step
                 and text_buffer
-                and _has_unparseable_tool_call_frame(text_buffer)
+                and _has_unparseable_tool_call_frame(text_buffer, md_state)
             ):
                 logger.warning(
                     "Unparseable <tool_call> block at end of stream (%s); falling back to plain text",
@@ -997,7 +999,7 @@ class AntigravityStream(Iterator[Any]):
                 )
             if text_buffer and not has_tool_calls and not neutralized_tool_step:
                 if self.has_tools or "<tool_call>" in text_buffer:
-                    parsed_calls, extra_text = _parse_tool_block(text_buffer)
+                    parsed_calls, extra_text = _parse_tool_block(text_buffer, state=md_state)
                     if parsed_calls:
                         has_tool_calls = True
                         for call_delta in identify_calls(parsed_calls):

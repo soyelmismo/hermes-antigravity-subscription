@@ -567,6 +567,65 @@ def test_tool_call_tag_inside_markdown_code_streams_as_text():
     assert finishes == ["stop"]
 
 
+def test_post_loop_incomplete_tool_call_inside_open_fence_is_plain_text():
+    stream, _proc_mock, _client = _stream(
+        _events("```xml\n<tool", "_call>{\"unclosed\": true")
+    )
+
+    calls, contents, finishes = _consumed(list(stream))
+
+    assert calls == []
+    assert "<tool_call>{\"unclosed\": true" in "".join(contents)
+    assert finishes == ["stop"]
+
+
+def test_post_loop_unparseable_tool_call_inside_open_fence_no_warning(caplog):
+    stream, _proc_mock, _client = _stream(
+        _events("```xml\n", "<tool_call>{}</tool_call>")
+    )
+
+    with caplog.at_level("WARNING"):
+        calls, contents, finishes = _consumed(list(stream))
+
+    assert calls == []
+    assert "<tool_call>{}</tool_call>" in "".join(contents)
+    assert finishes == ["stop"]
+    assert not any("Unparseable <tool_call>" in r.message for r in caplog.records)
+
+
+def test_indented_code_block_ignored_and_escaped_backtick_parsed():
+    stream, _proc_mock, _client = _stream(
+        _events(
+            "    <tool_call>{bad}</tool_call>\n\n",
+            f"\\`{_block('one')}\\`",
+        )
+    )
+
+    calls, contents, finishes = _consumed(list(stream))
+
+    assert [call.id for call in calls] == ["same"]
+    assert "<tool_call>{bad}</tool_call>" in "".join(contents)
+    assert finishes == ["tool_calls"]
+
+
+def test_commonmark_edge_cases_in_fences_and_headings():
+    stream, _proc_mock, _client = _stream(
+        _events(
+            "# `<tool_call>{bad}</tool_call>` #\n\n",
+            "```xml\n    ```\n<tool_call>{still_fenced}</tool_call>\n```\n",
+            "```xml\n``` extra\n<tool_call>{still_fenced_2}</tool_call>\n```",
+        )
+    )
+
+    calls, contents, finishes = _consumed(list(stream))
+    joined = "".join(contents)
+    assert calls == []
+    assert "<tool_call>{bad}</tool_call>" in joined
+    assert "<tool_call>{still_fenced}</tool_call>" in joined
+    assert "<tool_call>{still_fenced_2}</tool_call>" in joined
+    assert finishes == ["stop"]
+
+
 # ---------------------------------------------------------------------------
 # A lone "<" ending prose is text, a longer tag prefix remains a frame
 # ---------------------------------------------------------------------------
