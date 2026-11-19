@@ -44,6 +44,7 @@ try:
         is_authenticated,
         read_media_rules,
         reap_orphaned_plugin_workers,
+        register_tracked_process,
         resolve_agy_command,
         resolve_real_token_path,
         setup_isolated_home,
@@ -83,6 +84,7 @@ except ImportError:
         is_authenticated,
         read_media_rules,
         reap_orphaned_plugin_workers,
+        register_tracked_process,
         resolve_agy_command,
         resolve_real_token_path,
         setup_isolated_home,
@@ -908,6 +910,7 @@ class AntigravityClient:
             self._worker_media_rules = read_media_rules(self._isolated_gemini_dir)
             self._worker_usage_baseline = {}
             self._active_processes.add(proc)
+            register_tracked_process(proc)
             self._worker_last_activity[proc] = time.monotonic()
             # Give every worker a death date at spawn, not only when a turn
             # finishes. The countdown was armed solely by
@@ -973,6 +976,7 @@ class AntigravityClient:
                 **_own_process_group(),
             )
             self._active_processes.add(proc)
+            register_tracked_process(proc)
             start_stderr_drainer(proc)
 
         try:

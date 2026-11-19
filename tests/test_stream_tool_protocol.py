@@ -455,7 +455,10 @@ def test_stream_cut_inside_closing_tag_after_a_complete_call_fails():
 
 
 # ---------------------------------------------------------------------------
-# Native tool neutralization keeps its pinned empty-stop behavior
+# Native tool neutralization: security abort surfaced as explanatory content
+# (issue #52) instead of a bare empty completion that read as "no content"
+# and sent Hermes down the nudge/retry/silent-fallback path. Buffered frame
+# text is still never flushed after the abort.
 # ---------------------------------------------------------------------------
 
 
@@ -474,7 +477,11 @@ def test_native_tool_step_neutralization_with_partial_block_does_not_fail(partia
 
     calls, contents, finishes = _consumed(chunks)
     assert calls == []
-    assert contents == []
+    # The partial frame prefix stays buffered (never flushed), but the
+    # explanatory content chunk is emitted (issue #52).
+    assert len(contents) == 1
+    assert "blocked by host security policy" in contents[0]
+    assert "run_command" in contents[0]
     assert finishes == ["stop"]
     client._terminate_process.assert_called()
 

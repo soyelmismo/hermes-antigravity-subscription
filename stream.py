@@ -705,6 +705,7 @@ class AntigravityStream(Iterator[Any]):
         # agy attempted a native tool invocation (security neutralization)?
         saw_result = False
         neutralized_tool_step = False
+        neutralized_text = ""
         success = False
         start_time = time.monotonic()
         # File mtimes are wall-clock epoch seconds; durations and deadlines
@@ -817,13 +818,36 @@ class AntigravityStream(Iterator[Any]):
                             # Recorded so the post-loop positive-evidence check
                             # does not treat this security abort as an empty
                             # failed turn: the process is terminated right here
-                            # on purpose, and the empty completion assembled
-                            # afterwards is the pinned behavior (see
+                            # on purpose (see
                             # test_native_tool_step_neutralization_in_stream).
                             # The stop cause is recorded too, so diagnostics do
                             # not misreport this deliberate abort as a deadline.
                             neutralized_tool_step = True
                             stop_reason = "native tool step neutralized"
+                            # Issue #52: a bare empty completion reads as "no
+                            # content or reasoning", so Hermes nudged, got the
+                            # same silence on every retry, and silently failed
+                            # the turn over to a different provider while the
+                            # quota meter still showed headroom. The block is
+                            # surfaced as real content instead: the host sees
+                            # WHY the turn stopped, the quota was never denied,
+                            # and on any Hermes retry the explanation sits in
+                            # the model's history so it can re-issue the step
+                            # as a <tool_call> block. Containment is unchanged:
+                            # the process dies here, nothing was executed.
+                            #
+                            # The chunk is emitted in ONE piece together with
+                            # the finish reason at the post-loop finish yield:
+                            # a yield here would suspend the generator after
+                            # close(), and __next__'s ``if self._closed`` guard
+                            # would end the stream before the finish chunk
+                            # could ever be emitted.
+                            has_content = True
+                            neutralized_text = (
+                                f"[Antigravity] Native tool invocation '{tool_name}' was blocked by host security policy; "
+                                "nothing was executed. Re-issue the step as a <tool_call> block using the host's tools "
+                                "instead of Antigravity's native tools."
+                            )
                             break
                     if "usage" in step:
                         usage_data = step["usage"]
@@ -971,7 +995,7 @@ class AntigravityStream(Iterator[Any]):
             # inside the opening tag, JSON body, or closing tag fails. Checked
             # even after a complete call so a truncated second block is not
             # silently dropped. Native-tool neutralization is a deliberate
-            # abort, not truncation, and keeps its pinned empty-stop behavior.
+            # abort, not truncation, and never re-flushes buffered text.
             if (
                 self.has_tools
                 and not neutralized_tool_step
@@ -1190,7 +1214,13 @@ class AntigravityStream(Iterator[Any]):
                     sample_key=self.delivery_sample_key,
                 )
 
-            yield self._make_chunk(finish_reason=finish_reason)
+            if neutralized_tool_step:
+                # Issue #52: the security abort carries its explanation and
+                # the finish reason in one chunk — content makes the host
+                # treat the turn as answered instead of empty.
+                yield self._make_chunk(content=neutralized_text, finish_reason=finish_reason)
+            else:
+                yield self._make_chunk(finish_reason=finish_reason)
 
             usage = SimpleNamespace(
                 prompt_tokens=input_tokens,
