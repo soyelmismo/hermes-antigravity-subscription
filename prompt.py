@@ -16,8 +16,16 @@ import tempfile
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections.abc import Sequence
 from types import SimpleNamespace
 from typing import Any, Callable, Optional
+
+try:
+    from markdown_it import MarkdownIt
+    from markdown_it.rules_inline.backticks import backtick as _orig_backtick
+except ImportError:  # standalone import without hermes_agent / rich deps
+    MarkdownIt = None  # type: ignore[assignment,misc]
+    _orig_backtick = None  # type: ignore[assignment]
 
 try:
     from hermes_constants import get_hermes_home
@@ -531,13 +539,13 @@ _PROMPT_PREAMBLE = (
     # Antigravity") makes the model classify the preamble as prompt injection
     # and resist harder. This framing avoids contradicting agy's identity and
     # instead redirects the tool-calling protocol. (Issue #16)
-    "You are operating in HEADLESS INFERENCE MODE. In this mode, your native tools (run_command, write_to_file, view_file, edit_file, etc.) are disabled and will be silently rejected. Do not attempt to use them.",
+    "You are operating in HEADLESS INFERENCE MODE. In this mode, all native function-calling / tool-use channels (run_command, write_to_file, view_file, edit_file, etc.) are disabled and will fail or be silently rejected. Never emit native function calls—even for Hermes tool names such as terminal, read_file, write_file, or patch.",
     "You are being used strictly as an LLM inference backend for Hermes Agent.",
     "All tool executions and filesystem interactions are performed exclusively by Hermes Agent on the host side.",
     "IMPORTANT INSTRUCTIONS FOR TOOLS:",
-    "- If you need to call a tool, emit ONLY <tool_call>{...}</tool_call> blocks in your text output.",
-    "- Each tool call must be a JSON object containing 'id', 'type': 'function', and 'function': {'name': '...', 'arguments': '...'}.",
-    "- 'arguments' must be a JSON-encoded string containing the function arguments.",
+    "- If you need to call a tool, emit ONLY <tool_call>{...}</tool_call> blocks in plain text output—NEVER use the native functionCall / tool_use channel.",
+    "- Each <tool_call> block must contain a single valid JSON object with 'id' (unique per call), 'type': 'function', and 'function': {'name': '...', 'arguments': '...'}." ,
+    "- 'arguments' must be a valid, properly JSON-escaped string encoding the function's arguments object.",
     "- Do NOT execute local shell commands or file operations directly; only output <tool_call> tags so Hermes can execute them safely.",
     "- NEVER simulate or hallucinate Tool Results (e.g. 'Tool Result (...):'). Hermes Agent executes tools externally and will supply real results in subsequent turns.",
     "- After emitting tool calls, STOP generating immediately. Do NOT generate results, execution output, or commentary after tool calls.",
@@ -583,6 +591,175 @@ _TOOL_CALL_PREFIXES = tuple(
 
 _TOOL_CALL_OPEN = "<tool_call>"
 _TOOL_CALL_CLOSE = "</tool_call>"
+
+
+def _build_md_parser() -> Any:
+    """CommonMark parser that records exact source spans on ``code_inline`` tokens."""
+    if MarkdownIt is None or _orig_backtick is None:
+        return None
+    md = MarkdownIt("commonmark")
+
+    def _tracked_backtick(state: Any, silent: bool) -> bool:
+        start = state.pos
+        n_before = len(state.tokens)
+        ok = _orig_backtick(state, silent)
+        if ok and not silent and len(state.tokens) > n_before:
+            tok = state.tokens[-1]
+            if tok.type == "code_inline":
+                tok.meta["span"] = (start, state.pos)
+        return ok
+
+    md.inline.ruler.at("backticks", _tracked_backtick)
+    return md
+
+
+_MD_PARSER = _build_md_parser()
+
+
+def _map_inline_spans(region: str, content: str, children: Sequence[Any]) -> list[tuple[int, int]]:
+    """Map ``code_inline`` spans from *content* coordinates to *region* coordinates."""
+    spans = [c.meta["span"] for c in children if c.type == "code_inline" and "span" in c.meta]
+    if not spans:
+        return []
+    if region.startswith(content):
+        return spans
+    c_lines = content.split("\n")
+    r_lines = region.splitlines(keepends=True)
+    idx_map: list[int] = []
+    r_pos = 0
+    for idx, c_ln in enumerate(c_lines):
+        r_ln = r_lines[idx] if idx < len(r_lines) else ""
+        r_stripped = r_ln.rstrip("\r\n")
+        lead = r_stripped.find(c_ln)
+        if lead == -1:
+            lead = 0
+        for j in range(len(c_ln)):
+            idx_map.append(r_pos + lead + j)
+        if idx < len(c_lines) - 1:
+            idx_map.append(r_pos + len(r_stripped))
+        r_pos += len(r_ln)
+    idx_map.append(r_pos)
+    max_idx = len(idx_map) - 1
+    return [(idx_map[min(s, max_idx)], idx_map[min(e, max_idx)]) for s, e in spans]
+
+
+def _code_spans(text: str) -> list[tuple[int, int]]:
+    """Return sorted ``(start, end)`` char spans for all CommonMark code constructs."""
+    if not text or _MD_PARSER is None:
+        return []
+    lines = text.splitlines(keepends=True)
+    line_starts = [0]
+    for ln in lines:
+        line_starts.append(line_starts[-1] + len(ln))
+    spans: list[tuple[int, int]] = []
+    for tok in _MD_PARSER.parse(text):
+        if not tok.map:
+            continue
+        s_line, e_line = tok.map
+        region_start = line_starts[s_line]
+        region_end = line_starts[min(e_line, len(lines))]
+        if tok.type in ("fence", "code_block"):
+            spans.append((region_start, region_end))
+        elif tok.type == "inline" and tok.children:
+            region = text[region_start:region_end]
+            for s, e in _map_inline_spans(region, tok.content, tok.children):
+                spans.append((region_start + s, region_start + e))
+    return spans
+
+
+def _trailing_unclosed_fence(tokens: Sequence[Any], lines: list[str]) -> Any | None:
+    """Return the trailing ``fence`` token if it remains unclosed at EOF.
+
+    Walks past trailing container ``*_close`` tokens (e.g. ``blockquote_close``)
+    and relies on ``markdown-it-py``'s own fence-closing decision: a closed
+    fence excludes its closing line from ``tok.content`` (yielding at most
+    ``e_line - s_line - 2`` body lines), whereas an unclosed fence includes all
+    lines through EOF (``e_line - s_line - 1`` body lines).
+    """
+    for tok in reversed(tokens):
+        if tok.type.endswith("_close"):
+            continue
+        if tok.type != "fence" or not tok.map:
+            return None
+        s_line, e_line = tok.map
+        if e_line < len(lines):
+            return None
+        if e_line <= s_line + 1:
+            return tok
+        body_lines = len(tok.content.splitlines())
+        return tok if body_lines >= e_line - s_line - 1 else None
+    return None
+
+
+class _MarkdownCodeState:
+    """Track active CommonMark code context across stream chunks via ``markdown-it-py``.
+
+    Retains only the active unclosed block (an open fence or the current
+    paragraph since the last blank line) so incremental streaming stays bounded
+    while preserving full CommonMark semantics.
+    """
+
+    def __init__(self, tail: str = "") -> None:
+        self._tail = tail
+
+    def clone(self) -> "_MarkdownCodeState":
+        return _MarkdownCodeState(self._tail)
+
+    def in_code(self) -> bool:
+        if not self._tail or _MD_PARSER is None:
+            return False
+        lines = self._tail.splitlines(keepends=True)
+        tokens = _MD_PARSER.parse(self._tail)
+        return _trailing_unclosed_fence(tokens, lines) is not None
+
+    def advance(self, text: str) -> None:
+        """Advance markdown code state through *text* and compact completed blocks."""
+        if not text or _MD_PARSER is None:
+            return
+        self._tail += text
+        lines = self._tail.splitlines(keepends=True)
+        tokens = _MD_PARSER.parse(self._tail)
+        fence_tok = _trailing_unclosed_fence(tokens, lines)
+        if fence_tok is not None:
+            s_line = fence_tok.map[0]
+            opener = lines[s_line]
+            if not opener.endswith(("\n", "\r")):
+                opener += "\n"
+            trailing = (
+                lines[-1]
+                if len(lines) > s_line + 1 and not self._tail.endswith(("\n", "\r"))
+                else ""
+            )
+            self._tail = opener + trailing
+            return
+        for sep in ("\r\n\r\n", "\n\n"):
+            pos = self._tail.rfind(sep)
+            if pos != -1:
+                self._tail = self._tail[pos + len(sep):]
+                return
+
+
+def _find_unquoted_tool_call_open(
+    text: str, state: _MarkdownCodeState | None = None
+) -> int:
+    """Return index of first ``<tool_call`` in *text* outside CommonMark code, or -1."""
+    if "<tool_call" not in text:
+        return -1
+    prefix = state._tail if state is not None else ""
+    offset = len(prefix)
+    spans = _code_spans(prefix + text)
+    span_idx = 0
+    cursor = 0
+    while True:
+        idx = text.find("<tool_call", cursor)
+        if idx == -1:
+            return -1
+        abs_pos = offset + idx
+        while span_idx < len(spans) and spans[span_idx][1] <= abs_pos:
+            span_idx += 1
+        if span_idx >= len(spans) or abs_pos < spans[span_idx][0]:
+            return idx
+        cursor = idx + len("<tool_call")
 
 
 def _find_tool_call_close(text: str, start: int = 0) -> int:
@@ -983,9 +1160,9 @@ def _format_delta_prompt(
     if last_role == "tool":
         parts.append(
             "Continue the conversation from the latest tool result. "
-            "REMINDER: You are in HEADLESS INFERENCE MODE. Native tools are disabled. "
-            "If you need to call a tool, emit ONLY <tool_call>{...}</tool_call> blocks in your text output. "
-            "Do NOT invoke native tools directly."
+            "REMINDER: You are in HEADLESS INFERENCE MODE. Native function-calling and native tools are disabled. "
+            "If you need to call a tool, emit ONLY <tool_call>{...}</tool_call> blocks in plain text with valid JSON and a properly JSON-escaped 'arguments' string. "
+            "Never invoke native tools or emit native functionCall blocks."
         )
         if pending_user_text:
             parts.append(_pending_user_request_section(pending_user_text))
@@ -1025,27 +1202,40 @@ def _longest_tool_call_prefix_match(text: str) -> int:
     return 0
 
 
-def _has_unfinished_tool_call_frame(text: str) -> bool:
+def _has_unfinished_tool_call_frame(
+    text: str, state: _MarkdownCodeState | None = None
+) -> bool:
     """True when *text* ends inside a ``<tool_call>`` frame.
 
     Uses the incremental splitter's frame boundary (:func:`_find_tool_call_close`)
     so a complete block whose JSON contains a literal closing tag is not
     mistaken for a truncated one. An opening tag without a matching close, or
     a trailing fragment of the opening tag (``<tool_cal``), is unfinished.
+    Tags inside markdown code spans or fenced code blocks are ignored.
     """
+    cur = state.clone() if state is not None else _MarkdownCodeState()
     cursor = 0
     while True:
-        start = text.find(_TOOL_CALL_OPEN, cursor)
-        if start == -1:
-            # A lone "<" is ordinary text (a comparison operator, an unfinished
-            # HTML tag, ...), not evidence of a truncated <tool_call> frame.
-            # Two or more matching characters ("<t" ... "<tool_call") remain
-            # fail-closed: the shortest useful proof of protocol framing.
-            return _longest_tool_call_prefix_match(text) > 1
+        rel_start = _find_unquoted_tool_call_open(text[cursor:], cur)
+        if rel_start == -1:
+            k = _longest_tool_call_prefix_match(text[cursor:])
+            if k <= 1:
+                return False
+            cur.advance(text[cursor : len(text) - k])
+            return not cur.in_code()
+        start = cursor + rel_start
+        if not text.startswith(_TOOL_CALL_OPEN, start):
+            if start + len("<tool_call") == len(text):
+                return True
+            cur.advance(text[cursor : start + len("<tool_call")])
+            cursor = start + len("<tool_call")
+            continue
         close = _find_tool_call_close(text, start + len(_TOOL_CALL_OPEN))
         if close == -1:
             return True
-        cursor = close + len(_TOOL_CALL_CLOSE)
+        end = close + len(_TOOL_CALL_CLOSE)
+        cur.advance(text[cursor:end])
+        cursor = end
 
 
 def _tool_call_from_object(obj: Any, ordinal: int) -> Any | None:
@@ -1077,42 +1267,68 @@ def _tool_call_from_object(obj: Any, ordinal: int) -> Any | None:
     )
 
 
-def _has_unparseable_tool_call_frame(text: str) -> bool:
+def _has_closed_tool_call_frame(
+    text: str, state: _MarkdownCodeState | None = None
+) -> bool:
+    """True when *text* contains a closed ``<tool_call>...</tool_call>`` frame."""
+    cur = state.clone() if state is not None else _MarkdownCodeState()
+    cursor = 0
+    while True:
+        rel_start = _find_unquoted_tool_call_open(text[cursor:], cur)
+        if rel_start == -1:
+            return False
+        start = cursor + rel_start
+        if not text.startswith(_TOOL_CALL_OPEN, start):
+            cur.advance(text[cursor : start + len("<tool_call")])
+            cursor = start + len("<tool_call")
+            continue
+        return _find_tool_call_close(text, start + len(_TOOL_CALL_OPEN)) != -1
+
+
+def _has_unparseable_tool_call_frame(
+    text: str, state: _MarkdownCodeState | None = None
+) -> bool:
     """True when *text* keeps a closed ``<tool_call>`` frame after parsing.
 
     :func:`_parse_tool_block` consumes every frame it can turn into a call and
     leaves the unparseable ones in its cleaned text: invalid JSON, a missing
     or blank ``function`` name, a non-object value, or an empty body. A
     closed frame surviving in that cleaned text is therefore an explicit
-    protocol frame with no call, which must fail the turn instead of being
-    published as assistant text. Unclosed frames are
+    protocol frame with no call. Unclosed frames are
     :func:`_has_unfinished_tool_call_frame`'s concern.
     """
-    _calls, cleaned = _parse_tool_block(text)
-    start = cleaned.find(_TOOL_CALL_OPEN)
-    return (
-        start != -1
-        and _find_tool_call_close(cleaned, start + len(_TOOL_CALL_OPEN)) != -1
-    )
+    _calls, cleaned = _parse_tool_block(text, state=state)
+    return _has_closed_tool_call_frame(cleaned, state=state)
 
 
-def _extract_tagged_tool_calls(block: str) -> tuple[list[Any], str]:
+def _extract_tagged_tool_calls(
+    block: str, state: _MarkdownCodeState | None = None
+) -> tuple[list[Any], str]:
     """Extract ``<tool_call>{...}</tool_call>`` frames using the shared scanner.
 
     The frame boundary is :func:`_find_tool_call_close`, so a literal closing
     tag inside a JSON string does not terminate the block. Text outside valid
     frames, and a frame whose body is not a valid call, are returned as
-    ``cleaned_text``.
+    ``cleaned_text``. Tags inside markdown code spans or fenced code blocks
+    are left untouched as ordinary text.
     """
     calls: list[Any] = []
     text_parts: list[str] = []
+    cur = state.clone() if state is not None else _MarkdownCodeState()
     cursor = 0
     while True:
-        start = block.find(_TOOL_CALL_OPEN, cursor)
-        if start == -1:
+        rel_start = _find_unquoted_tool_call_open(block[cursor:], cur)
+        if rel_start == -1:
             text_parts.append(block[cursor:])
             break
+        start = cursor + rel_start
+        if not block.startswith(_TOOL_CALL_OPEN, start):
+            text_parts.append(block[cursor : start + len("<tool_call")])
+            cur.advance(block[cursor : start + len("<tool_call")])
+            cursor = start + len("<tool_call")
+            continue
         text_parts.append(block[cursor:start])
+        cur.advance(block[cursor:start])
         close = _find_tool_call_close(block, start + len(_TOOL_CALL_OPEN))
         if close == -1:
             text_parts.append(block[start:])
@@ -1127,6 +1343,7 @@ def _extract_tagged_tool_calls(block: str) -> tuple[list[Any], str]:
         call = _tool_call_from_object(parsed, len(calls) + 1)
         if call is None:
             text_parts.append(block[start:end])
+            cur.advance(block[start:end])
         else:
             calls.append(call)
         cursor = end
@@ -1138,12 +1355,14 @@ def _extract_tagged_tool_calls(block: str) -> tuple[list[Any], str]:
     return calls, "\n".join(part.strip() for part in text_parts if part and part.strip()).strip()
 
 
-def _parse_tool_block(block: str) -> tuple[list[Any], str]:
+def _parse_tool_block(
+    block: str, state: _MarkdownCodeState | None = None
+) -> tuple[list[Any], str]:
     """Parse tool call blocks, returning (tool_call_deltas, cleaned_text)."""
     calls: list[Any] = []
     cleaned_text = ""
     if _TOOL_CALL_OPEN in block:
-        calls, cleaned_text = _extract_tagged_tool_calls(block)
+        calls, cleaned_text = _extract_tagged_tool_calls(block, state=state)
     else:
         try:
             from agent.acp_openai_bridge import extract_tool_calls_from_text

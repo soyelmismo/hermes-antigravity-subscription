@@ -504,57 +504,126 @@ def _consume_until_error(stream):
 
 
 @pytest.mark.parametrize("body", UNPARSEABLE_FRAME_BODIES)
-def test_closed_unparseable_frame_fails_in_stream(body):
-    stream, _proc_mock, _client = _stream(_events(f"<tool_call>{body}</tool_call>"))
+def test_closed_unparseable_frame_falls_back_to_text_in_stream(body):
+    raw = f"<tool_call>{body}</tool_call>"
+    stream, _proc_mock, _client = _stream(_events(raw))
 
-    (calls, contents, finishes), message = _consume_until_error(stream)
+    calls, contents, finishes = _consumed(list(stream))
 
-    assert "invalid tool call block" in message
     assert calls == []
-    assert contents == []
-    assert finishes == []
+    assert "".join(contents) == raw
+    assert finishes == ["stop"]
 
 
 @pytest.mark.parametrize("body", UNPARSEABLE_FRAME_BODIES)
-def test_closed_unparseable_frame_in_result_response_fails(body):
-    stream, _proc_mock, _client = _stream(
-        _events(final=f"<tool_call>{body}</tool_call>")
-    )
+def test_closed_unparseable_frame_in_result_response_falls_back_to_text(body):
+    raw = f"<tool_call>{body}</tool_call>"
+    stream, _proc_mock, _client = _stream(_events(final=raw))
 
-    (calls, contents, finishes), message = _consume_until_error(stream)
+    calls, contents, finishes = _consumed(list(stream))
 
-    assert "invalid tool call block" in message
     assert calls == []
-    assert contents == []
-    assert finishes == []
+    assert "".join(contents) == raw
+    assert finishes == ["stop"]
 
 
 @pytest.mark.parametrize("body", UNPARSEABLE_FRAME_BODIES)
-def test_closed_unparseable_frame_after_a_complete_call_fails_in_stream(body):
+def test_closed_unparseable_frame_after_a_complete_call_in_stream(body):
     stream, _proc_mock, _client = _stream(
         _events(_block("one"), f"<tool_call>{body}</tool_call>")
     )
 
-    (calls, contents, finishes), message = _consume_until_error(stream)
+    calls, contents, finishes = _consumed(list(stream))
 
-    assert "invalid tool call block" in message
     assert [call.id for call in calls] == ["same"]
     assert contents == []
-    assert finishes == []
+    assert finishes == ["tool_calls"]
 
 
-def test_closed_unparseable_frame_after_a_complete_call_in_result_response_fails():
+def test_closed_unparseable_frame_after_a_complete_call_in_result_response():
     stream, _proc_mock, _client = _stream(
         _events(final=_block("one") + "<tool_call>{}</tool_call>")
     )
 
-    (calls, contents, finishes), message = _consume_until_error(stream)
+    calls, contents, finishes = _consumed(list(stream))
 
-    assert "invalid tool call block" in message
-    # The result-only buffer is validated before anything is emitted.
-    assert calls == []
+    assert [call.id for call in calls] == ["same"]
     assert contents == []
-    assert finishes == []
+    assert finishes == ["tool_calls"]
+
+
+def test_tool_call_tag_inside_markdown_code_streams_as_text():
+    prose = (
+        "Example:\n\n```xml\n"
+        "<tool_call>{\"bad\": \"json\"</tool_call>\n"
+        "```\n\nDone."
+    )
+    stream, _proc_mock, _client = _stream(_events(prose))
+
+    calls, contents, finishes = _consumed(list(stream))
+
+    assert calls == []
+    assert "".join(contents) == prose
+    assert finishes == ["stop"]
+
+
+def test_post_loop_incomplete_tool_call_inside_open_fence_is_plain_text():
+    stream, _proc_mock, _client = _stream(
+        _events("```xml\n<tool", "_call>{\"unclosed\": true")
+    )
+
+    calls, contents, finishes = _consumed(list(stream))
+
+    assert calls == []
+    assert "<tool_call>{\"unclosed\": true" in "".join(contents)
+    assert finishes == ["stop"]
+
+
+def test_post_loop_unparseable_tool_call_inside_open_fence_no_warning(caplog):
+    stream, _proc_mock, _client = _stream(
+        _events("```xml\n", "<tool_call>{}</tool_call>")
+    )
+
+    with caplog.at_level("WARNING"):
+        calls, contents, finishes = _consumed(list(stream))
+
+    assert calls == []
+    assert "<tool_call>{}</tool_call>" in "".join(contents)
+    assert finishes == ["stop"]
+    assert not any("Unparseable <tool_call>" in r.message for r in caplog.records)
+
+
+def test_indented_code_block_ignored_and_escaped_backtick_parsed():
+    stream, _proc_mock, _client = _stream(
+        _events(
+            "    <tool_call>{bad}</tool_call>\n\n",
+            f"\\`{_block('one')}\\`",
+        )
+    )
+
+    calls, contents, finishes = _consumed(list(stream))
+
+    assert [call.id for call in calls] == ["same"]
+    assert "<tool_call>{bad}</tool_call>" in "".join(contents)
+    assert finishes == ["tool_calls"]
+
+
+def test_commonmark_edge_cases_in_fences_and_headings():
+    stream, _proc_mock, _client = _stream(
+        _events(
+            "# `<tool_call>{bad}</tool_call>` #\n\n",
+            "```xml\n    ```\n<tool_call>{still_fenced}</tool_call>\n```\n",
+            "```xml\n``` extra\n<tool_call>{still_fenced_2}</tool_call>\n```",
+        )
+    )
+
+    calls, contents, finishes = _consumed(list(stream))
+    joined = "".join(contents)
+    assert calls == []
+    assert "<tool_call>{bad}</tool_call>" in joined
+    assert "<tool_call>{still_fenced}</tool_call>" in joined
+    assert "<tool_call>{still_fenced_2}</tool_call>" in joined
+    assert finishes == ["stop"]
 
 
 # ---------------------------------------------------------------------------
