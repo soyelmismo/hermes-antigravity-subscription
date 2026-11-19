@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
@@ -37,6 +38,63 @@ except ImportError:
     )
 
 logger = logging.getLogger(__name__)
+
+# Single-turn prompt ceiling measured against agy 1.x (issue #49): the CLI
+# silently truncates a Gemini-route prompt at ~75,800 input tokens, keeps the
+# head and drops the tail, and reports no error. In an agent loop the tail is
+# the fresh tool output, so Hermes must compact before agy starts discarding
+# it. Claude routes accepted >122k input with no observed cap below the
+# compiled multi-turn trajectory threshold, so they keep the full default.
+_GEMINI_SINGLE_TURN_CONTEXT = 75_000
+_DEFAULT_CONTEXT_LENGTH = 239_000
+_CONTEXT_LENGTH_OVERRIDE_VARS = (
+    "HERMES_ANTIGRAVITY_CONTEXT_LENGTHS",
+    "ANTIGRAVITY_CONTEXT_LENGTHS",
+)
+
+
+def _context_length_overrides() -> dict[str, int]:
+    """Parse per-model context overrides from ``*_CONTEXT_LENGTHS`` JSON env vars.
+
+    ``HERMES_ANTIGRAVITY_CONTEXT_LENGTHS`` wins over ``ANTIGRAVITY_CONTEXT_LENGTHS``.
+    Values must be positive integers; malformed entries are ignored rather than
+    failing the request path.
+    """
+    for var in _CONTEXT_LENGTH_OVERRIDE_VARS:
+        raw = os.environ.get(var)
+        if not raw:
+            continue
+        try:
+            parsed = json.loads(raw)
+        except ValueError:
+            logger.warning("Ignoring malformed %s (not valid JSON)", var)
+            continue
+        if isinstance(parsed, dict):
+            out: dict[str, int] = {}
+            for name, val in parsed.items():
+                if isinstance(val, int) and not isinstance(val, bool) and val > 0:
+                    out[str(name).strip().lower()] = val
+            if out:
+                return out
+    return {}
+
+
+def resolve_context_length(model: str) -> int:
+    """Single-turn context length for *model*, per-family where measured.
+
+    Exact-name overrides beat family overrides; the measured Gemini ceiling
+    (75k, head-kept truncation) applies to every ``gemini-*`` route, effort
+    suffixes included.
+    """
+    base, _effort = split_effort_suffix(model.strip().lower())
+    overrides = _context_length_overrides()
+    for name in (model.strip().lower(), base):
+        if name and name in overrides:
+            return overrides[name]
+    if base.startswith("gemini"):
+        return _GEMINI_SINGLE_TURN_CONTEXT
+    return _DEFAULT_CONTEXT_LENGTH
+
 
 class AntigravitySubscriptionDirectSDKProfile(ProviderProfile):
     """Google Antigravity Subscription DirectSDK provider profile."""
@@ -106,13 +164,22 @@ class AntigravitySubscriptionDirectSDKProfile(ProviderProfile):
         return list(_FALLBACK_MODELS)
 
     def get_model_context_length(self, model: str) -> int | None:
-        """Declared context window for Antigravity CLI.
+        """Declared context window for Antigravity CLI, per model family.
 
-        Defaults to 239,000 tokens so Hermes compaction triggers safely below agy's
-        compiled internal trajectory checkpoint threshold (239,616 tokens / 256k - 16k output tokens),
-        maximizing usable context while ensuring Hermes retains sovereign context control. Multi-turn
-        trajectory persistence via native --conversation prevents hitting agy's single-turn 100,000 token limit.
-        Configurable via HERMES_ANTIGRAVITY_CONTEXT_LENGTH or ANTIGRAVITY_CONTEXT_LENGTH.
+        Gemini routes declare 75,000 tokens: agy 1.x silently truncates a
+        single-turn Gemini prompt at ~75,800 input tokens, keeps the head and
+        drops the tail (issue #49), so Hermes compaction must fire below that.
+        Claude routes have no observed single-turn cap under the compiled
+        trajectory threshold and keep the 239,000 default (239,616 tokens /
+        256k - 16k output tokens). Multi-turn trajectory persistence via
+        native --conversation prevents hitting the single-turn limit.
+
+        Overrides: ``HERMES_ANTIGRAVITY_CONTEXT_LENGTH`` /
+        ``ANTIGRAVITY_CONTEXT_LENGTH`` set one global value;
+        ``HERMES_ANTIGRAVITY_CONTEXT_LENGTHS`` /
+        ``ANTIGRAVITY_CONTEXT_LENGTHS`` take a JSON object mapping a model
+        name or family prefix (e.g. ``"gemini-4-argon"``) to a token count.
+        The global override wins over the per-model table.
         """
         env_val = os.environ.get("HERMES_ANTIGRAVITY_CONTEXT_LENGTH") or os.environ.get("ANTIGRAVITY_CONTEXT_LENGTH")
         if env_val:
@@ -122,7 +189,7 @@ class AntigravitySubscriptionDirectSDKProfile(ProviderProfile):
                     return val
             except ValueError:
                 pass
-        return 239_000
+        return resolve_context_length(model)
 
     def classify_api_error(
         self,
