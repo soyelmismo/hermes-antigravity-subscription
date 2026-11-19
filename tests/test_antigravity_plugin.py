@@ -1180,6 +1180,16 @@ class AntigravityPluginTests(unittest.TestCase):
             )
             chunks = list(stream)
             mock_term.assert_called_once_with(mock_proc)
+        # Issue #52: the abort is surfaced as explanatory content instead of
+        # a bare empty completion that Hermes classified as "no content" and
+        # silently failed over to another provider.
+        contents = [c.choices[0].delta.content for c in chunks if c.choices and c.choices[0].delta.content]
+        self.assertEqual(len(contents), 1)
+        self.assertIn("run_command", contents[0])
+        self.assertIn("blocked by host security policy", contents[0])
+        self.assertIn("<tool_call>", contents[0])
+        finishes = [c.choices[0].finish_reason for c in chunks if c.choices and c.choices[0].finish_reason]
+        self.assertEqual(finishes, ["stop"])
 
     def test_temp_directory_isolation_and_cleanup(self):
         client = AntigravityClient()
