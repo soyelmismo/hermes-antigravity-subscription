@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import atexit
 import contextlib
+import ctypes
 import logging
 import os
 import re
@@ -124,15 +126,81 @@ def _no_window() -> dict[str, Any]:
 
 
 def _own_process_group() -> dict[str, Any]:
-    """Popen kwargs for background processes in a group we can kill cleanly."""
+    """Popen kwargs for background processes in a group we can kill cleanly.
+
+    On Linux the child also gets PR_SET_PDEATHSIG(SIGKILL): if the hosting
+    Hermes worker dies without running the plugin's cleanup (crash, dispatcher
+    kill), the kernel terminates agy instead of leaving it reparented to init,
+    holding its request open and its memory (issue #50). The preexec_fn
+    re-checks the parent after fork to close the classic PDEATHSIG race where
+    the parent dies between fork and prctl.
+    """
     if os.name == "nt":
         return {"creationflags": getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200) | _CREATE_NO_WINDOW}
-    return {"start_new_session": True}
+    kwargs: dict[str, Any] = {"start_new_session": True}
+    if sys.platform == "linux":
+        kwargs["preexec_fn"] = _pdeathsig_preexec(os.getpid())
+    return kwargs
+
+
+_PR_SET_PDEATHSIG = 1  # Linux prctl(2) option: signal delivered on parent death
+
+
+def _pdeathsig_preexec(parent_pid: int) -> Any:
+    """Build a preexec_fn that SIGKILLs the child when its parent disappears."""
+
+    def _set_pdeathsig() -> None:
+        try:
+            libc = ctypes.CDLL(None, use_errno=True)
+            libc.prctl(_PR_SET_PDEATHSIG, signal.SIGKILL, 0, 0, 0)
+            # Parent died between fork() and prctl(): we are already orphaned,
+            # so kill ourselves instead of surviving one generation (issue #50).
+            if os.getppid() != parent_pid:
+                os.kill(os.getpid(), signal.SIGKILL)
+        except Exception:
+            # Best effort only: a preexec failure must not block the spawn.
+            pass
+
+    return _set_pdeathsig
+
+
+# Processes this host owns, so a normal interpreter exit never orphans agy
+# even when client close() paths are skipped (issue #50).
+_TRACKED_PROCS: set[subprocess.Popen] = set()
+_TRACKED_LOCK = threading.Lock()
+
+
+def register_tracked_process(proc: subprocess.Popen) -> None:
+    with _TRACKED_LOCK:
+        _TRACKED_PROCS.add(proc)
+
+
+def unregister_tracked_process(proc: subprocess.Popen) -> None:
+    with _TRACKED_LOCK:
+        _TRACKED_PROCS.discard(proc)
+
+
+def _terminate_tracked_processes() -> None:
+    with _TRACKED_LOCK:
+        snapshot = list(_TRACKED_PROCS)
+        _TRACKED_PROCS.clear()
+    for proc in snapshot:
+        if proc.poll() is None:
+            try:
+                terminate_process(proc)
+            except Exception:
+                # The exit hook must never abort on one stubborn child:
+                # keep killing the rest (issue #50).
+                logger.exception("Failed to terminate tracked process %s", proc.pid)
+
+
+atexit.register(_terminate_tracked_processes)
 
 
 def _kill_process_tree(proc: subprocess.Popen) -> None:
     """Kill process and every descendant: taskkill /F /T on Windows, killpg on POSIX."""
     if proc.poll() is not None:
+        unregister_tracked_process(proc)
         return
     if os.name == "nt":
         with contextlib.suppress(Exception):
@@ -143,12 +211,18 @@ def _kill_process_tree(proc: subprocess.Popen) -> None:
                 check=False,
                 **_no_window(),
             )
+        unregister_tracked_process(proc)
         return
     try:
         os.killpg(proc.pid, signal.SIGKILL)  # windows-footgun: ok — the nt branch above never reaches this line
     except (ProcessLookupError, PermissionError, AttributeError):
         with contextlib.suppress(Exception):
             proc.kill()
+    unregister_tracked_process(proc)
+    # A killed child lingers as a defunct zombie until reaped (issue #50:
+    # a [agy] <defunct> was observed living 33 minutes under a live worker).
+    with contextlib.suppress(Exception):
+        proc.wait(timeout=2)
 
 
 def terminate_process(proc: subprocess.Popen) -> None:
@@ -158,6 +232,7 @@ def terminate_process(proc: subprocess.Popen) -> None:
         proc.wait(timeout=2)
     except Exception:
         _kill_process_tree(proc)
+    unregister_tracked_process(proc)
 
 
 _DEFAULT_STDERR_LIMIT = 64 * 1024  # 64 KiB of text

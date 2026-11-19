@@ -2246,7 +2246,12 @@ class AntigravityPluginTests(unittest.TestCase):
             self.assertEqual(flags, {"creationflags": 0x08000200})
         with patch("os.name", "posix"):
             flags = _own_process_group()
-            self.assertEqual(flags, {"start_new_session": True})
+            # Linux additionally arms PR_SET_PDEATHSIG via preexec_fn
+            # (issue #50); macOS/other POSIX keep the bare setsid contract.
+            self.assertEqual(flags.pop("start_new_session", None), True)
+            if sys.platform == "linux":
+                self.assertTrue(callable(flags.pop("preexec_fn", None)))
+            self.assertEqual(flags, {})
 
     def test_windows_kill_process_tree(self):
         from client import _kill_process_tree
