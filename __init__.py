@@ -18,6 +18,7 @@ try:
         _MODEL_ALIASES,
         _cached_catalog,
         _heuristic_efforts,
+        fallback_rows,
         load_catalog,
         model_efforts,
         resolve_model_alias,
@@ -31,6 +32,7 @@ except ImportError:
         _MODEL_ALIASES,
         _cached_catalog,
         _heuristic_efforts,
+        fallback_rows,
         load_catalog,
         model_efforts,
         resolve_model_alias,
@@ -157,11 +159,15 @@ class AntigravitySubscriptionDirectSDKProfile(ProviderProfile):
         or `claude-opus-5-5-{low,medium,high}` becomes one entry), allowing Hermes' native
         reasoning effort picker to handle the thinking depth cleanly. The result also warms
         the effort table that `resolve_model_and_effort` reads.
+
+        A failed probe returns `models.fallback_rows()`: the built-in families marked as a
+        non-authoritative catalog, so Hermes keeps the account's last verified list instead
+        of caching the fallback over it. See `fallback_rows` for the cache contract.
         """
         catalog = load_catalog(timeout=timeout)
         if catalog:
             return list(catalog)
-        return list(_FALLBACK_MODELS)
+        return fallback_rows()
 
     def get_model_context_length(self, model: str) -> int | None:
         """Declared context window for Antigravity CLI, per model family.

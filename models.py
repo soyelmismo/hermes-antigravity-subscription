@@ -31,6 +31,30 @@ _KNOWN_EFFORTS: dict[str, tuple[str, ...]] = {
 
 _FALLBACK_MODELS = list(_KNOWN_EFFORTS)
 
+
+def fallback_rows() -> list[str]:
+    """The built-in fallback catalog, marked as a placeholder when Hermes can say so.
+
+    Hermes' provider-catalog cache treats a plain list as authoritative: it stores it
+    under the normal provider TTL and overwrites whatever the account really listed.
+    Answering a failed ``agy models`` probe with a plain list therefore pinned the
+    ``/model`` picker to these legacy families for hours after one transient failure,
+    until somebody ran ``/model --refresh`` — the account's real catalog (with the
+    current families) was still on disk but had been replaced by the fallback.
+
+    ``hermes_cli.models_catalog_static.CuratedFallbackModels`` is the marker core
+    already understands (``hermes_cli/models.py::_live_result_entry``): a marked row
+    never replaces a verified one for the same credentials, and when it is stored it
+    expires on the short fallback TTL (~60s) instead of the full provider TTL. On a
+    core without the marker the plain list keeps the old behaviour.
+    """
+    try:
+        from hermes_cli.models_catalog_static import CuratedFallbackModels
+    except Exception:  # old core, or a host that cannot import Hermes' CLI package
+        return list(_FALLBACK_MODELS)
+    return CuratedFallbackModels(_FALLBACK_MODELS)
+
+
 _MODEL_ALIASES = {
     "default": "gemini-3.8-flash",
     "flash": "gemini-3.8-flash",
