@@ -393,5 +393,56 @@ class NativeMediaRootsTests(unittest.TestCase):
                 sys.modules.pop("hermes_constants", None)
 
 
+class NativeMediaToolInfoPathTests(unittest.TestCase):
+    def test_tool_info_regex_extracts_windows_drive_paths(self):
+        import stream as agy_stream
+
+        info = (
+            r"read_file C:\Users\u\AppData\Local\hermes\cache\agy_media\a.jpg"
+            " and C:/Users/u/AppData/Local/hermes/cache/agy_media/b.png"
+        )
+        found = agy_stream._TOOL_INFO_PATH_RE.findall(info)
+        self.assertIn(r"C:\Users\u\AppData\Local\hermes\cache\agy_media\a.jpg", found)
+        self.assertIn("C:/Users/u/AppData/Local/hermes/cache/agy_media/b.png", found)
+
+    def test_tool_info_regex_still_extracts_posix_paths(self):
+        import stream as agy_stream
+
+        found = agy_stream._TOOL_INFO_PATH_RE.findall(
+            "read_file /home/u/.hermes/cache/agy_media/a.jpg"
+        )
+        self.assertEqual(found, ["/home/u/.hermes/cache/agy_media/a.jpg"])
+
+    @unittest.skipUnless(os.name == "nt", "Windows path semantics")
+    def test_windows_media_cache_read_is_permitted(self):
+        import types
+
+        import stream as agy_stream
+
+        with tempfile.TemporaryDirectory() as home:
+            module = types.ModuleType("hermes_constants")
+            setattr(module, "get_hermes_home", lambda: home)
+            saved = sys.modules.get("hermes_constants")
+            sys.modules["hermes_constants"] = module
+            try:
+                target = os.path.join(home, "cache", "agy_media", "a.jpg")
+                # Both separators and a different drive-letter/segment case.
+                for spelling in (target, target.replace("\\", "/"), target.lower()):
+                    self.assertTrue(
+                        agy_stream._path_is_native_media_target(spelling, set()),
+                        spelling,
+                    )
+                self.assertFalse(
+                    agy_stream._path_is_native_media_target(
+                        os.path.join(os.path.expanduser("~"), ".ssh", "id.jpg"), set()
+                    )
+                )
+            finally:
+                if saved is not None:
+                    sys.modules["hermes_constants"] = saved
+                else:
+                    sys.modules.pop("hermes_constants", None)
+
+
 if __name__ == "__main__":
     unittest.main()

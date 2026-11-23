@@ -83,21 +83,30 @@ def _native_media_roots() -> tuple[str, ...]:
     return tuple(os.path.realpath(r) for r in roots)
 
 
-_TOOL_INFO_PATH_RE = re.compile(r"/[A-Za-z0-9_\-./]+")
+# POSIX paths (/home/u/.hermes/...) and Windows drive paths with either
+# separator (C:\Users\u\... or C:/Users/u/...). Matching only "/..." made every
+# Windows media-attach read fail the allowlist, so agy could never see an image.
+_TOOL_INFO_PATH_RE = re.compile(r"(?:[A-Za-z]:)?[\\/][A-Za-z0-9_\-./\\]+")
 
 
 def _path_is_native_media_target(path: str, referenced: set[str]) -> bool:
     normalized = os.path.normpath(path)
     if normalized in referenced:
         return True
-    real = os.path.realpath(normalized)
+    # Windows paths are case-insensitive: agy may report C:\users\... while the
+    # roots resolve to C:\Users\... normcase is the identity on POSIX.
+    key = os.path.normcase(normalized)
+    if any(key == os.path.normcase(os.path.normpath(ref)) for ref in referenced):
+        return True
+    real = os.path.normcase(os.path.realpath(normalized))
     # Resolved at use time: a Hermes process serving several profiles must
     # evaluate the roots of the profile owning this session (review
     # 5887913331, point 2).
-    return any(
-        real == root or real.startswith(root + os.sep)
-        for root in _native_media_roots()
-    )
+    for root in _native_media_roots():
+        root = os.path.normcase(root)
+        if real == root or real.startswith(root + os.sep):
+            return True
+    return False
 
 
 class _UsageDeltas(NamedTuple):
