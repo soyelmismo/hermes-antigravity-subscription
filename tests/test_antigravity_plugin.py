@@ -995,14 +995,13 @@ class AntigravityPluginTests(unittest.TestCase):
 
     def test_profile_get_model_context_length(self):
         profile = get_provider_profile("antigravity-subscription-directsdk")
-        # Gemini routes declare the measured single-turn ceiling: agy silently
-        # truncates a single-turn Gemini prompt, head kept, tail dropped. The
-        # 50k figure is the 2026-11-24 re-measurement against agy 1.5.16 (a
-        # ~56.4k-token payload still arrives intact; larger ones lose the
-        # tail), superseding issue #49's ~75.8k reading on an older agy 1.x.
-        self.assertEqual(profile.get_model_context_length("gemini-3.8-flash"), 50_000)
-        self.assertEqual(profile.get_model_context_length("gemini-4-argon-high"), 50_000)
-        self.assertEqual(profile.get_model_context_length("gemini-4-hydrogen"), 50_000)
+        # Gemini routes declare the OFFICIAL model window (models.dev / Google).
+        # The measured agy single-turn truncation (~56.4k tokens arrive intact,
+        # larger payloads lose the tail) is documented on the constant, not
+        # baked into the declaration.
+        self.assertEqual(profile.get_model_context_length("gemini-3.8-flash"), 1_048_576)
+        self.assertEqual(profile.get_model_context_length("gemini-4-argon-high"), 1_048_576)
+        self.assertEqual(profile.get_model_context_length("gemini-4-hydrogen"), 1_048_576)
         # Claude routes keep the full default (no observed single-turn cap).
         self.assertEqual(profile.get_model_context_length("claude-sonnet-4-6"), 239_000)
         self.assertEqual(profile.get_model_context_length("claude-sonnet-5-5-high"), 239_000)
@@ -1035,7 +1034,7 @@ class AntigravityPluginTests(unittest.TestCase):
             self.assertEqual(profile.get_model_context_length("gemini-4-argon-medium"), 90_000)
             self.assertEqual(profile.get_model_context_length("claude-sonnet-5-5-low"), 200_000)
             # Unrelated families keep their defaults.
-            self.assertEqual(profile.get_model_context_length("gemini-3.8-flash"), 50_000)
+            self.assertEqual(profile.get_model_context_length("gemini-3.8-flash"), 1_048_576)
 
         # HERMES_ JSON wins over ANTIGRAVITY_ JSON; malformed JSON is ignored.
         with patch.dict(os.environ, {
@@ -1044,12 +1043,12 @@ class AntigravityPluginTests(unittest.TestCase):
         }):
             self.assertEqual(profile.get_model_context_length("gemini-4-argon"), 80_000)
         with patch.dict(os.environ, {"ANTIGRAVITY_CONTEXT_LENGTHS": "{not json"}):
-            self.assertEqual(profile.get_model_context_length("gemini-4-argon"), 50_000)
+            self.assertEqual(profile.get_model_context_length("gemini-4-argon"), 1_048_576)
         # Non-positive and non-int values are dropped.
         with patch.dict(os.environ, {
             "ANTIGRAVITY_CONTEXT_LENGTHS": json.dumps({"gemini-4-argon": -5, "claude-sonnet-4-6": "abc"}),
         }):
-            self.assertEqual(profile.get_model_context_length("gemini-4-argon"), 50_000)
+            self.assertEqual(profile.get_model_context_length("gemini-4-argon"), 1_048_576)
             self.assertEqual(profile.get_model_context_length("claude-sonnet-4-6"), 239_000)
 
     def test_profile_classify_api_error(self):

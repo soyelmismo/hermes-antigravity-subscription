@@ -39,30 +39,31 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
-# Single-turn prompt ceiling measured against the live agy CLI (re-measured
-# 2026-11-24 against agy 1.5.16, superseding the ~75.8k figure from issue #49
-# which was taken on an older 1.x): the CLI silently truncates a Gemini-route
-# prompt, keeps the head and drops the tail, and reports no error. A 160 KB
-# payload (~56.4k model-visible tokens including agy's own overhead) still
-# reaches the model intact on gemini-4-neon-low, gemini-4-argon-high and
-# gemini-3.8-flash-high, while a 1 MB payload loses its tail on every route
-# (post-truncation reported input: 63.8k-70.8k). In an agent loop the tail is
-# the fresh tool output, so Hermes must compact before agy starts discarding
-# it. 50k keeps even a worst-case full resend (declared limit + prompt
-# formatting + agy overhead) below the verified-intact point.
+# Gemini routes declare the OFFICIAL model window: 1,048,576 tokens for every
+# gemini-4-* id (and the gemini-3.x 1M models), per models.dev / Google. Hermes
+# compaction, /context display and @-reference budgets therefore match the
+# model's published specification instead of a workaround number.
 #
-# The official 1,048,576-token window (models.dev / Google) is NOT reachable
-# on this route today: agy's settings schema exposes no context key for
-# built-in models (only customModel.maxTokens), AGY_CLI_AUTO_COMPACT_OVERRIDE
-# was measured ineffective against the single-turn cut, and agy's multi-turn
-# auto-compaction is clamped to 256,000 tokens upstream
-# (google-antigravity/antigravity-cli#1245 and #1432). Use
-# HERMES_ANTIGRAVITY_CONTEXT_LENGTH(S) to opt into a larger declaration; above
-# ~56k model-visible tokens per turn, agy then silently drops the tail.
+# Measured reality on this route (agy 1.5.16, 2026-11-24), documented so the
+# trade-off is never silent: the agy CLI silently truncates a single-turn
+# Gemini-route prompt, keeping the head and dropping the tail, with no error.
+# A ~56.4k-token payload (agy overhead included) still reaches the model
+# intact; a 1 MB payload loses its tail on every route (post-truncation
+# reported input 63.8k-70.8k). Continuation turns send only deltas and are
+# unaffected; full sends (first turn, post-compaction resend, worker recycle
+# after ANTIGRAVITY_WORKER_IDLE_SECONDS, model switch) above that point lose
+# their newest content. agy offers no escape today: its settings schema
+# exposes no context key for built-in models, AGY_CLI_AUTO_COMPACT_OVERRIDE
+# does not lift the single-turn cut, and agy's multi-turn auto-compaction is
+# clamped to 256,000 tokens upstream (google-antigravity/antigravity-cli#1245
+# and #1432). Deployments that would rather keep full sends intact can dial
+# the declaration back down with HERMES_ANTIGRAVITY_CONTEXT_LENGTH(S) — 50,000
+# was the measured-safe value this plugin shipped before declaring the
+# official window.
 #
-# Claude routes accepted >122k input with no observed cap below the
-# compiled multi-turn trajectory threshold, so they keep the full default.
-_GEMINI_SINGLE_TURN_CONTEXT = 50_000
+# Claude routes have no observed single-turn cap below the compiled
+# multi-turn trajectory threshold, so they keep the full default.
+_GEMINI_CONTEXT_LENGTH = 1_048_576
 _DEFAULT_CONTEXT_LENGTH = 239_000
 _CONTEXT_LENGTH_OVERRIDE_VARS = (
     "HERMES_ANTIGRAVITY_CONTEXT_LENGTHS",
@@ -97,13 +98,13 @@ def _context_length_overrides() -> dict[str, int]:
 
 
 def resolve_context_length(model: str) -> int:
-    """Single-turn context length for *model*, per-family where measured.
+    """Context length for *model*, per family.
 
-    Exact-name overrides beat family overrides; the measured Gemini ceiling
-    applies to every ``gemini-*`` route, effort suffixes included. The value
-    is the route's real single-turn budget (see ``_GEMINI_SINGLE_TURN_CONTEXT``
-    for the 2026-11-24 measurements against agy 1.5.16), not the official
-    1,048,576-token model window, which agy cannot deliver on this route.
+    Exact-name overrides beat family defaults. Gemini routes return the
+    official 1,048,576-token window (``_GEMINI_CONTEXT_LENGTH``); see that
+    constant's comment for the measured single-turn truncation the route
+    applies above ~56k model-visible tokens and how to dial the declaration
+    back down.
     """
     base, _effort = split_effort_suffix(model.strip().lower())
     overrides = _context_length_overrides()
@@ -111,7 +112,7 @@ def resolve_context_length(model: str) -> int:
         if name and name in overrides:
             return overrides[name]
     if base.startswith("gemini"):
-        return _GEMINI_SINGLE_TURN_CONTEXT
+        return _GEMINI_CONTEXT_LENGTH
     return _DEFAULT_CONTEXT_LENGTH
 
 
@@ -185,30 +186,36 @@ class AntigravitySubscriptionDirectSDKProfile(ProviderProfile):
     def get_model_context_length(self, model: str) -> int | None:
         """Declared context window for Antigravity CLI, per model family.
 
-        Gemini routes declare the measured single-turn budget: agy silently
-        truncates a single-turn Gemini prompt (head kept, tail dropped), so
-        Hermes compaction must fire below that point. Re-measured 2026-11-24
-        against agy 1.5.16: a ~56.4k-token payload (160 KB, agy overhead
-        included) still reaches the model intact on gemini-4-neon-low,
-        gemini-4-argon-high and gemini-3.8-flash-high, while larger payloads
-        lose their tail on every route. The official 1,048,576-token window is
-        not reachable through agy today (no settings key;
-        AGY_CLI_AUTO_COMPACT_OVERRIDE measured ineffective against the
-        single-turn cut; multi-turn compaction clamped to 256k upstream,
-        google-antigravity/antigravity-cli#1245 and #1432).
+        Gemini routes declare the official 1,048,576-token window (models.dev /
+        Google), so Hermes' compaction, /context display and @-reference budgets
+        match the model's published specification.
+
+        Measured trade-off, documented rather than hidden (agy 1.5.16,
+        2026-11-24): the agy CLI silently truncates a single-turn Gemini-route
+        prompt, keeping the head and dropping the tail, with no error. A
+        ~56.4k-token payload (agy overhead included) still arrives intact,
+        while larger payloads lose their tail. Continuation turns send only
+        deltas and are unaffected; full sends (first turn, post-compaction
+        resend, worker recycle, model switch) above that point lose their
+        newest content. agy offers no escape: its settings schema exposes no
+        context key for built-in models, AGY_CLI_AUTO_COMPACT_OVERRIDE does
+        not lift the single-turn cut, and multi-turn auto-compaction is
+        clamped to 256k tokens upstream (google-antigravity/antigravity-cli#1245
+        and #1432). Deployments that would rather keep full sends intact can
+        declare a smaller window — 50,000 was the measured-safe value this
+        plugin shipped before adopting the official one.
+
         Claude routes have no observed single-turn cap under the compiled
-        trajectory threshold and keep the 239,000 default (239,616 tokens /
-        256k - 16k output tokens). Multi-turn trajectory persistence via
-        native --conversation prevents hitting the single-turn limit.
+        trajectory threshold and keep the 239,000 default. Multi-turn
+        trajectory persistence via native --conversation prevents hitting the
+        single-turn limit.
 
         Overrides: ``HERMES_ANTIGRAVITY_CONTEXT_LENGTH`` /
         ``ANTIGRAVITY_CONTEXT_LENGTH`` set one global value;
         ``HERMES_ANTIGRAVITY_CONTEXT_LENGTHS`` /
         ``ANTIGRAVITY_CONTEXT_LENGTHS`` take a JSON object mapping a model
         name or family prefix (e.g. ``"gemini-4-argon"``) to a token count.
-        The global override wins over the per-model table. Declaring more
-        than ~56k model-visible tokens per turn opts into agy's silent
-        head-kept truncation.
+        The global override wins over the per-model table.
         """
         env_val = os.environ.get("HERMES_ANTIGRAVITY_CONTEXT_LENGTH") or os.environ.get("ANTIGRAVITY_CONTEXT_LENGTH")
         if env_val:
