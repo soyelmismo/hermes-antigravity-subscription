@@ -39,13 +39,28 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
-# Single-turn prompt ceiling measured against agy 1.x (issue #49): the CLI
-# silently truncates a Gemini-route prompt at ~75,800 input tokens, keeps the
-# head and drops the tail, and reports no error. In an agent loop the tail is
-# the fresh tool output, so Hermes must compact before agy starts discarding
-# it. Claude routes accepted >122k input with no observed cap below the
-# compiled multi-turn trajectory threshold, so they keep the full default.
+# Single-message prompt ceiling measured against agy 1.x (issue #49): the CLI
+# silently truncates one Gemini-route user message (first seen at ~75,800
+# input tokens; later fillers point at a ~190k-character cut), keeps the head
+# and drops the tail, and reports no error. Full sends that do
+# not fit one message are split into consecutive turns of one conversation
+# (prompt._format_messages_as_segments), which lifts that ceiling.
+#
+# The conversation itself has a second, larger bound. Measured with agy
+# 1.5.15 + gemini-4-neon-low: eleven ~56k-token turns in one stream-json
+# process raised no error (no max_trajectory_tokens), but once a turn
+# reported a context above ~512k (518,207 after turn 9; 462,145 after turn 8
+# did not), the next turn ran agy's checkpointer first: a summary call, after
+# which the context dropped from ~592k to ~73k. The agy binary carries
+# checkpointer configs with max_token_limit 128000 / 256000 / 512000. Hermes
+# must compact before agy summarizes on its own, so Gemini routes declare
+# 512,000 minus 32,768 output reserve (the checkpointer's own
+# max_output_tokens) minus ~19k margin for the next turn's delta.
+#
+# With splitting disabled (HERMES_ANTIGRAVITY_SEGMENT_WEIGHT=0) a full send is
+# one message again, so the single-message ceiling applies.
 _GEMINI_SINGLE_TURN_CONTEXT = 75_000
+_GEMINI_CONTEXT_LENGTH = 460_000
 _DEFAULT_CONTEXT_LENGTH = 239_000
 _CONTEXT_LENGTH_OVERRIDE_VARS = (
     "HERMES_ANTIGRAVITY_CONTEXT_LENGTHS",
@@ -80,11 +95,12 @@ def _context_length_overrides() -> dict[str, int]:
 
 
 def resolve_context_length(model: str) -> int:
-    """Single-turn context length for *model*, per-family where measured.
+    """Context length for *model*, per-family where measured.
 
-    Exact-name overrides beat family overrides; the measured Gemini ceiling
-    (75k, head-kept truncation) applies to every ``gemini-*`` route, effort
-    suffixes included.
+    Exact-name overrides beat family overrides. Every ``gemini-*`` route,
+    effort suffixes included, declares 460k (below agy's ~512k checkpoint)
+    while full sends are split into parts, and the 75k single-message
+    ceiling when splitting is disabled.
     """
     base, _effort = split_effort_suffix(model.strip().lower())
     overrides = _context_length_overrides()
@@ -92,8 +108,21 @@ def resolve_context_length(model: str) -> int:
         if name and name in overrides:
             return overrides[name]
     if base.startswith("gemini"):
+        if _full_send_splitting_enabled(base):
+            return _GEMINI_CONTEXT_LENGTH
         return _GEMINI_SINGLE_TURN_CONTEXT
     return _DEFAULT_CONTEXT_LENGTH
+
+
+def _full_send_splitting_enabled(model: str) -> bool:
+    try:
+        from .prompt import full_send_segment_budget
+    except ImportError:
+        try:
+            from prompt import full_send_segment_budget
+        except ImportError:
+            return False
+    return full_send_segment_budget(model) is not None
 
 
 class AntigravitySubscriptionDirectSDKProfile(ProviderProfile):
@@ -166,9 +195,12 @@ class AntigravitySubscriptionDirectSDKProfile(ProviderProfile):
     def get_model_context_length(self, model: str) -> int | None:
         """Declared context window for Antigravity CLI, per model family.
 
-        Gemini routes declare 75,000 tokens: agy 1.x silently truncates a
-        single-turn Gemini prompt at ~75,800 input tokens, keeps the head and
-        drops the tail (issue #49), so Hermes compaction must fire below that.
+        Gemini routes declare 460,000 tokens. agy 1.x silently truncates a
+        single Gemini user message at ~75,800 input tokens (issue #49), so
+        full sends are split into consecutive turns of one conversation; the
+        conversation runs agy's own checkpoint summary once a turn reports
+        more than ~512k, so Hermes compaction must fire below that. With
+        splitting disabled the 75,000 single-message ceiling applies again.
         Claude routes have no observed single-turn cap under the compiled
         trajectory threshold and keep the 239,000 default (239,616 tokens /
         256k - 16k output tokens). Multi-turn trajectory persistence via
