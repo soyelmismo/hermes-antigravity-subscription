@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import base64
 import http.server
+import json
 import os
 import sys
 import tempfile
@@ -394,54 +395,93 @@ class NativeMediaRootsTests(unittest.TestCase):
 
 
 class NativeMediaToolInfoPathTests(unittest.TestCase):
-    def test_tool_info_regex_extracts_windows_drive_paths(self):
-        import stream as agy_stream
+    """soyelmismo/hermes-antigravity-subscription#58: Windows media-attach reads."""
 
-        info = (
-            r"read_file C:\Users\u\AppData\Local\hermes\cache\agy_media\a.jpg"
-            " and C:/Users/u/AppData/Local/hermes/cache/agy_media/b.png"
-        )
-        found = agy_stream._TOOL_INFO_PATH_RE.findall(info)
-        self.assertIn(r"C:\Users\u\AppData\Local\hermes\cache\agy_media\a.jpg", found)
-        self.assertIn("C:/Users/u/AppData/Local/hermes/cache/agy_media/b.png", found)
-
-    def test_tool_info_regex_still_extracts_posix_paths(self):
-        import stream as agy_stream
-
-        found = agy_stream._TOOL_INFO_PATH_RE.findall(
-            "read_file /home/u/.hermes/cache/agy_media/a.jpg"
-        )
-        self.assertEqual(found, ["/home/u/.hermes/cache/agy_media/a.jpg"])
-
-    @unittest.skipUnless(os.name == "nt", "Windows path semantics")
-    def test_windows_media_cache_read_is_permitted(self):
+    def setUp(self):
         import types
 
         import stream as agy_stream
 
-        with tempfile.TemporaryDirectory() as home:
-            module = types.ModuleType("hermes_constants")
-            setattr(module, "get_hermes_home", lambda: home)
-            saved = sys.modules.get("hermes_constants")
-            sys.modules["hermes_constants"] = module
-            try:
-                target = os.path.join(home, "cache", "agy_media", "a.jpg")
-                # Both separators and a different drive-letter/segment case.
-                for spelling in (target, target.replace("\\", "/"), target.lower()):
-                    self.assertTrue(
-                        agy_stream._path_is_native_media_target(spelling, set()),
-                        spelling,
-                    )
-                self.assertFalse(
-                    agy_stream._path_is_native_media_target(
-                        os.path.join(os.path.expanduser("~"), ".ssh", "id.jpg"), set()
-                    )
-                )
-            finally:
-                if saved is not None:
-                    sys.modules["hermes_constants"] = saved
-                else:
-                    sys.modules.pop("hermes_constants", None)
+        self.stream = agy_stream
+        self._tmp = tempfile.TemporaryDirectory()
+        self.home = self._tmp.name
+        module = types.ModuleType("hermes_constants")
+        setattr(module, "get_hermes_home", lambda: self.home)
+        self._saved = sys.modules.get("hermes_constants")
+        sys.modules["hermes_constants"] = module
+        self.media = os.path.join(self.home, "cache", "agy_media", "First Last (1) é.jpg")
+        self.secret = os.path.join(os.path.expanduser("~"), ".hermes", "auth.json")
+
+    def tearDown(self):
+        if self._saved is not None:
+            sys.modules["hermes_constants"] = self._saved
+        else:
+            sys.modules.pop("hermes_constants", None)
+        self._tmp.cleanup()
+
+    def _permitted(self, tool_info, tool_name="read_file"):
+        from types import SimpleNamespace
+
+        holder = SimpleNamespace(_media_paths=set())
+        return self.stream.AntigravityStream._is_permitted_native_media_step(
+            holder, tool_name, tool_info
+        )
+
+    # Structured tool_info: the shape agy actually sends.
+    def test_structured_tool_info_keeps_spaces_parens_and_unicode(self):
+        info = {"name": "read_file", "parameters": {"Path": self.media}}
+        self.assertEqual(self.stream._tool_info_paths(info), [self.media])
+        self.assertTrue(self._permitted(info))
+
+    def test_json_and_dict_repr_strings_are_parsed(self):
+        info = {"name": "read_file", "parameters": {"Path": self.media}}
+        self.assertTrue(self._permitted(json.dumps(info)))
+        self.assertTrue(self._permitted(repr(info)))
+
+    def test_bare_absolute_path_string_is_taken_whole(self):
+        self.assertEqual(self.stream._tool_info_paths(self.media), [self.media])
+        self.assertTrue(self._permitted(self.media))
+
+    # Multi-path steps: every candidate must pass (all, not any).
+    def test_one_disallowed_path_denies_the_step(self):
+        info = {"name": "read_file", "parameters": {"Path": self.media, "Other": self.secret}}
+        self.assertFalse(self._permitted(info))
+        self.assertFalse(self._permitted(f"read_file {self.media.replace(' ', '_')} {self.secret}"))
+
+    def test_no_candidate_and_non_media_tools_are_denied(self):
+        self.assertFalse(self._permitted({"name": "read_file", "parameters": {"Path": "rel/a.jpg"}}))
+        self.assertFalse(self._permitted(""))
+        self.assertFalse(self._permitted(None))
+        self.assertFalse(self._permitted({"parameters": {"Path": self.media}}, tool_name="run_command"))
+
+    # Free-form fallback regex: drive paths, POSIX paths, anchored.
+    def test_regex_extracts_windows_and_posix_absolute_paths(self):
+        found = self.stream._TOOL_INFO_PATH_RE.findall(
+            r"read C:\Users\u\cache\a.jpg C:/Users/u/cache/b.png /home/u/.hermes/cache/c.jpg"
+        )
+        self.assertEqual(
+            found,
+            [r"C:\Users\u\cache\a.jpg", "C:/Users/u/cache/b.png", "/home/u/.hermes/cache/c.jpg"],
+        )
+
+    def test_regex_does_not_match_inside_relative_paths(self):
+        self.assertEqual(self.stream._TOOL_INFO_PATH_RE.findall("relative/tmp/x.png"), [])
+        self.assertEqual(self.stream._TOOL_INFO_PATH_RE.findall(r"foo\bar"), [])
+        self.assertFalse(self._permitted("read_file relative/tmp/x.png"))
+
+    # Root prefix check.
+    def test_filesystem_root_media_root_matches_children(self):
+        root = os.path.abspath(os.sep)  # "C:\\" on Windows, "/" on POSIX
+        child = os.path.join(root, "agy-test-child", "a.jpg")
+        with patch.object(self.stream, "_native_media_roots", return_value=(root,)):
+            self.assertTrue(self.stream._path_is_native_media_target(child, set()))
+
+    @unittest.skipUnless(os.name == "nt", "Windows path semantics")
+    def test_windows_separators_and_case_are_equivalent(self):
+        for spelling in (self.media, self.media.replace("\\", "/"), self.media.lower()):
+            self.assertTrue(self.stream._path_is_native_media_target(spelling, set()), spelling)
+        outside = os.path.join(os.path.expanduser("~"), ".ssh", "id.jpg")
+        self.assertFalse(self.stream._path_is_native_media_target(outside, set()))
 
 
 if __name__ == "__main__":
