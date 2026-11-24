@@ -66,6 +66,7 @@ try:
         _is_plugin_owned_media_path,
         media_reference_paths,
     )
+    from .custom_agent import custom_agent_args
     from .delivery import DeliveryWatch
     from .stream import AntigravityStream, collect_stream_completion
     from .debug import dump_prompt_debug
@@ -106,6 +107,7 @@ except ImportError:
         _is_plugin_owned_media_path,
         media_reference_paths,
     )
+    from custom_agent import custom_agent_args
     from delivery import DeliveryWatch
     from stream import AntigravityStream, collect_stream_completion
     from debug import dump_prompt_debug
@@ -494,6 +496,13 @@ class AntigravityClient:
     ) -> tuple[str, str | None]:
         return resolve_model_and_effort(model, reasoning_effort)
 
+    def _agent_args(self) -> list[str]:
+        if any(arg == "--agent" or arg.startswith("--agent=") for arg in self._args):
+            return []  # ANTIGRAVITY_ARGS already names an agent; agy takes one.
+        # Asked at every spawn, not once: a rejected agent is dropped for the
+        # rest of the process, and the retry must already spawn without it.
+        return custom_agent_args(self._command, self._isolated_home)
+
     def _child_env(self) -> dict[str, str]:
         return build_child_env(self._isolated_home)
 
@@ -878,7 +887,7 @@ class AntigravityClient:
             # stale copy ("You are not logged into Antigravity").
             sync_isolated_token(self._isolated_home)
 
-            cmd_args = [self._command, "--input-format", "stream-json", *self._args]
+            cmd_args = [self._command, "--input-format", "stream-json", *self._args, *self._agent_args()]
             if conversation_id:
                 cmd_args.extend(["--conversation", conversation_id])
             if model:
@@ -951,7 +960,7 @@ class AntigravityClient:
             model=model,
             messages=messages,
         )
-        cmd_args = [self._command, *self._args]
+        cmd_args = [self._command, *self._args, *self._agent_args()]
         if model:
             cmd_args.extend(["--model", model])
         if effort:
