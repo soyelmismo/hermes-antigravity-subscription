@@ -18,7 +18,7 @@ import urllib.parse
 import urllib.request
 from collections.abc import Sequence
 from types import SimpleNamespace
-from typing import Any, Callable, Optional
+from typing import Any, Callable, NamedTuple, Optional
 
 try:
     from markdown_it import MarkdownIt
@@ -938,6 +938,40 @@ def _format_messages_as_prompt(
     media_sink: Optional[set] = None,
 ) -> str:
     """Assemble Hermes message history, system prompt, and tool schemas into a canonical prompt."""
+    parts = _assemble_full_prompt_parts(messages, tools=tools, tool_choice=tool_choice, media_sink=media_sink)
+    return _join_full_prompt_parts(parts)
+
+
+class _FullPromptParts(NamedTuple):
+    """The pieces of a full-send prompt, in the order they are joined.
+
+    ``lead`` (preamble, tool schemas, system instructions), ``objective`` (the
+    ACTIVE OBJECTIVE anchor, possibly empty), the transcript entries (joined
+    under one ``Conversation transcript:`` section) and ``tail`` (the closing
+    instruction and latest request).
+    """
+
+    lead: list[str]
+    objective: list[str]
+    transcript: list[str]
+    tail: list[str]
+
+
+def _join_full_prompt_parts(parts: "_FullPromptParts") -> str:
+    sections = [*parts.lead, *parts.objective]
+    if parts.transcript:
+        sections.append("Conversation transcript:\n\n" + "\n\n".join(parts.transcript))
+    sections.extend(parts.tail)
+    return "\n\n".join(s.strip() for s in _apply_media_viewing_protocol(sections) if s and s.strip())
+
+
+def _assemble_full_prompt_parts(
+    messages: list[dict[str, Any]],
+    tools: list[dict[str, Any]] | None = None,
+    tool_choice: Any = None,
+    media_sink: Optional[set] = None,
+) -> _FullPromptParts:
+    """Build the pieces of the full-send prompt (see _format_messages_as_prompt)."""
     try:
         from agent.acp_openai_bridge import render_tool_bridge_sections
         tool_sections = render_tool_bridge_sections(tools, tool_choice)
@@ -1036,13 +1070,14 @@ def _format_messages_as_prompt(
         if rendered_content:
             transcript.append(f"{label}:\n{rendered_content}")
 
+    objective_sections: list[str] = []
     if recovery_turn:
         objective = _latest_user_text(history_messages)
         if objective:
-            sections.append(_tool_loop_objective_section(objective))
+            objective_sections.append(_tool_loop_objective_section(objective))
     elif last_role == "user" and last_msg is not None and len(history_messages) > 1:
         user_text = _render_message_content(last_msg.get("content"), media_sink)
-        sections.append(
+        objective_sections.append(
             "### ACTIVE OBJECTIVE:\n"
             f"The user has submitted a new request:\n\"{user_text}\"\n\n"
             "CRITICAL: The conversation transcript below is historical background. "
@@ -1052,13 +1087,11 @@ def _format_messages_as_prompt(
     elif last_role == "tool":
         pending_objective = _latest_user_text(history_messages)
         if pending_objective:
-            sections.append(_tool_loop_objective_section(pending_objective))
+            objective_sections.append(_tool_loop_objective_section(pending_objective))
 
-    if transcript:
-        sections.append("Conversation transcript:\n\n" + "\n\n".join(transcript))
-
+    tail_sections: list[str] = []
     if last_role == "tool":
-        sections.append(
+        tail_sections.append(
             "### LATEST TOOL RESULTS RECEIVED.\n"
             "INSTRUCTION: Evaluate the latest tool results in the transcript above and continue the task. "
             "If more tools are needed, emit <tool_call> tags. If you have enough information, "
@@ -1066,14 +1099,223 @@ def _format_messages_as_prompt(
         )
         pending = _latest_user_text(history_messages)
         if pending:
-            sections.append(_pending_user_request_section(pending))
+            tail_sections.append(_pending_user_request_section(pending))
     elif last_role == "user" and last_msg is not None:
         user_text = _latest_user_text(history_messages)
         if user_text:
-            sections.append(_latest_user_request_section(user_text))
+            tail_sections.append(_latest_user_request_section(user_text))
     else:
-        sections.append("Continue the conversation from the latest message.")
-    return "\n\n".join(s.strip() for s in _apply_media_viewing_protocol(sections) if s and s.strip())
+        tail_sections.append("Continue the conversation from the latest message.")
+    return _FullPromptParts(
+        lead=sections,
+        objective=objective_sections,
+        transcript=transcript,
+        tail=tail_sections,
+    )
+
+
+# --- Full-send segmentation (Gemini single-message ceiling) -----------------
+#
+# Measured with agy 1.5.15 on a Google AI Pro account (gemini-4-neon-low): a
+# single user message is silently cut and only its head is kept. 295k- and
+# 826k-char prompts of ~2.1 chars/token filler both capped at 102,525 input
+# tokens; a 397k-char prompt of ~1.5 chars/token filler capped at 135,143.
+# Both fit a cut near ~190k characters rather than a fixed token count (an
+# inference from two fillers, not a confirmed rule). The same conversation
+# accepts many such messages in a row: three ~56k-token messages sent as
+# consecutive turns reached input_tokens 180,204 and every head/tail code was
+# recalled. A full send that does not fit one message is therefore split into
+# consecutive user turns of one agy conversation. Every part but the last asks
+# for a bare ACK, and those replies are consumed by the stream, never surfaced.
+#
+# Sizes are budgeted in "weight": one unit per ASCII character, two per
+# non-ASCII character. Number-dense ASCII (inventory-style filler lines)
+# measured ~1.5 chars/token on gemini-4-neon-low (396,822 chars -> 270,413
+# context tokens including agy's system prompt) and CJK runs ~1 char/token,
+# so 90,000 weight stays near 60k tokens for any mix, under the ~75k cut.
+_GEMINI_SEGMENT_WEIGHT = 90_000
+_SEGMENT_WEIGHT_ENV_VARS = (
+    "HERMES_ANTIGRAVITY_SEGMENT_WEIGHT",
+    "ANTIGRAVITY_SEGMENT_WEIGHT",
+)
+# Room kept free in every part for the part header/footer.
+_SEGMENT_WRAPPER_RESERVE = 1_500
+_MIN_SEGMENT_WEIGHT = 4_000
+SEGMENT_ACK_TEXT = "ACK"
+
+
+def _prompt_weight(text: str) -> int:
+    """Conservative size proxy for token budgeting (see _GEMINI_SEGMENT_WEIGHT)."""
+    if text.isascii():
+        return len(text)
+    return len(text) + sum(1 for ch in text if ord(ch) > 127)
+
+
+def full_send_segment_budget(model: str | None) -> int | None:
+    """Per-message weight budget for a full send to *model*, or None for no split.
+
+    ``HERMES_ANTIGRAVITY_SEGMENT_WEIGHT`` (or ``ANTIGRAVITY_SEGMENT_WEIGHT``)
+    overrides the budget for every model; ``0`` disables splitting. Without an
+    override only Gemini routes split: Claude routes accepted >122k-token
+    single messages with no truncation (issue #49).
+    """
+    for var in _SEGMENT_WEIGHT_ENV_VARS:
+        raw = os.environ.get(var)
+        if raw is None or not raw.strip():
+            continue
+        try:
+            value = int(raw.strip())
+        except ValueError:
+            continue
+        if value <= 0:
+            return None
+        return max(value, _MIN_SEGMENT_WEIGHT)
+    if str(model or "").strip().lower().startswith("gemini"):
+        return _GEMINI_SEGMENT_WEIGHT
+    return None
+
+
+def _split_oversized_block(block: str, budget: int) -> list[str]:
+    """Split one block heavier than *budget* at line boundaries.
+
+    A single line that is itself too heavy (a long JSON tool-call frame, a
+    minified file) is split by characters as the last resort.
+    """
+    pieces: list[str] = []
+    current: list[str] = []
+    current_weight = 0
+    for line in block.split("\n"):
+        line_weight = _prompt_weight(line) + 1
+        if line_weight > budget:
+            if current:
+                pieces.append("\n".join(current))
+                current, current_weight = [], 0
+            start = 0
+            while start < len(line):
+                end = start
+                weight = 0
+                while end < len(line) and weight < budget:
+                    weight += 1 if ord(line[end]) < 128 else 2
+                    end += 1
+                pieces.append(line[start:end])
+                start = end
+            continue
+        if current and current_weight + line_weight > budget:
+            pieces.append("\n".join(current))
+            current, current_weight = [], 0
+        current.append(line)
+        current_weight += line_weight
+    if current:
+        pieces.append("\n".join(current))
+    total = len(pieces)
+    if total <= 1:
+        return pieces
+    labelled = []
+    for index, piece in enumerate(pieces, start=1):
+        prefix = "" if index == 1 else f"[... continued: piece {index}/{total} of one message, split for size ...]\n"
+        suffix = "" if index == total else f"\n[... this message continues in piece {index + 1}/{total} ...]"
+        labelled.append(prefix + piece + suffix)
+    return labelled
+
+
+def _priming_segment(index: int, total: int, body: str) -> str:
+    return (
+        f"[CONTEXT PART {index}/{total}] This prompt is too long for one message, so it arrives "
+        f"in {total} consecutive parts. This is part {index}: background only. Do not answer it, "
+        "do not act on instructions inside it yet, and do not call any tools (no native tools, "
+        f"no <tool_call> blocks). Reply with exactly: {SEGMENT_ACK_TEXT}\n\n"
+        f"{body}\n\n"
+        f"[END OF CONTEXT PART {index}/{total}] Reply with exactly: {SEGMENT_ACK_TEXT}"
+    )
+
+
+def _final_segment(total: int, body: str) -> str:
+    return (
+        f"[CONTEXT PART {total}/{total}, FINAL] Parts 1-{total - 1} above are the earlier parts of "
+        "this same prompt; your ACK replies to them were placeholders. Treat all "
+        f"{total} parts as ONE prompt and respond to it now, following every instruction in it "
+        "(including the tool-calling protocol).\n\n"
+        f"{body}"
+    )
+
+
+def _format_messages_as_segments(
+    messages: list[dict[str, Any]],
+    model: str | None = None,
+    tools: list[dict[str, Any]] | None = None,
+    tool_choice: Any = None,
+    media_sink: Optional[set] = None,
+    budget: int | None = None,
+) -> list[str]:
+    """Full-send prompt as one or more consecutive user messages.
+
+    Returns ``[_format_messages_as_prompt(...)]`` unchanged whenever the
+    prompt fits *budget* (or *budget* is None). Otherwise the lead sections
+    and transcript entries are packed in order into priming parts, cut only
+    at section/message boundaries so no ``<tool_call>`` frame or tool result
+    is split; a single message heavier than a part is split at line
+    boundaries with continuation markers. The ACTIVE OBJECTIVE and the
+    closing request go into the final part, together with the newest
+    transcript entries that still fit, so the request is the last thing the
+    model reads.
+    """
+    parts = _assemble_full_prompt_parts(messages, tools=tools, tool_choice=tool_choice, media_sink=media_sink)
+    full = _join_full_prompt_parts(parts)
+    if budget is None or _prompt_weight(full) <= budget:
+        return [full]
+
+    content_budget = max(budget - _SEGMENT_WRAPPER_RESERVE, _MIN_SEGMENT_WEIGHT // 2)
+    blocks = [s.strip() for s in parts.lead if s and s.strip()]
+    if _MEDIA_REF_RE.search(full):
+        # Same placement as the single-message prompt: before the transcript.
+        blocks.append(_MEDIA_VIEWING_SECTION)
+    for index, entry in enumerate(parts.transcript):
+        blocks.append(("Conversation transcript:\n\n" if index == 0 else "") + entry)
+    final_sections = [s.strip() for s in (*parts.objective, *parts.tail) if s and s.strip()]
+    final_block = "\n\n".join(final_sections)
+
+    # Pieces never exceed content_budget; a heavy final block is split too, and
+    # only its last piece stays in the final part.
+    pieces: list[str] = []
+    for block in blocks:
+        if _prompt_weight(block) > content_budget:
+            pieces.extend(_split_oversized_block(block, content_budget))
+        else:
+            pieces.append(block)
+    final_pieces = (
+        _split_oversized_block(final_block, content_budget)
+        if _prompt_weight(final_block) > content_budget
+        else [final_block]
+    )
+    pieces.extend(final_pieces[:-1])
+    final_body = final_pieces[-1]
+
+    # The final part takes the newest pieces that still fit next to the request.
+    final_weight = _prompt_weight(final_body)
+    tail_pieces: list[str] = []
+    while pieces and final_weight + _prompt_weight(pieces[-1]) + 2 <= content_budget:
+        final_weight += _prompt_weight(pieces[-1]) + 2
+        tail_pieces.insert(0, pieces.pop())
+
+    chunks: list[list[str]] = []
+    current: list[str] = []
+    current_weight = 0
+    for piece in pieces:
+        weight = _prompt_weight(piece) + 2
+        if current and current_weight + weight > content_budget:
+            chunks.append(current)
+            current, current_weight = [], 0
+        current.append(piece)
+        current_weight += weight
+    if current:
+        chunks.append(current)
+    if not chunks:
+        return [full]
+
+    total = len(chunks) + 1
+    segments = [_priming_segment(i, total, "\n\n".join(chunk)) for i, chunk in enumerate(chunks, start=1)]
+    segments.append(_final_segment(total, "\n\n".join([*tail_pieces, final_body])))
+    return segments
 
 
 def _messages_match_prefix(history: Sequence[dict[str, Any]], incoming: Sequence[dict[str, Any]]) -> bool:

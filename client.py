@@ -59,11 +59,13 @@ try:
         _format_delta_prompt,
         _latest_user_text,
         _format_messages_as_prompt,
+        _format_messages_as_segments,
         _longest_tool_call_prefix_match,
         _messages_match_prefix,
         _parse_tool_block,
         _render_message_content,
         _is_plugin_owned_media_path,
+        full_send_segment_budget,
         media_reference_paths,
     )
     from .delivery import DeliveryWatch
@@ -99,11 +101,13 @@ except ImportError:
         _format_delta_prompt,
         _latest_user_text,
         _format_messages_as_prompt,
+        _format_messages_as_segments,
         _longest_tool_call_prefix_match,
         _messages_match_prefix,
         _parse_tool_block,
         _render_message_content,
         _is_plugin_owned_media_path,
+        full_send_segment_budget,
         media_reference_paths,
     )
     from delivery import DeliveryWatch
@@ -264,6 +268,7 @@ __all__ = [
     "_format_delta_prompt",
     "_latest_user_text",
     "_format_messages_as_prompt",
+    "_format_messages_as_segments",
     "_kill_process_tree",
     "_longest_tool_call_prefix_match",
     "_messages_match_prefix",
@@ -927,6 +932,47 @@ class AntigravityClient:
             self._arm_idle_timer_locked()
             return proc
 
+    def _full_send_segments(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        model: str,
+        tools: list[dict[str, Any]] | None,
+        tool_choice: Any,
+        branch: str,
+    ) -> list[str]:
+        """Full-send prompt as consecutive user messages (one when it fits).
+
+        Gemini routes silently cut a single long user message and keep only
+        its head, so a full send heavier than the per-message budget is
+        split into parts sent as consecutive turns of one agy conversation
+        (see prompt._format_messages_as_segments).
+        """
+        segments = _format_messages_as_segments(
+            messages,
+            model=model,
+            tools=tools,
+            tool_choice=tool_choice,
+            media_sink=self._materialized_media,
+            budget=full_send_segment_budget(model),
+        )
+        if len(segments) > 1:
+            logger.info(
+                "Antigravity full send split into %d parts (%d chars) for %s",
+                len(segments),
+                sum(len(seg) for seg in segments),
+                model,
+            )
+        dump_prompt_debug(
+            prompt=segments[0] if len(segments) == 1 else "\n\n".join(
+                f"===== PART {i}/{len(segments)} =====\n{seg}" for i, seg in enumerate(segments, start=1)
+            ),
+            branch=branch,
+            model=model,
+            messages=messages,
+        )
+        return segments
+
     def _run_oneshot_completion(
         self,
         *,
@@ -938,20 +984,16 @@ class AntigravityClient:
         tool_choice: Any,
         stream: bool,
     ) -> Any:
-        prompt_text = _format_messages_as_prompt(
-            messages,
-            model=model,
-            tools=tools,
-            tool_choice=tool_choice,
-            media_sink=self._materialized_media,
+        segments = self._full_send_segments(
+            messages, model=model, tools=tools, tool_choice=tool_choice, branch="oneshot"
         )
-        dump_prompt_debug(
-            prompt=prompt_text,
-            branch="oneshot",
-            model=model,
-            messages=messages,
-        )
+        prompt_text = segments[0]
+        segmented = len(segments) > 1
         cmd_args = [self._command, *self._args]
+        if segmented:
+            # Parts go in as consecutive turns of this one process, which
+            # needs NDJSON input for more than one turn.
+            cmd_args[1:1] = ["--input-format", "stream-json"]
         if model:
             cmd_args.extend(["--model", model])
         if effort:
@@ -982,9 +1024,14 @@ class AntigravityClient:
         try:
             self._raise_if_cancelled()
             if proc.stdin:
-                proc.stdin.write(prompt_text + "\n")
-                proc.stdin.flush()
-                proc.stdin.close()
+                if segmented:
+                    event_msg = {"event": "user", "message": {"content": prompt_text}}
+                    proc.stdin.write(json.dumps(event_msg) + "\n")
+                    proc.stdin.flush()
+                else:
+                    proc.stdin.write(prompt_text + "\n")
+                    proc.stdin.flush()
+                    proc.stdin.close()
         except OSError:
             self._raise_if_cancelled()
         self._raise_if_cancelled()
@@ -1003,6 +1050,8 @@ class AntigravityClient:
             # Oneshots run concurrently when the worker is busy. They have no
             # comparable prior sample and must not mutate the worker watch.
             delivery_watch=None,
+            followup_segments=segments[1:],
+            close_stdin_after_segments=True,
         )
         if stream:
             return stream_iter
@@ -1072,6 +1121,7 @@ class AntigravityClient:
                     conv_id_to_resume = self._worker_conversation_id if is_continuation else None
 
                 comparable_full_send = not is_continuation
+                followup_segments: list[str] = []
                 if is_continuation:
                     proc = self._get_or_spawn_worker(
                         resolved_model, effort, conversation_id=conv_id_to_resume
@@ -1094,19 +1144,14 @@ class AntigravityClient:
                             self._terminate_worker_locked(keep_conversation=False)
                             self._purge_isolated_conversations()
                     proc = self._get_or_spawn_worker(resolved_model, effort, conversation_id=None)
-                    prompt_payload = _format_messages_as_prompt(
+                    segments = self._full_send_segments(
                         messages_list,
                         model=resolved_model,
                         tools=tools,
                         tool_choice=tool_choice,
-                        media_sink=self._materialized_media,
-                    )
-                    dump_prompt_debug(
-                        prompt=prompt_payload,
                         branch="full",
-                        model=resolved_model,
-                        messages=messages_list,
                     )
+                    prompt_payload, followup_segments = segments[0], segments[1:]
 
                 event_msg = {"event": "user", "message": {"content": prompt_payload}}
                 try:
@@ -1120,19 +1165,14 @@ class AntigravityClient:
                         self._terminate_worker_locked(keep_conversation=False)
                         self._purge_isolated_conversations()
                     proc = self._get_or_spawn_worker(resolved_model, effort, conversation_id=None)
-                    prompt_payload = _format_messages_as_prompt(
+                    segments = self._full_send_segments(
                         messages_list,
                         model=resolved_model,
                         tools=tools,
                         tool_choice=tool_choice,
-                        media_sink=self._materialized_media,
-                    )
-                    dump_prompt_debug(
-                        prompt=prompt_payload,
                         branch="retry",
-                        model=resolved_model,
-                        messages=messages_list,
                     )
+                    prompt_payload, followup_segments = segments[0], segments[1:]
                     event_msg = {"event": "user", "message": {"content": prompt_payload}}
                     self._raise_if_cancelled()
                     proc.stdin.write(json.dumps(event_msg) + "\n")
@@ -1154,6 +1194,7 @@ class AntigravityClient:
                     prompt_chars=len(prompt_payload),
                     delivery_watch=self._delivery_watch if comparable_full_send else None,
                     delivery_sample_key=f"{resolved_model}:{effort}",
+                    followup_segments=followup_segments,
                 )
                 if stream:
                     return stream_iter
@@ -1180,8 +1221,13 @@ class AntigravityClient:
                     sync_isolated_token(self._isolated_home)
                     with self._lock:
                         self._terminate_worker_locked(keep_conversation=True)
+                    # A segmented full send restarts from part 1 in a fresh
+                    # conversation: the failed attempt may have left any
+                    # number of parts in the old one.
                     proc = self._get_or_spawn_worker(
-                        resolved_model, effort, conversation_id=self._worker_conversation_id
+                        resolved_model,
+                        effort,
+                        conversation_id=None if followup_segments else self._worker_conversation_id,
                     )
                     event_msg = {"event": "user", "message": {"content": prompt_payload}}
                     try:
@@ -1207,6 +1253,7 @@ class AntigravityClient:
                         prompt_chars=len(prompt_payload),
                         delivery_watch=self._delivery_watch if comparable_full_send else None,
                         delivery_sample_key=f"{resolved_model}:{effort}",
+                        followup_segments=followup_segments,
                     )
                 try:
                     self._raise_if_cancelled()

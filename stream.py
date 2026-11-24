@@ -226,6 +226,8 @@ class AntigravityStream(Iterator[Any]):
         prompt_chars: int = 0,
         delivery_watch: Any = None,
         delivery_sample_key: str = "",
+        followup_segments: list[str] | None = None,
+        close_stdin_after_segments: bool = False,
     ):
         # Loud pairing, not a defaulted bool (review nit): a future site
         # passing worker_lock WITHOUT worker_lock_held would silently never
@@ -273,6 +275,23 @@ class AntigravityStream(Iterator[Any]):
         # Worker deltas and concurrent oneshots must never share samples.
         self.delivery_watch = delivery_watch
         self.delivery_sample_key = delivery_sample_key
+        # Segmented full send (prompt._format_messages_as_segments): the
+        # caller already wrote part 1; every result that arrives while parts
+        # remain is a priming ACK. It is consumed here, never yielded, and
+        # the next part is written. Oneshots close stdin after the last part.
+        self._pending_segments: list[str] = list(followup_segments or [])
+        self._segment_total = len(self._pending_segments) + 1
+        # The final call's input spans every part, so the delivery check
+        # (issue #29) compares it against the size of all parts together.
+        self.prompt_chars += sum(len(seg) for seg in self._pending_segments)
+        self._segments_acked = 0
+        self._close_stdin_after_segments = bool(close_stdin_after_segments)
+        # Oneshot processes start with fresh counters but report cumulative
+        # usage across their own turns, so a segmented oneshot needs a private
+        # baseline to report only the final call. Workers use usage_baseline.
+        self._segment_usage_baseline: dict[str, int] | None = (
+            {} if self._pending_segments and not is_worker else None
+        )
         self.conversation_id = ""
         self._closed = False
         self._interrupted = False
@@ -663,6 +682,82 @@ class AntigravityStream(Iterator[Any]):
                 return ""
         return ""
 
+    def _check_priming_step(self, step: dict[str, Any]) -> None:
+        """Verdict on a step_update of a priming turn; discards everything else.
+
+        A priming part asks for a bare ACK, so the only step that can matter
+        is a native tool step. The media-attach read stays allowed (history
+        may reference media); any other native tool aborts the request the
+        same way a normal turn neutralizes it, but as an error: no answer
+        exists yet that could carry the explanation.
+        """
+        if step.get("step_type") != "tool":
+            return
+        tool_name = str(step.get("tool_name") or "")
+        if self._is_permitted_native_media_step(tool_name, str(step.get("tool_info") or "")):
+            logger.info("Antigravity native media attach allowed during context priming: %s", tool_name)
+            return
+        logger.warning(
+            "Antigravity attempted native tool invocation '%s' while priming context part %d/%d; "
+            "aborting the request.",
+            tool_name,
+            self._segments_acked + 1,
+            self._segment_total,
+        )
+        raise RuntimeError(
+            "Antigravity execution failed: native tool invocation "
+            f"'{tool_name}' while priming context part {self._segments_acked + 1}/{self._segment_total}; "
+            "nothing was executed"
+        )
+
+    def _finish_priming_turn(self, res: dict[str, Any]) -> None:
+        """Consume the result of a priming part and send the next part.
+
+        The ACK reply is dropped. Its usage advances the cumulative baseline,
+        so the usage chunk of the final part reports that call alone (whose
+        input already spans every part) rather than the sum of all parts.
+        """
+        part = self._segments_acked + 1
+        status = res.get("status", "")
+        error = res.get("error")
+        if error or status != "SUCCESS":
+            if error:
+                raise RuntimeError(f"Antigravity model error: {error}")
+            raise RuntimeError(
+                "Antigravity execution failed: context priming part "
+                f"{part}/{self._segment_total} ended with status {status!r}"
+            )
+        if self.conversation_id and self.is_worker and self.client and hasattr(self.client, "_set_worker_conversation_id"):
+            self.client._set_worker_conversation_id(self.conversation_id)
+        usage = res.get("usage")
+        baseline = self.usage_baseline if self.is_worker else self._segment_usage_baseline
+        if isinstance(usage, dict) and baseline is not None:
+            _delta_worker_usage(usage, baseline)
+        self._segments_acked = part
+        segment = self._pending_segments.pop(0)
+        logger.info(
+            "Antigravity context part %d/%d acknowledged; sending part %d (%d chars)",
+            part,
+            self._segment_total,
+            part + 1,
+            len(segment),
+        )
+        self._raise_if_cancelled()
+        try:
+            stdin = self.proc.stdin
+            if stdin is None:
+                raise OSError("stdin is not available")
+            stdin.write(json.dumps({"event": "user", "message": {"content": segment}}) + "\n")
+            stdin.flush()
+            if not self._pending_segments and self._close_stdin_after_segments:
+                stdin.close()
+        except (BrokenPipeError, OSError, ValueError) as exc:
+            self._raise_if_cancelled()
+            raise RuntimeError(
+                "Antigravity execution failed: could not send context part "
+                f"{part + 1}/{self._segment_total}: {exc}"
+            ) from exc
+
     def _stream_generator(self) -> Iterator[Any]:
         deadline = time.monotonic() + self.timeout
         text_buffer = ""
@@ -797,6 +892,11 @@ class AntigravityStream(Iterator[Any]):
                     step = event.get("step_update", {})
                     if not self.conversation_id:
                         self.conversation_id = step.get("conversation_id", "")
+                    if self._pending_segments:
+                        # Priming turn: its ACK text is discarded, never
+                        # yielded; only native tool steps need a verdict.
+                        self._check_priming_step(step)
+                        continue
                     if step.get("step_type") == "tool":
                         tool_name = str(step.get("tool_name") or "")
                         if self._is_permitted_native_media_step(
@@ -933,6 +1033,12 @@ class AntigravityStream(Iterator[Any]):
                     res = event.get("result", {})
                     if not self.conversation_id:
                         self.conversation_id = res.get("conversation_id", "")
+                    if self._pending_segments:
+                        self._finish_priming_turn(res)
+                        # Each part is its own model call: the read budget
+                        # restarts with it, as it would for separate turns.
+                        deadline = time.monotonic() + self.timeout
+                        continue
                     if self.conversation_id and self.is_worker and self.client and hasattr(self.client, "_set_worker_conversation_id"):
                         self.client._set_worker_conversation_id(self.conversation_id)
                     status = res.get("status", "")
@@ -985,6 +1091,10 @@ class AntigravityStream(Iterator[Any]):
                 if last_stdout_at is not None
                 else ", no stdout received"
             )
+            if self._pending_segments:
+                stop_detail += (
+                    f", while priming context part {self._segments_acked + 1}/{self._segment_total}"
+                )
             # A stream that ends inside a <tool_call> frame was truncated.
             # The old flush then re-emitted the raw block as assistant text
             # and sealed the turn with finish_reason="stop", presenting a
@@ -1203,6 +1313,10 @@ class AntigravityStream(Iterator[Any]):
             # baseline must not wait for that chunk or the next turn's delta
             # absorbs them. There is no yield between this computation and
             # the finish-reason yield, so chunk emission order is unchanged.
+            if self._segment_usage_baseline is not None and usage_data:
+                # Segmented oneshot: drop the priming turns' share of the
+                # process counters (workers do this via usage_baseline).
+                usage_data = _delta_worker_usage(usage_data, self._segment_usage_baseline)._asdict()
             input_tokens, output_tokens, total_tokens, cached_tokens = self._usage_totals(usage_data)
 
             # Heuristic only (issue #29), restricted to comparable full sends.
