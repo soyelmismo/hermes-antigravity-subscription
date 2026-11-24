@@ -1495,14 +1495,16 @@ def _lenient_json_loads(text: str) -> tuple[Any, dict[str, int]]:
     * a backslash before a character JSON cannot escape (``\\(`` ``\\|``
       ``\\.`` from ``find \\( ... \\)`` or ``grep 'a\\|b'``). JSON gives such a
       sequence no meaning, so the only reading is the literal backslash the
-      shell needs: it is doubled.
+      shell needs: it is doubled. The exception is ``\\'``: JSON does not
+      escape single quotes, so it is a plain ``'`` written by habit and the
+      backslash is dropped.
     * a bare ``"`` inside a string (``f'{"DIR" if d else "FILE"}'``). The
       decoder ends the string there and then fails on the next character.
       The quote that ended the string is escaped and decoding resumes.
 
-    Each fix is driven by the decoder's own error position and only ever
-    inserts one backslash, so every character the model wrote is kept; the
-    result must still decode cleanly. Returns ``(value, fixes)`` and raises
+    Each fix is driven by the decoder's own error position and touches one
+    backslash (inserted, or dropped for ``\\'``); every other character the
+    model wrote is kept, and the result must still decode cleanly. Returns ``(value, fixes)`` and raises
     ``ValueError`` when the text cannot be decoded this way. Callers that can
     check the result against a schema must do so: a quote fix can merge two
     keys a missing comma separated.
@@ -1518,7 +1520,14 @@ def _lenient_json_loads(text: str) -> tuple[Any, dict[str, int]]:
                 slash = pos if pos < len(s) and s[pos] == "\\" else s.rfind("\\", 0, pos + 1)
                 if slash < 0:
                     raise ValueError(f"{exc.msg} (char {pos})") from None
-                s = s[:slash] + "\\" + s[slash:]
+                if s.startswith("\\'", slash):
+                    # JSON never escapes a single quote; "\'" is the habit of
+                    # languages that do, and means a plain quote. Doubling it
+                    # would hand bash a literal backslash-quote: sed 's/a/b/'
+                    # would become sed \'s/a/b/\'.
+                    s = s[:slash] + s[slash + 1:]
+                else:
+                    s = s[:slash] + "\\" + s[slash:]
                 fixes["escape"] += 1
                 continue
             if exc.msg in _JSON_QUOTE_FIX_ERRORS:

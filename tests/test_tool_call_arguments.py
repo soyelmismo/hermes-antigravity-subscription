@@ -95,6 +95,26 @@ class LenientDecoderTests(unittest.TestCase):
         self.assertEqual(value["command"], "find . \\( -name a \\)")
         self.assertEqual(fixes, {"escape": 2, "quote": 0})
 
+    def test_escaped_single_quote_becomes_a_plain_quote(self):
+        # JSON never escapes "'"; doubling the backslash would hand bash a
+        # literal \' and sed a quoted script. bash -n cannot see that: it
+        # only checks syntax, and \'s/a/b/\' is valid syntax.
+        raw = r'{"command":"sed \'s/\./,/g\' f && echo done"}'
+        args, error = _normalize_tool_arguments("terminal", raw, SCHEMAS)
+        self.assertIsNone(error)
+        self.assertEqual(json.loads(args)["command"], r"sed 's/\./,/g' f && echo done")
+
+    def test_mixed_escapes_keep_shell_meaning(self):
+        raw = r'{"command":"printf \'a.b|c\\n\' | sed \'s/\./,/g\' | grep -c \'a\|z\'"}'
+        args, error = _normalize_tool_arguments("terminal", raw, SCHEMAS)
+        self.assertIsNone(error)
+        command = json.loads(args)["command"]
+        self.assertEqual(command, r"printf 'a.b|c\n' | sed 's/\./,/g' | grep -c 'a\|z'")
+        if shutil.which("bash"):
+            # Run it: a semantic check bash -n cannot make.
+            out = subprocess.run(["bash", "-c", command], capture_output=True, text=True)
+            self.assertEqual(out.stdout.strip(), "1")
+
     def test_bare_quotes_inside_a_string_are_escaped(self):
         value, fixes = _lenient_json_loads('{"command": "python -c "print(1)""}')
         self.assertEqual(value["command"], 'python -c "print(1)"')
