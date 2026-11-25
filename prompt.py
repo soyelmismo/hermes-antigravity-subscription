@@ -1480,12 +1480,144 @@ def _has_unfinished_tool_call_frame(
         cursor = end
 
 
-def _tool_call_from_object(obj: Any, ordinal: int) -> Any | None:
+_JSON_QUOTE_FIX_ERRORS = ("Expecting ',' delimiter", "Expecting ':' delimiter", "Extra data")
+_MAX_JSON_FIXES = 200
+
+
+def _lenient_json_loads(text: str) -> tuple[Any, dict[str, int]]:
+    """Decode JSON a model wrote by hand, fixing two escaping slips.
+
+    Shell commands and Python snippets inside a ``<tool_call>`` defeat models
+    that must escape them for JSON, and for a string-valued ``arguments``
+    twice. Observed on gemini-4-neon (agy 1.5.15), every time with valid JSON
+    around the slip:
+
+    * a backslash before a character JSON cannot escape (``\\(`` ``\\|``
+      ``\\.`` from ``find \\( ... \\)`` or ``grep 'a\\|b'``). JSON gives such a
+      sequence no meaning, so the only reading is the literal backslash the
+      shell needs: it is doubled. The exception is ``\\'``: JSON does not
+      escape single quotes, so it is a plain ``'`` written by habit and the
+      backslash is dropped.
+    * a bare ``"`` inside a string (``f'{"DIR" if d else "FILE"}'``). The
+      decoder ends the string there and then fails on the next character.
+      The quote that ended the string is escaped and decoding resumes.
+
+    Each fix is driven by the decoder's own error position and touches one
+    backslash (inserted, or dropped for ``\\'``); every other character the
+    model wrote is kept, and the result must still decode cleanly. Returns ``(value, fixes)`` and raises
+    ``ValueError`` when the text cannot be decoded this way. Callers that can
+    check the result against a schema must do so: a quote fix can merge two
+    keys a missing comma separated.
+    """
+    fixes = {"escape": 0, "quote": 0}
+    s = text
+    for _ in range(_MAX_JSON_FIXES + 1):
+        try:
+            return json.loads(s, strict=False), fixes
+        except json.JSONDecodeError as exc:
+            pos = exc.pos
+            if exc.msg.startswith(("Invalid \\escape", "Invalid \\uXXXX")):
+                slash = pos if pos < len(s) and s[pos] == "\\" else s.rfind("\\", 0, pos + 1)
+                if slash < 0:
+                    raise ValueError(f"{exc.msg} (char {pos})") from None
+                if s.startswith("\\'", slash):
+                    # JSON never escapes a single quote; "\'" is the habit of
+                    # languages that do, and means a plain quote. Doubling it
+                    # would hand bash a literal backslash-quote: sed 's/a/b/'
+                    # would become sed \'s/a/b/\'.
+                    s = s[:slash] + s[slash + 1:]
+                else:
+                    s = s[:slash] + "\\" + s[slash:]
+                fixes["escape"] += 1
+                continue
+            if exc.msg in _JSON_QUOTE_FIX_ERRORS:
+                quote = s.rfind('"', 0, pos)
+                if quote < 0 or s[quote + 1:pos].strip(" \t\r\n}]"):
+                    raise ValueError(f"{exc.msg} (char {pos})") from None
+                slashes = 0
+                while quote - slashes - 1 >= 0 and s[quote - slashes - 1] == "\\":
+                    slashes += 1
+                if slashes % 2:
+                    raise ValueError(f"{exc.msg} (char {pos})") from None
+                s = s[:quote] + "\\" + s[quote:]
+                fixes["quote"] += 1
+                continue
+            raise ValueError(f"{exc.msg} (char {pos})") from None
+    raise ValueError("too many JSON repairs")
+
+
+def _arguments_fit_schema(args: dict[str, Any], schema: Any) -> str | None:
+    """Why repaired *args* do not fit a tool's JSON schema, or None when they do.
+
+    Only applied to arguments that needed a repair: a quote fix that merged
+    two keys loses one, which shows up as a missing required key or an
+    unknown key.
+    """
+    if not isinstance(schema, dict):
+        return None
+    props = schema.get("properties")
+    required = schema.get("required") or []
+    missing = [key for key in required if isinstance(key, str) and key not in args]
+    if missing:
+        return f"missing required {', '.join(missing)}"
+    if isinstance(props, dict) and schema.get("additionalProperties") is not True:
+        unknown = [key for key in args if key not in props]
+        if unknown:
+            return f"unknown key {', '.join(unknown)}"
+    return None
+
+
+def _normalize_tool_arguments(
+    fn_name: str, fn_args: str, tool_schemas: dict[str, Any] | None
+) -> tuple[str, str | None]:
+    """Validate a string ``arguments`` value; repair it when the model slipped.
+
+    Returns ``(arguments, error)``. Valid JSON passes through byte-identical.
+    Invalid JSON is repaired by :func:`_lenient_json_loads` and re-serialized;
+    when that fails, or the repaired object does not fit the tool's schema,
+    ``error`` says why and the call must not be executed. Hermes would
+    otherwise get the broken string, fail to repair it, and treat the turn as
+    a truncated reply: retried with the same mistake, then failed.
+    """
+    stripped = fn_args.strip()
+    if not stripped:
+        return "{}", None
+    try:
+        json.loads(stripped)
+        return fn_args, None
+    except (json.JSONDecodeError, TypeError, ValueError):
+        pass
+    try:
+        value, fixes = _lenient_json_loads(stripped)
+    except ValueError as exc:
+        return fn_args, f"arguments are not valid JSON ({exc})"
+    if not isinstance(value, dict):
+        return fn_args, "arguments must be a JSON object"
+    schema = (tool_schemas or {}).get(fn_name)
+    misfit = _arguments_fit_schema(value, schema)
+    if misfit:
+        return fn_args, f"arguments are not valid JSON; the repaired object does not fit the schema ({misfit})"
+    logger.warning(
+        "Repaired <tool_call> arguments for %s: %d invalid escape(s), %d unescaped quote(s)",
+        fn_name,
+        fixes["escape"],
+        fixes["quote"],
+    )
+    return json.dumps(value, ensure_ascii=False), None
+
+
+def _tool_call_from_object(
+    obj: Any, ordinal: int, tool_schemas: dict[str, Any] | None = None
+) -> Any | None:
     """Build one tool-call delta object from a decoded JSON value.
 
     Mirrors the core ACP parser: the value must be an object whose
     ``function`` is an object with a non-blank string name. Anything else is
     malformed and returns None, so a nameless call is never emitted.
+
+    A string ``arguments`` is validated (see :func:`_normalize_tool_arguments`).
+    A call whose arguments cannot be made valid carries ``arguments_error``;
+    the stream withholds it from Hermes and asks the model to re-emit it.
     """
     if not isinstance(obj, dict):
         return None
@@ -1500,12 +1632,16 @@ def _tool_call_from_object(obj: Any, ordinal: int) -> Any | None:
     if not isinstance(call_id, str) or not call_id.strip():
         call_id = f"call_{ordinal}"
     fn_args = fn.get("arguments", "{}")
-    if not isinstance(fn_args, str):
+    arguments_error = None
+    if isinstance(fn_args, str):
+        fn_args, arguments_error = _normalize_tool_arguments(fn_name, fn_args, tool_schemas)
+    else:
         fn_args = json.dumps(fn_args, ensure_ascii=False)
     return SimpleNamespace(
         id=call_id,
         type="function",
         function=SimpleNamespace(name=fn_name, arguments=fn_args),
+        arguments_error=arguments_error,
     )
 
 
@@ -1528,7 +1664,7 @@ def _has_closed_tool_call_frame(
 
 
 def _has_unparseable_tool_call_frame(
-    text: str, state: _MarkdownCodeState | None = None
+    text: str, state: _MarkdownCodeState | None = None, tool_schemas: dict[str, Any] | None = None
 ) -> bool:
     """True when *text* keeps a closed ``<tool_call>`` frame after parsing.
 
@@ -1539,12 +1675,12 @@ def _has_unparseable_tool_call_frame(
     protocol frame with no call. Unclosed frames are
     :func:`_has_unfinished_tool_call_frame`'s concern.
     """
-    _calls, cleaned = _parse_tool_block(text, state=state)
+    _calls, cleaned = _parse_tool_block(text, state=state, tool_schemas=tool_schemas)
     return _has_closed_tool_call_frame(cleaned, state=state)
 
 
 def _extract_tagged_tool_calls(
-    block: str, state: _MarkdownCodeState | None = None
+    block: str, state: _MarkdownCodeState | None = None, tool_schemas: dict[str, Any] | None = None
 ) -> tuple[list[Any], str]:
     """Extract ``<tool_call>{...}</tool_call>`` frames using the shared scanner.
 
@@ -1581,8 +1717,18 @@ def _extract_tagged_tool_calls(
         try:
             parsed = json.loads(body)
         except Exception:
-            parsed = None
-        call = _tool_call_from_object(parsed, len(calls) + 1)
+            # Same escaping slips as in arguments (see _lenient_json_loads),
+            # one level up: an object-valued "arguments" carries the command.
+            try:
+                parsed, fixes = _lenient_json_loads(body)
+                logger.warning(
+                    "Repaired <tool_call> frame JSON: %d invalid escape(s), %d unescaped quote(s)",
+                    fixes["escape"],
+                    fixes["quote"],
+                )
+            except ValueError:
+                parsed = None
+        call = _tool_call_from_object(parsed, len(calls) + 1, tool_schemas)
         if call is None:
             text_parts.append(block[start:end])
             cur.advance(block[start:end])
@@ -1598,13 +1744,17 @@ def _extract_tagged_tool_calls(
 
 
 def _parse_tool_block(
-    block: str, state: _MarkdownCodeState | None = None
+    block: str, state: _MarkdownCodeState | None = None, tool_schemas: dict[str, Any] | None = None
 ) -> tuple[list[Any], str]:
-    """Parse tool call blocks, returning (tool_call_deltas, cleaned_text)."""
+    """Parse tool call blocks, returning (tool_call_deltas, cleaned_text).
+
+    A delta whose ``arguments_error`` is set must not be executed (see
+    :func:`_tool_call_from_object`).
+    """
     calls: list[Any] = []
     cleaned_text = ""
     if _TOOL_CALL_OPEN in block:
-        calls, cleaned_text = _extract_tagged_tool_calls(block, state=state)
+        calls, cleaned_text = _extract_tagged_tool_calls(block, state=state, tool_schemas=tool_schemas)
     else:
         try:
             from agent.acp_openai_bridge import extract_tool_calls_from_text
@@ -1625,6 +1775,7 @@ def _parse_tool_block(
                 id=getattr(call, "id", f"call_{i+1}"),
                 type="function",
                 function=SimpleNamespace(name=name, arguments=args),
+                arguments_error=getattr(call, "arguments_error", None),
             )
         )
     return deltas, cleaned_text.strip()

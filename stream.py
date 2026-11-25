@@ -275,6 +275,39 @@ class _AwaitableCompletion(SimpleNamespace):
         return _ready(self).__await__()
 
 
+_MAX_TOOL_CALL_CORRECTIONS = 2
+
+
+def _tool_schemas_by_name(tools: list[dict[str, Any]] | None) -> dict[str, Any]:
+    """``{tool name: parameters schema}`` from OpenAI-style tool definitions."""
+    schemas: dict[str, Any] = {}
+    for tool in tools or []:
+        fn = tool.get("function") if isinstance(tool, dict) else None
+        if isinstance(fn, dict) and isinstance(fn.get("name"), str):
+            schemas[fn["name"]] = fn.get("parameters")
+    return schemas
+
+
+def _tool_call_correction_prompt(rejected: list[tuple[str, str]], accepted_count: int) -> str:
+    lines = [
+        "[HOST] Your previous reply had tool call(s) whose arguments are not valid JSON, "
+        "so they were NOT executed:"
+    ]
+    lines.extend(f"- {name}: {error}" for name, error in rejected)
+    if accepted_count:
+        lines.append(
+            f"The other {accepted_count} tool call(s) in that reply were accepted and will run; do not repeat them."
+        )
+    lines.append(
+        "Re-emit ONLY the rejected call(s), each as one <tool_call> block, and nothing else. "
+        "Give \"arguments\" as a JSON object, not a string, for example "
+        '<tool_call>{"id": "call_1", "type": "function", "function": {"name": "terminal", '
+        '"arguments": {"command": "grep -n \\"a\\\\|b\\" f.txt"}}}</tool_call> '
+        "Inside a JSON string write every double quote as \\\" and every backslash as \\\\."
+    )
+    return "\n".join(lines)
+
+
 class AntigravityStream(Iterator[Any]):
     """Streaming iterator yielding OpenAI ChatCompletionChunk objects from CLI stream-json."""
 
@@ -362,6 +395,14 @@ class AntigravityStream(Iterator[Any]):
         self._segment_usage_baseline: dict[str, int] | None = (
             {} if self._pending_segments and not is_worker else None
         )
+        # Tool calls whose arguments could not be made valid JSON are never
+        # handed to Hermes (it would treat the turn as truncated and retry
+        # with the same mistake). A worker turn asks the model to re-emit
+        # them instead; see _send_tool_call_correction.
+        self._tool_schemas = _tool_schemas_by_name(tools)
+        self._rejected_calls: list[tuple[str, str]] = []
+        self._corrections_sent = 0
+        self._yielded_call_keys: set[tuple[str, str]] = set()
         self.conversation_id = ""
         self._closed = False
         self._interrupted = False
@@ -754,6 +795,76 @@ class AntigravityStream(Iterator[Any]):
                 return ""
         return ""
 
+    def _accept_calls(self, calls: list[Any]) -> list[Any]:
+        """Calls that may reach Hermes; records the ones that must not.
+
+        A call with ``arguments_error`` is withheld and queued for a
+        correction turn. After a correction, a re-emitted call identical to
+        one already yielded this turn is dropped so it never runs twice.
+        """
+        accepted = []
+        for call in calls:
+            fn = getattr(call, "function", None)
+            name = getattr(fn, "name", "") if fn else ""
+            args = getattr(fn, "arguments", "") if fn else ""
+            error = getattr(call, "arguments_error", None)
+            if error:
+                logger.warning("Withholding <tool_call> %s from Hermes: %s", name, error)
+                self._rejected_calls.append((name, error))
+                continue
+            key = (name, args)
+            if self._corrections_sent and key in self._yielded_call_keys:
+                logger.info("Dropping re-emitted duplicate <tool_call> %s after correction", name)
+                continue
+            self._yielded_call_keys.add(key)
+            accepted.append(call)
+        return accepted
+
+    def _can_correct_tool_calls(self, res: dict[str, Any]) -> bool:
+        """True when a rejected call can be sent back to this turn's model.
+
+        Only a worker keeps stdin open after the prompt; a oneshot fails the
+        request instead (Hermes retries it).
+        """
+        return (
+            bool(self._rejected_calls)
+            and self.is_worker
+            and self._corrections_sent < _MAX_TOOL_CALL_CORRECTIONS
+            and res.get("status") == "SUCCESS"
+            and not res.get("error")
+            and getattr(self.client, "_cancelled", False) is not True
+            and self.proc.stdin is not None
+        )
+
+    def _send_tool_call_correction(self, res: dict[str, Any]) -> None:
+        """Ask the model to re-emit its rejected calls in a follow-up turn.
+
+        The finished turn's usage advances the cumulative baseline exactly as
+        a priming part does, so the usage chunk reports the last call only.
+        """
+        usage = res.get("usage")
+        if isinstance(usage, dict) and self.usage_baseline is not None:
+            _delta_worker_usage(usage, self.usage_baseline)
+        rejected, self._rejected_calls = self._rejected_calls, []
+        self._corrections_sent += 1
+        prompt = _tool_call_correction_prompt(rejected, len(self._yielded_call_keys))
+        logger.warning(
+            "Asking agy to re-emit %d rejected tool call(s) (correction %d/%d)",
+            len(rejected),
+            self._corrections_sent,
+            _MAX_TOOL_CALL_CORRECTIONS,
+        )
+        self._raise_if_cancelled()
+        try:
+            self.proc.stdin.write(json.dumps({"event": "user", "message": {"content": prompt}}) + "\n")
+            self.proc.stdin.flush()
+        except (BrokenPipeError, OSError, ValueError) as exc:
+            self._raise_if_cancelled()
+            raise RuntimeError(
+                "Antigravity execution failed: could not ask the model to re-emit "
+                f"invalid tool call arguments: {exc}"
+            ) from exc
+
     def _check_priming_step(self, step: dict[str, Any]) -> None:
         """Verdict on a step_update of a priming turn; discards everything else.
 
@@ -1039,7 +1150,9 @@ class AntigravityStream(Iterator[Any]):
                                         block = text_buffer[:full_end]
                                         text_buffer = text_buffer[full_end:]
                                         in_tool_call = False
-                                        parsed_calls, extra_text = _parse_tool_block(block)
+                                        parsed_calls, extra_text = _parse_tool_block(
+                                            block, tool_schemas=self._tool_schemas
+                                        )
                                         if (
                                             not parsed_calls
                                             and self.has_tools
@@ -1053,9 +1166,10 @@ class AntigravityStream(Iterator[Any]):
                                                 has_content = True
                                                 yield self._make_chunk(content=block)
                                         else:
-                                            if parsed_calls:
+                                            accepted_calls = self._accept_calls(parsed_calls)
+                                            if accepted_calls:
                                                 has_tool_calls = True
-                                                for call_delta in identify_calls(parsed_calls):
+                                                for call_delta in identify_calls(accepted_calls):
                                                     yield self._make_chunk(tool_calls=[call_delta])
                                             if extra_text and not has_tool_calls:
                                                 md_state.advance(extra_text)
@@ -1109,6 +1223,34 @@ class AntigravityStream(Iterator[Any]):
                         self._finish_priming_turn(res)
                         # Each part is its own model call: the read budget
                         # restarts with it, as it would for separate turns.
+                        deadline = time.monotonic() + self.timeout
+                        continue
+                    if (
+                        self.has_tools
+                        and self.is_worker
+                        and self._corrections_sent < _MAX_TOOL_CALL_CORRECTIONS
+                    ):
+                        # Judge every call of this turn before deciding on a
+                        # correction: a frame can still sit in the buffer (or
+                        # arrive only in result.response).
+                        if not text_buffer and not has_content and not has_tool_calls:
+                            text_buffer = res.get("response", "") or ""
+                        if text_buffer and not in_tool_call and _has_closed_tool_call_frame(text_buffer, md_state):
+                            parsed_calls, extra_text = _parse_tool_block(
+                                text_buffer, state=md_state, tool_schemas=self._tool_schemas
+                            )
+                            accepted_calls = self._accept_calls(parsed_calls)
+                            if accepted_calls:
+                                has_tool_calls = True
+                                for call_delta in identify_calls(accepted_calls):
+                                    yield self._make_chunk(tool_calls=[call_delta])
+                            if parsed_calls:
+                                text_buffer = extra_text
+                    if self._can_correct_tool_calls(res):
+                        self._send_tool_call_correction(res)
+                        text_buffer = ""
+                        in_tool_call = False
+                        md_state = _MarkdownCodeState()
                         deadline = time.monotonic() + self.timeout
                         continue
                     if self.conversation_id and self.is_worker and self.client and hasattr(self.client, "_set_worker_conversation_id"):
@@ -1197,7 +1339,7 @@ class AntigravityStream(Iterator[Any]):
                 self.has_tools
                 and not neutralized_tool_step
                 and text_buffer
-                and _has_unparseable_tool_call_frame(text_buffer, md_state)
+                and _has_unparseable_tool_call_frame(text_buffer, md_state, self._tool_schemas)
             ):
                 logger.warning(
                     "Unparseable <tool_call> block at end of stream (%s); falling back to plain text",
@@ -1205,10 +1347,13 @@ class AntigravityStream(Iterator[Any]):
                 )
             if text_buffer and not has_tool_calls and not neutralized_tool_step:
                 if self.has_tools or "<tool_call>" in text_buffer:
-                    parsed_calls, extra_text = _parse_tool_block(text_buffer, state=md_state)
-                    if parsed_calls:
+                    parsed_calls, extra_text = _parse_tool_block(
+                        text_buffer, state=md_state, tool_schemas=self._tool_schemas
+                    )
+                    accepted_calls = self._accept_calls(parsed_calls)
+                    if accepted_calls:
                         has_tool_calls = True
-                        for call_delta in identify_calls(parsed_calls):
+                        for call_delta in identify_calls(accepted_calls):
                             yield self._make_chunk(tool_calls=[call_delta])
                     if extra_text and not has_tool_calls:
                         has_content = True
@@ -1219,6 +1364,16 @@ class AntigravityStream(Iterator[Any]):
                 else:
                     has_content = True
                     yield self._make_chunk(content=text_buffer)
+
+            if self._rejected_calls:
+                # Never hand Hermes a call it cannot decode: it would execute
+                # nothing useful or retry the turn with the same mistake.
+                names = ", ".join(name for name, _error in self._rejected_calls)
+                raise RuntimeError(
+                    "Antigravity execution failed: tool call arguments for "
+                    f"{names} are not valid JSON and could not be repaired "
+                    f"({self._rejected_calls[0][1]}); nothing was executed"
+                )
 
             if not self.is_worker:
                 try:
@@ -1503,6 +1658,8 @@ def collect_stream_completion(stream: AntigravityStream) -> Any:
     # Fallback tool call extraction if tools weren't pre-configured in stream
     if not tool_calls and full_content and "<tool_call>" in full_content:
         extracted_calls, cleaned = _parse_tool_block(full_content)
+        # A call whose arguments could not be made valid is never returned.
+        extracted_calls = [c for c in extracted_calls if not getattr(c, "arguments_error", None)]
         if extracted_calls:
             tool_calls = extracted_calls
             full_content = cleaned or None

@@ -477,6 +477,15 @@ class AntigravityClient:
         # session it was created for, so a stream left over from a terminated
         # session cannot corrupt a later session's baseline.
         self._worker_usage_baseline: dict[str, int] = {}
+        # (conversation id, baseline copy) of a worker terminated while its
+        # agy conversation is kept for --conversation resume (idle reap,
+        # media-permission recycle, auth retry). agy's counters on a resumed
+        # conversation continue from the session total, so the respawned
+        # worker starts from this copy; with an empty baseline its first turn
+        # reported every earlier turn as this call's prompt (measured:
+        # 201,502 for a 67,457-token context; 4,954,420 in a long session),
+        # and Hermes compressed a context that was nowhere near full.
+        self._resume_usage_baseline: tuple[str, dict[str, int]] | None = None
         self._worker_lock = threading.Lock()
         self._worker_idle_timer: threading.Timer | None = None
         # Last moment each worker showed a sign of life: its spawn, or the last
@@ -669,6 +678,11 @@ class AntigravityClient:
     def _terminate_worker_locked(self, keep_conversation: bool = False) -> None:
         self._cancel_idle_timer_locked()
         if self._worker_proc is not None:
+            if keep_conversation and self._worker_conversation_id:
+                self._resume_usage_baseline = (
+                    self._worker_conversation_id,
+                    dict(self._worker_usage_baseline),
+                )
             proc = self._worker_proc
             self._worker_proc = None
             self._worker_model = None
@@ -679,13 +693,15 @@ class AntigravityClient:
             self._worker_cpu_at_activity.pop(proc, None)
             self._terminate_process(proc)
         # The session is gone: any later usage from it belongs to a dead
-        # session, and the next spawn must start from a clean baseline.
+        # session, and the next spawn starts from a fresh baseline dict (a
+        # resumed conversation copies the saved snapshot into it).
         self._worker_usage_baseline = {}
         # Full-send diagnostics compare only fresh-context requests, never
         # session counters or deltas. Their reference survives worker resets.
         if not keep_conversation:
             self._worker_conversation_id = None
             self._conversation_history = []
+            self._resume_usage_baseline = None
 
     def _terminate_worker(self, keep_conversation: bool = False) -> None:
         with self._lock:
@@ -914,6 +930,12 @@ class AntigravityClient:
             # live worker changes nothing for its next turn).
             self._worker_media_rules = read_media_rules(self._isolated_gemini_dir)
             self._worker_usage_baseline = {}
+            saved = self._resume_usage_baseline
+            self._resume_usage_baseline = None
+            if conversation_id and saved is not None and saved[0] == conversation_id:
+                # A copy, not the old dict: a stream left over from the dead
+                # process keeps advancing only its own snapshot.
+                self._worker_usage_baseline = dict(saved[1])
             self._active_processes.add(proc)
             register_tracked_process(proc)
             self._worker_last_activity[proc] = time.monotonic()

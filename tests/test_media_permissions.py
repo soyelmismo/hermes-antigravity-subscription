@@ -154,6 +154,7 @@ def test_new_media_recycles_idle_worker_and_resumes_conversation(worker, tmp_pat
         return original_terminate(keep_conversation=keep_conversation)
 
     cl._terminate_worker_locked = terminate
+    old_baseline = cl._worker_usage_baseline
     cl._create_chat_completion(model=MODEL, messages=messages, stream=True)
     try:
         cl._terminate_process.assert_called_once_with(proc)
@@ -161,7 +162,10 @@ def test_new_media_recycles_idle_worker_and_resumes_conversation(worker, tmp_pat
         assert cl._worker_conversation_id == "synthetic-conversation"
         assert cl._conversation_history == history
         assert cl._worker_history == history
-        assert cl._worker_usage_baseline == {}
+        # The resumed conversation's counters continue from the session
+        # total, so the respawned worker starts from a copy of the snapshot.
+        assert cl._worker_usage_baseline == {"input_tokens": 123}
+        assert cl._worker_usage_baseline is not old_baseline
         assert cl._worker_media_rules == rules_for(path)
         args = agy_client.subprocess.Popen.call_args.args[0]
         assert args[args.index("--conversation") + 1] == "synthetic-conversation"
