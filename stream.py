@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import contextlib
 import json
@@ -83,21 +84,90 @@ def _native_media_roots() -> tuple[str, ...]:
     return tuple(os.path.realpath(r) for r in roots)
 
 
-_TOOL_INFO_PATH_RE = re.compile(r"/[A-Za-z0-9_\-./]+")
+# Fallback for free-form tool_info strings only: POSIX absolute paths
+# (/home/u/.hermes/...) and drive-rooted Windows paths with either separator
+# (C:\Users\u\... or C:/Users/u/...). The lookbehind keeps it from matching a
+# suffix of a relative path (relative/tmp/x.png must not yield /tmp/x.png).
+# Matching only "/..." made every Windows media-attach read fail the allowlist.
+_TOOL_INFO_PATH_RE = re.compile(
+    r"(?<![A-Za-z0-9_.\-\\/])(?:[A-Za-z]:[\\/][A-Za-z0-9_\-./\\]+|/[A-Za-z0-9_\-./]+)"
+)
+_WINDOWS_ABS_PATH_RE = re.compile(r"^[A-Za-z]:[\\/]")
+
+
+def _is_absolute_path_value(value: str) -> bool:
+    """An absolute POSIX or drive-rooted Windows path, independent of the host OS."""
+    return value.startswith("/") or bool(_WINDOWS_ABS_PATH_RE.match(value))
+
+
+def _collect_path_values(value: Any, out: list[str]) -> None:
+    if isinstance(value, str):
+        stripped = value.strip()
+        if _is_absolute_path_value(stripped):
+            out.append(stripped)
+    elif isinstance(value, dict):
+        for item in value.values():
+            _collect_path_values(item, out)
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            _collect_path_values(item, out)
+
+
+def _tool_info_paths(tool_info: Any) -> list[str]:
+    """Every path a native tool step targets.
+
+    agy reports ``tool_info`` as a structured object
+    (``{"name": "read_file", "parameters": {"Path": "C:\\\\Users\\\\u\\\\a b (1).jpg"}}``),
+    so path values are read from it whole: spaces, parentheses and non-ASCII
+    characters survive. A JSON or dict-repr string is parsed the same way; a
+    bare absolute path string is taken as is; any other string falls back to
+    regex scanning.
+    """
+    if isinstance(tool_info, (dict, list, tuple)):
+        scope = tool_info.get("parameters", tool_info) if isinstance(tool_info, dict) else tool_info
+        paths: list[str] = []
+        _collect_path_values(scope, paths)
+        return paths
+    if not isinstance(tool_info, str):
+        return []
+    text = tool_info.strip()
+    if not text:
+        return []
+    if text[0] in "{[":
+        parsed: Any = None
+        try:
+            parsed = json.loads(text)
+        except ValueError:
+            try:
+                parsed = ast.literal_eval(text)
+            except (ValueError, SyntaxError, MemoryError, RecursionError):
+                parsed = None
+        if isinstance(parsed, (dict, list, tuple)):
+            return _tool_info_paths(parsed)
+    if _is_absolute_path_value(text):
+        return [text]
+    return _TOOL_INFO_PATH_RE.findall(text)
 
 
 def _path_is_native_media_target(path: str, referenced: set[str]) -> bool:
     normalized = os.path.normpath(path)
     if normalized in referenced:
         return True
-    real = os.path.realpath(normalized)
+    # Windows paths are case-insensitive: agy may report C:\users\... while the
+    # roots resolve to C:\Users\... normcase is the identity on POSIX.
+    key = os.path.normcase(normalized)
+    if any(key == os.path.normcase(os.path.normpath(ref)) for ref in referenced):
+        return True
+    real = os.path.normcase(os.path.realpath(normalized))
     # Resolved at use time: a Hermes process serving several profiles must
     # evaluate the roots of the profile owning this session (review
     # 5887913331, point 2).
-    return any(
-        real == root or real.startswith(root + os.sep)
-        for root in _native_media_roots()
-    )
+    for root in _native_media_roots():
+        root = os.path.normcase(root)
+        # rstrip: a drive or filesystem root (C:\ or /) already ends in a separator.
+        if real == root or real.startswith(root.rstrip(os.sep) + os.sep):
+            return True
+    return False
 
 
 class _UsageDeltas(NamedTuple):
@@ -508,20 +578,22 @@ class AntigravityStream(Iterator[Any]):
         """
         return media_reference_paths(self.messages)
 
-    def _is_permitted_native_media_step(self, tool_name: str, tool_info: str) -> bool:
+    def _is_permitted_native_media_step(self, tool_name: str, tool_info: Any) -> bool:
         """True when a native tool step is exactly the media-attach read.
 
-        Read-only tools only, and the target must be a path this turn
+        Read-only tools only, and EVERY target must be a path this turn
         references as media (or sit under Hermes' media cache roots, so a
         resumed conversation can still re-read an earlier attachment). A
-        read whose target cannot be verified is denied: fail closed.
+        read whose target cannot be verified, or that names any path outside
+        the allowlist next to a permitted one, is denied: fail closed.
         """
         if tool_name not in _NATIVE_MEDIA_TOOLS:
             return False
-        for candidate in _TOOL_INFO_PATH_RE.findall(tool_info):
-            if _path_is_native_media_target(candidate, self._media_paths):
-                return True
-        return False
+        candidates = _tool_info_paths(tool_info)
+        return bool(candidates) and all(
+            _path_is_native_media_target(candidate, self._media_paths)
+            for candidate in candidates
+        )
 
     def close(self) -> None:
         if self._closed:
@@ -800,7 +872,7 @@ class AntigravityStream(Iterator[Any]):
                     if step.get("step_type") == "tool":
                         tool_name = str(step.get("tool_name") or "")
                         if self._is_permitted_native_media_step(
-                            tool_name, str(step.get("tool_info") or "")
+                            tool_name, step.get("tool_info")
                         ):
                             # The media-attach read: agy copies the referenced
                             # file into its session media store and inlines the
