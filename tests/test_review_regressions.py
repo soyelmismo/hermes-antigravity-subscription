@@ -85,7 +85,7 @@ class DeliveryRegressionTests(unittest.TestCase):
         return AntigravityStream(proc=proc, client=client, model='flash', timeout=1,
                                  prompt_chars=chars, delivery_watch=watch)
 
-    def test_cache_tokens_count_for_diagnostic_not_usage(self):
+    def test_delivery_and_chat_usage_both_include_cache_reads(self):
         watch = DeliveryWatch()
         watch.observe(64147, 95990)
         with self.assertNoLogs('delivery', level='WARNING'):
@@ -94,7 +94,8 @@ class DeliveryRegressionTests(unittest.TestCase):
         self.assertIsNotNone(sample)
         assert sample is not None
         self.assertEqual(sample.input_tokens, 196651)
-        self.assertEqual(chunks[-1].usage.prompt_tokens, 96651)
+        self.assertEqual(chunks[-1].usage.prompt_tokens, 196651)
+        self.assertEqual(chunks[-1].usage.prompt_tokens_details.cached_tokens, 100000)
 
     def test_no_watch_means_delta_does_not_contaminate(self):
         watch = DeliveryWatch()

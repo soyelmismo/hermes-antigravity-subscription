@@ -172,13 +172,27 @@ def _path_is_native_media_target(path: str, referenced: set[str]) -> bool:
     return False
 
 
-class _UsageDeltas(NamedTuple):
-    """Per-turn usage derived from cumulative worker-session counters."""
+class _TurnUsage(NamedTuple):
+    """Per-turn agy counters, with fresh and cached input kept separate."""
 
     input_tokens: int
     output_tokens: int
-    total_tokens: int
     cache_read_tokens: int
+
+    @property
+    def prompt_tokens(self) -> int:
+        """Chat Completions prompt_tokens includes cache reads."""
+        return self.input_tokens + self.cache_read_tokens
+
+    def as_chat_usage(self) -> SimpleNamespace:
+        # agy's total_tokens is not a Chat Completions total: it can omit
+        # cache reads. Derive the total from the same buckets as the prompt.
+        return SimpleNamespace(
+            prompt_tokens=self.prompt_tokens,
+            completion_tokens=self.output_tokens,
+            total_tokens=self.prompt_tokens + self.output_tokens,
+            prompt_tokens_details=SimpleNamespace(cached_tokens=self.cache_read_tokens),
+        )
 
 
 def _counter_delta(usage_data: dict[str, Any], baseline: dict[str, int], field: str) -> int:
@@ -217,30 +231,17 @@ def _counter_delta(usage_data: dict[str, Any], baseline: dict[str, int], field: 
     return delta
 
 
-def _delta_worker_usage(usage_data: dict[str, Any], baseline: dict[str, int]) -> _UsageDeltas:
+def _delta_worker_usage(usage_data: dict[str, Any], baseline: dict[str, int]) -> _TurnUsage:
     """Convert cumulative worker-session usage into per-turn deltas.
 
     The baseline dict belongs to the worker session that produced this usage
     and is updated in place. Callers must hand in the baseline captured when
     the worker stream was created, so a stream left over from a terminated
     session can never corrupt the baseline of the session that replaced it.
-
-    total_tokens is expected to be stably present or absent for a session. If
-    it flaps (present -> absent -> present), the absent turn falls back to
-    input+output without advancing the total_tokens snapshot, so the next
-    present turn's total delta spans two turns.
     """
-    input_delta = _counter_delta(usage_data, baseline, "input_tokens")
-    output_delta = _counter_delta(usage_data, baseline, "output_tokens")
-    if "total_tokens" in usage_data:
-        total_delta = _counter_delta(usage_data, baseline, "total_tokens")
-    else:
-        # total_tokens is optional: fall back to the per-turn input+output.
-        total_delta = input_delta + output_delta
-    return _UsageDeltas(
-        input_tokens=input_delta,
-        output_tokens=output_delta,
-        total_tokens=total_delta,
+    return _TurnUsage(
+        input_tokens=_counter_delta(usage_data, baseline, "input_tokens"),
+        output_tokens=_counter_delta(usage_data, baseline, "output_tokens"),
         cache_read_tokens=_counter_delta(usage_data, baseline, "cache_read_tokens"),
     )
 
@@ -748,27 +749,11 @@ class AntigravityStream(Iterator[Any]):
             usage=None,
         )
 
-    def _usage_totals(self, usage_data: dict[str, Any]) -> tuple[int, int, int, int]:
-        """(input, output, total, cached) token counts for the usage chunk.
-
-        Persistent worker sessions report cumulative usage, so worker streams
-        forward per-turn deltas against their session baseline. Oneshot
-        processes already report per-turn usage and are forwarded raw; they
-        never touch the worker baseline.
-        """
-        if self.is_worker and self.usage_baseline is not None:
-            deltas = _delta_worker_usage(usage_data, self.usage_baseline)
-            return (
-                deltas.input_tokens,
-                deltas.output_tokens,
-                deltas.total_tokens,
-                deltas.cache_read_tokens,
-            )
-        input_tokens = int(usage_data.get("input_tokens", 0) or 0)
-        output_tokens = int(usage_data.get("output_tokens", 0) or 0)
-        total_tokens = int(usage_data.get("total_tokens", input_tokens + output_tokens) or 0)
-        cached_tokens = int(usage_data.get("cache_read_tokens", 0) or 0)
-        return input_tokens, output_tokens, total_tokens, cached_tokens
+    def _usage_totals(self, usage_data: dict[str, Any]) -> _TurnUsage:
+        """Get per-turn agy buckets before translating to Chat Completions."""
+        baseline = self.usage_baseline if self.is_worker else self._segment_usage_baseline
+        # A plain oneshot starts at zero and never touches the worker baseline.
+        return _delta_worker_usage(usage_data, baseline if baseline is not None else {})
 
     def _empty_result_message(
         self,
@@ -1683,18 +1668,14 @@ class AntigravityStream(Iterator[Any]):
             # baseline must not wait for that chunk or the next turn's delta
             # absorbs them. There is no yield between this computation and
             # the finish-reason yield, so chunk emission order is unchanged.
-            if self._segment_usage_baseline is not None and usage_data:
-                # Segmented oneshot: drop the priming turns' share of the
-                # process counters (workers do this via usage_baseline).
-                usage_data = _delta_worker_usage(usage_data, self._segment_usage_baseline)._asdict()
-            input_tokens, output_tokens, total_tokens, cached_tokens = self._usage_totals(usage_data)
+            turn_usage = self._usage_totals(usage_data)
 
             # Heuristic only (issue #29), restricted to comparable full sends.
             # Include cache reads conservatively; never change reported usage.
             watch = self.delivery_watch
             if watch is not None and self.prompt_chars:
                 watch.observe(
-                    self.prompt_chars, input_tokens + cached_tokens,
+                    self.prompt_chars, turn_usage.prompt_tokens,
                     sample_key=self.delivery_sample_key,
                 )
 
@@ -1713,17 +1694,11 @@ class AntigravityStream(Iterator[Any]):
                     self.client._clear_native_block_streak()
                 yield self._make_chunk(finish_reason=finish_reason)
 
-            usage = SimpleNamespace(
-                prompt_tokens=input_tokens,
-                completion_tokens=output_tokens,
-                total_tokens=total_tokens,
-                prompt_tokens_details=SimpleNamespace(cached_tokens=cached_tokens),
-            )
             yield SimpleNamespace(
                 id=self.conversation_id or f"agy-{int(time.time() * 1000)}",
                 choices=[],
                 model=self.model,
-                usage=usage,
+                usage=turn_usage.as_chat_usage(),
             )
             self._finished = True
         except Exception:
