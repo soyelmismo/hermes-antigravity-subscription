@@ -1,6 +1,6 @@
 name: antigravity-subscription-directsdk
 manifest_version: 2
-version: "1.0.32"
+version: "1.0.33"
 kind: model-provider
 description: "Run Hermes on an Antigravity / Gemini subscription via the official agy CLI (DirectSDK path). Streams tokens progressively, persists multi-turn trajectories via agy --conversation (239k tokens on Claude routes, 460k on Gemini routes), embeds image/video/audio natively as file references agy reads and uploads as pixels, discovers models dynamically per account, maps thinking effort, tracks quota in /usage, aborts reported native tool steps, reaps orphaned workers, and cleans every ephemeral session dir on close."
 author: "soyelmismo"
