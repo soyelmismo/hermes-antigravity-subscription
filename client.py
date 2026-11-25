@@ -721,6 +721,29 @@ class AntigravityClient:
             if conv_id and not self._cancelled:
                 self._worker_conversation_id = conv_id
 
+    def _restore_pruned_workspace(self) -> None:
+        """Recreate the private directory after something outside removed it.
+
+        Hermes points TMPDIR at a scratch dir and prunes entries with no
+        writes for 24 h (issue #62). An idle client loses its
+        ``hermes_agy_*`` directory that way and every later spawn fails with
+        ENOENT. The agy conversation lived in that directory, so it goes
+        with it: the worker is terminated and the next turn is a full send.
+        """
+        if self._temp_dir is None or os.path.isdir(self._cwd):
+            return
+        with self._lock:
+            if os.path.isdir(self._cwd):
+                return  # a concurrent request restored it first
+            logger.warning(
+                "Antigravity private directory %s was removed while the client was idle; "
+                "recreating it and dropping the agy conversation.",
+                self._cwd,
+            )
+            self._terminate_worker_locked(keep_conversation=False)
+            self._isolated_home, self._isolated_gemini_dir = setup_isolated_home(self._cwd)
+            self._purge_isolated_conversations()
+
     def _purge_isolated_conversations(self) -> None:
         """Purge isolated conversation database files on session reset or new conversation."""
         conv_dir = self._isolated_gemini_dir / "conversations"
@@ -1111,6 +1134,7 @@ class AntigravityClient:
                 "Antigravity CLI is not authenticated. Please run 'agy' in your terminal "
                 "to log in with your Google account."
             )
+        self._restore_pruned_workspace()
 
         effort_param = reasoning_effort or extra_kwargs.get("reasoning_effort")
         resolved_model, effort = self._resolve_model_and_effort(model, effort_param)
