@@ -22,7 +22,7 @@ This plugin lets Hermes use Gemini and Claude models through your existing Antig
 - **Early quota detection**: While waiting for the first content event, a log watcher aborts the turn on `RESOURCE_EXHAUSTED`/429 or credit-cap lines written during that turn. Log mtimes are compared in wall-clock time; `init` alone does not disarm the watcher, the first non-init event does.
 - **Own agent instead of agy's**: On `agy` 1.5.16 or newer the plugin spawns `agy` with `--agent hermes-inference-backend`, a Markdown agent it writes under the isolated HOME (`.gemini/config/agents/`) with `excludeDefaultComponents: true`. That agent carries none of `agy`'s default prompt sections and none of its built-in tools except `read_file`, which the media pipeline needs. Same one-line question through the plugin on `gemini-3.8-flash-low`: the default agent answers "I am Antigravity", lists 15 native tools and costs 10,749 input tokens; this agent answers "My name is Hermes", lists `read_file` and `manage_task` and costs 1,218. Older `agy` versions, `ANTIGRAVITY_DISABLE_CUSTOM_AGENT=1`, an `--agent` already present in `ANTIGRAVITY_ARGS`, or a spawn `agy` rejects all fall back to the default agent.
 - **Tool execution guard**: `agy` registers local system tools by default. This plugin runs `agy` in headless mode without permissions skip flags. If `agy` attempts to execute an internal tool step, the stream closes and terminates the child process. When the host offered tools and this is the first blocked step in a row, the turn ends empty instead of with the notice: Hermes retries it, and the retry's prompt carries a host note naming the blocked tool and asking for a `<tool_call>` block. A second blocked step in a row ends with the visible notice again, because Hermes fails a turn over to another provider after two empty replies.
-- **Thinking effort mapping**: Maps Hermes reasoning effort settings (`low`, `medium`, `high`) to backend model variants (`gemini-3.8-flash-low`, `gemini-3.8-flash-high`).
+- **Thinking effort mapping**: Maps Hermes reasoning effort settings (`low`, `medium`, `high`, and `xhigh` where the model supports it) to backend model variants (`gemini-3.8-flash-low`, `gemini-3.8-flash-high`).
 - **Subagent concurrency**: Each completion turn runs in its own process group (`start_new_session=True`). Multiple Hermes subagents can request completions concurrently without shared state.
 - **Windows console suppression**: On Windows, every console-subsystem child (`agy`, `cmdkey`, `taskkill`, and `agy models`) is spawned with `CREATE_NO_WINDOW`, so a GUI-hosted Hermes without a console of its own gets no visible console window per call. `AGY_CLI_DISABLE_AUTO_UPDATE=true` is set in the child environment so `agy`'s background updater cannot open one either.
 - **Filesystem isolation**: Subprocesses run in an isolated, private temporary working directory per client and slash commands are disabled. Local `GEMINI.md` and `AGENTS.md` project files are not read.
@@ -46,7 +46,7 @@ This plugin lets Hermes use Gemini and Claude models through your existing Antig
 | `claude-sonnet-4-6` | None | 200k tokens | 239k tokens | None (agy rejects `--effort`) |
 | `claude-opus-4-6-thinking` | None | 200k tokens | 239k tokens | None (agy rejects `--effort`) |
 
-**Dynamic discovery per account.** Available models and supported reasoning efforts are discovered dynamically from `agy models`. The picker reflects the exact models available on the user's account and subscription tier (including preview models or custom models configured in `agy` settings). A model that agy lists by bare name takes no `--effort`. A requested effort that the model lacks maps to the nearest supported one, the stronger on a tie (`medium` on `gemini-3.1-pro` becomes `high`). `xhigh` is a level of its own above `high` on agy 1.5.16: `gemini-4-hydrogen` takes it, a model without it gets `high`, and Hermes' `max` and `ultra` resolve to it. On the same prompt `gemini-4-hydrogen` spent 22.7k tokens thinking at `xhigh` against 13.1k at `high`. The result is cached for 15 minutes; a model the cached snapshot does not list triggers one re-probe per minute, so a family agy added resolves from the catalog instead of the prefix heuristics (issue #56 in `soyelmismo/hermes-antigravity-subscription`). When `agy models` fails, `models.py` serves an emergency fallback and logs one `warning` per minute with the cause (issue #55 in `soyelmismo/hermes-antigravity-subscription`). Hermes' own `xhigh` and `max` map to `high`. An `-xhigh` variant that `agy models` reports (an incorrect duplicate of the real effort variants, issue #47 in `soyelmismo/hermes-antigravity-subscription`) folds into its base model's `high` entry and is never listed as a separate bare-name model.
+**Dynamic discovery per account.** Available models and supported reasoning efforts are discovered dynamically from `agy models`. The picker reflects the exact models available on the user's account and subscription tier (including preview models or custom models configured in `agy` settings). A model that agy lists by bare name takes no `--effort`. A requested effort that the model lacks maps to the nearest supported one, the stronger on a tie (`medium` on `gemini-3.1-pro` becomes `high`). `xhigh` is a level of its own above `high` on agy 1.5.16: `gemini-4-hydrogen` takes it, a model without it gets `high`, and Hermes' `max` and `ultra` resolve to it. On the same prompt `gemini-4-hydrogen` spent 22.7k tokens thinking at `xhigh` against 13.1k at `high`. The result is cached for 15 minutes; a model the cached snapshot does not list triggers one re-probe per minute, so a family agy added resolves from the catalog instead of the prefix heuristics (issue #56 in `soyelmismo/hermes-antigravity-subscription`). When `agy models` fails, `models.py` serves an emergency fallback marked as a placeholder and logs one `warning` per minute with the cause (issue #55 in `soyelmismo/hermes-antigravity-subscription`), so a failed probe is not served as if it were the account's list. An `-xhigh` variant that `agy models` reports groups into its base model as the `xhigh` effort and is never listed as a separate bare-name model.
 
 > **Claude Model Aliases**: Requests for `claude-sonnet-5-5` or `claude-opus-5-5` resolve dynamically if present in the user's `agy models` catalog; if the account lacks them, they gracefully fall back to `claude-sonnet-4-6` and `claude-opus-4-6-thinking`.
 
@@ -86,6 +86,7 @@ Reasoning text in `stream-json` remains blocked upstream: `agy` exposes no flag 
 
 | Model | `<tool_call>` Protocol | Notes |
 | :--- | :--- | :--- |
+| `gemini-4-hydrogen` | Follows | Runs Hermes' full toolset through the plugin's agent on `agy` 1.5.16 (Linux arm64). Not measured with `agy`'s default agent. |
 | `gemini-3.8-flash` | Follows | Tested with full toolset (~40 tools) |
 | `gemini-3.7-flash` | Follows | Tested with full toolset |
 | `gemini-3.6-flash` | Ignores | Goes native even with a single tool schema |
@@ -186,10 +187,12 @@ Multiple agy sessions on one account contend for the shared OAuth token: whoever
    agy --version
    ```
 2. **Hermes Agent**:
-   Version `0.21.0` or higher.
+   Version `0.21.4` or higher (the `requires_hermes` floor in `plugin.yaml`).
    ```bash
    hermes --version
    ```
+3. **`agy` version**:
+   No minimum is enforced. On `agy` 1.5.16 or newer the plugin runs its own agent; older versions fall back to `agy`'s default agent (see **Model Compatibility**). The `xhigh` effort needs 1.5.16.
 
 > **Optional: Linux keyring detection.**
 > On Linux with a D-Bus session, `agy` keeps its session in the freedesktop
@@ -235,7 +238,8 @@ Multiple agy sessions on one account contend for the shared OAuth token: whoever
 
 | Variable | Default | Description |
 | :--- | :--- | :--- |
-| `HERMES_ANTIGRAVITY_CONTEXT_LENGTH` | `239000` (Claude), `460000` (Gemini) | Override the declared context window (tokens). Also checks `ANTIGRAVITY_CONTEXT_LENGTH`. Hermes triggers auto-compression based on this value (e.g. at 75% threshold, ~179k tokens). |
+| `HERMES_ANTIGRAVITY_CONTEXT_LENGTH` | `239000` (Claude), `460000` (Gemini) | Override the declared context window (tokens). Also checks `ANTIGRAVITY_CONTEXT_LENGTH`. Hermes triggers auto-compression based on this value (e.g. at a 0.8 threshold, ~191k tokens for Claude routes and ~368k for Gemini routes). |
+| `HERMES_ANTIGRAVITY_CONTEXT_LENGTHS` | (none) | Per-model overrides as a JSON object mapping a model name or family prefix to a token count, e.g. `{"gemini-4-argon": 200000}`. Also checks `ANTIGRAVITY_CONTEXT_LENGTHS`. The global `*_CONTEXT_LENGTH` override wins; malformed entries are ignored. |
 | `HERMES_ANTIGRAVITY_SEGMENT_WEIGHT` | `90000` (Gemini), off (Claude) | Largest single message of a full send, in weight units (1 per ASCII character, 2 per non-ASCII character). Heavier full sends are split into consecutive turns of one conversation. Setting it applies to every model; `0` disables splitting (Gemini then declares 75,000). Also checks `ANTIGRAVITY_SEGMENT_WEIGHT`. |
 | `ANTIGRAVITY_COMMAND` | `agy` | Path to the `agy` binary. Also checks `AGY_CLI_PATH` and `ANTIGRAVITY_CLI_PATH`. |
 | `ANTIGRAVITY_ARGS` | (none) | Extra arguments to pass to the `agy` subprocess. |
