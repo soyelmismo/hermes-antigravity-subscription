@@ -1103,6 +1103,7 @@ class AntigravityClient:
         tools: list[dict[str, Any]] | None,
         tool_choice: Any,
         stream: bool,
+        media_paths: set[str] | None = None,
     ) -> Any:
         segments = self._full_send_segments(
             messages, model=model, tools=tools, tool_choice=tool_choice, branch="oneshot"
@@ -1172,6 +1173,7 @@ class AntigravityClient:
             delivery_watch=None,
             followup_segments=segments[1:],
             close_stdin_after_segments=True,
+            media_paths=media_paths,
         )
         if stream:
             return stream_iter
@@ -1322,6 +1324,7 @@ class AntigravityClient:
                     delivery_sample_key=f"{resolved_model}:{effort}",
                     followup_segments=followup_segments,
                     native_block_retry=native_block_retry,
+                    media_paths=turn_media_paths,
                 )
                 if stream:
                     return stream_iter
@@ -1382,6 +1385,7 @@ class AntigravityClient:
                         delivery_sample_key=f"{resolved_model}:{effort}",
                         followup_segments=followup_segments,
                         native_block_retry=native_block_retry,
+                        media_paths=turn_media_paths,
                     )
                 try:
                     self._raise_if_cancelled()
@@ -1407,4 +1411,5 @@ class AntigravityClient:
                 tools=tools,
                 tool_choice=tool_choice,
                 stream=stream,
+                media_paths=turn_media_paths,
             )
