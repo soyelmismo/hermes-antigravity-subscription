@@ -429,7 +429,10 @@ class SegmentedSendTests(unittest.TestCase):
             list(c.chat.completions.create(model=GEMINI, messages=_history(), stream=True))
 
     def test_oneshot_segmented_send_uses_ndjson_and_closes_stdin(self):
-        proc = _TurnProcess(_cumulative(self.n_parts))
+        turns = _cumulative(self.n_parts)
+        for i, events in enumerate(turns, 1):
+            events[-1]["result"]["usage"]["cache_read_tokens"] = 700 * i
+        proc = _TurnProcess(turns)
         self.pending.append(proc)
         c = self._client()
         self.assertTrue(c._worker_lock.acquire(blocking=False))  # force the oneshot path
@@ -444,7 +447,10 @@ class SegmentedSendTests(unittest.TestCase):
         text = "".join(ch.choices[0].delta.content or "" for ch in chunks if ch.choices)
         self.assertEqual(text, "codes: alpha-17 beta-42 gamma-99")
         usage = [ch.usage for ch in chunks if getattr(ch, "usage", None) is not None][-1]
-        self.assertEqual(usage.prompt_tokens, 1000 * self.n_parts)
+        self.assertEqual(usage.prompt_tokens, 1000 * self.n_parts + 700)
+        self.assertEqual(usage.prompt_tokens_details.cached_tokens, 700)
+        self.assertEqual(usage.total_tokens, usage.prompt_tokens + 3)
+        self.assertEqual(c._worker_usage_baseline, {})
 
     def test_oneshot_that_fits_keeps_plain_text_stdin(self):
         proc = _TurnProcess([_turn("hi", {"input_tokens": 5, "output_tokens": 1})])

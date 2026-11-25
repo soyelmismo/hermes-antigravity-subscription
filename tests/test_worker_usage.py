@@ -114,23 +114,23 @@ class WorkerUsageDeltaTests(unittest.TestCase):
         self.assertEqual(_counter_delta({"input_tokens": None}, baseline, "input_tokens"), 0)
         self.assertEqual(baseline, {"input_tokens": 0})
 
-    def test_total_tokens_falls_back_to_input_plus_output_when_absent(self):
+    def test_chat_total_is_derived_even_when_agy_total_flaps(self):
         baseline: dict[str, int] = {}
-        deltas = _delta_worker_usage({"input_tokens": 100, "output_tokens": 10}, baseline)
-        self.assertEqual(deltas.input_tokens, 100)
-        self.assertEqual(deltas.output_tokens, 10)
-        self.assertEqual(deltas.total_tokens, 110)
-        self.assertNotIn("total_tokens", baseline)
-
-    def test_total_tokens_is_deltaed_like_the_other_counters_when_present(self):
-        baseline: dict[str, int] = {}
-        _delta_worker_usage(
-            {"input_tokens": 100, "output_tokens": 10, "total_tokens": 110}, baseline
-        )
-        deltas = _delta_worker_usage(
-            {"input_tokens": 250, "output_tokens": 40, "total_tokens": 290}, baseline
-        )
-        self.assertEqual(deltas.total_tokens, 180)
+        prev = [0, 0, 0]
+        for counts, extra in (
+            ((100, 10, 0), {"total_tokens": 110}),
+            ((125, 11, 200), {}),
+            ((130, 13, 300), {"total_tokens": 443}),
+        ):
+            with self.subTest(counts=counts, extra=extra):
+                fresh, output, cached = (cur - old for cur, old in zip(counts, prev))
+                usage = _delta_worker_usage(dict(
+                    input_tokens=counts[0], output_tokens=counts[1], cache_read_tokens=counts[2], **extra
+                ), baseline).as_chat_usage()
+                self.assertEqual(usage.prompt_tokens, fresh + cached)
+                self.assertEqual(usage.total_tokens, fresh + cached + output)
+                self.assertNotIn("total_tokens", baseline)
+                prev = counts
 
     def test_omitted_fields_do_not_reset_unrelated_counters(self):
         baseline: dict[str, int] = {}
@@ -151,15 +151,11 @@ class WorkerTurnUsageTests(unittest.TestCase):
         patcher_auth = patch("client.is_authenticated", return_value=True)
         patcher_token = patch("process.resolve_real_token_path", return_value=None)
         patcher_cmd = patch("client.resolve_agy_command", return_value="agy")
+        patcher_catalog = patch("models.load_catalog", return_value={})
         patcher_keychains = patch("process._link_macos_keychains")
-        patcher_auth.start()
-        patcher_token.start()
-        patcher_cmd.start()
-        patcher_keychains.start()
-        self.addCleanup(patcher_auth.stop)
-        self.addCleanup(patcher_token.stop)
-        self.addCleanup(patcher_cmd.stop)
-        self.addCleanup(patcher_keychains.stop)
+        for patcher in (patcher_auth, patcher_token, patcher_cmd, patcher_catalog, patcher_keychains):
+            patcher.start()
+            self.addCleanup(patcher.stop)
 
     def _client(self) -> AntigravityClient:
         # A real per-test temp dir as cwd on every platform: hardcoded
@@ -172,6 +168,63 @@ class WorkerTurnUsageTests(unittest.TestCase):
         client = AntigravityClient(cwd=temp_dir.name)
         self.addCleanup(client.close)
         return client
+
+    def test_hydrogen_usage_matches_hermes_chat_contract(self):
+        # Per-turn counts from the agy trajectory: a cold priming call followed
+        # by two visible calls, including the one Hermes logged as 100% cached.
+        # Wrap them in session snapshots, the format of agy's worker results.
+        from agent.usage_pricing import normalize_usage
+
+        turns = [(15_291, 0, 87), (25_513, 23_837, 1_904), (4_536, 232_613, 662)]
+        cum_in = cum_cache = cum_out = 0
+        events = []
+        for n, (fresh, cached, out) in enumerate(turns, 1):
+            cum_in += fresh
+            cum_cache += cached
+            cum_out += out
+            events.append(_turn_events("conv-1", f"answer {n}", {
+                "input_tokens": cum_in, "cache_read_tokens": cum_cache,
+                "output_tokens": cum_out, "total_tokens": cum_in + cum_out,
+            }))
+        client = self._client()
+        proc = _mock_proc(_turn_lines(*events))
+        hydrogen = "gemini-4-hydrogen-high"
+        with (
+            patch("subprocess.Popen", return_value=proc) as popen,
+            patch.object(client, "_resolve_model_and_effort", return_value=(hydrogen, "high")),
+            patch("client._worker_cpu_seconds", return_value=None),
+        ):
+            for stream, messages, (fresh, cached, out) in zip(
+                (True, False, True), (MESSAGES_TURN_1, MESSAGES_TURN_2, MESSAGES_TURN_3), turns
+            ):
+                with self.subTest(fresh=fresh, cached=cached):
+                    result = client.chat.completions.create(model=hydrogen, messages=messages, stream=stream)
+                    self.assertIs(client._worker_proc, proc)
+                    usage = _usage_of(list(result)) if stream else result.usage
+                    self.assertEqual(usage.prompt_tokens, fresh + cached)
+                    self.assertEqual(usage.total_tokens, fresh + cached + out)
+                    self.assertEqual(usage.prompt_tokens_details.cached_tokens, cached)
+                    canonical = normalize_usage(usage, provider="antigravity-subscription-directsdk",
+                                                api_mode="chat_completions")
+                    self.assertEqual((canonical.input_tokens, canonical.cache_read_tokens,
+                                      canonical.output_tokens, canonical.total_tokens),
+                                     (fresh, cached, out, fresh + cached + out))
+        self.assertEqual(popen.call_count, 1, "must exercise deltas on a single worker")
+
+    def test_concurrent_oneshot_reports_cache_as_part_of_prompt(self):
+        client = self._client()
+        proc = _mock_proc(_turn_lines(_turn_events("oneshot", "answer", {
+            "input_tokens": 800, "cache_read_tokens": 4_000, "output_tokens": 12,
+        })), alive=False)
+        self.assertTrue(client._worker_lock.acquire(blocking=False))
+        try:
+            with patch("subprocess.Popen", return_value=proc):
+                result = client.chat.completions.create(model=MODEL, messages=MESSAGES_TURN_1)
+        finally:
+            client._worker_lock.release()
+        self.assertEqual((result.usage.prompt_tokens, result.usage.total_tokens), (4_800, 4_812))
+        self.assertEqual(result.usage.prompt_tokens_details.cached_tokens, 4_000)
+        self.assertEqual(client._worker_usage_baseline, {})
 
     def test_consecutive_worker_turns_report_per_turn_deltas_streaming(self):
         client = self._client()
@@ -196,7 +249,7 @@ class WorkerTurnUsageTests(unittest.TestCase):
                 self.assertEqual(usage.total_tokens, expected[2])
         self.assertEqual(
             client._worker_usage_baseline,
-            {"input_tokens": 37261, "output_tokens": 284, "total_tokens": 37545, "cache_read_tokens": 0},
+            {"input_tokens": 37261, "output_tokens": 284, "cache_read_tokens": 0},
         )
 
     def test_consecutive_worker_turns_report_per_turn_deltas_nonstreaming(self):
@@ -221,7 +274,7 @@ class WorkerTurnUsageTests(unittest.TestCase):
                 self.assertEqual(res.usage.total_tokens, expected[2])
         self.assertEqual(
             client._worker_usage_baseline,
-            {"input_tokens": 37261, "output_tokens": 284, "total_tokens": 37545, "cache_read_tokens": 0},
+            {"input_tokens": 37261, "output_tokens": 284, "cache_read_tokens": 0},
         )
 
     def test_worker_respawn_resets_usage_baseline(self):
@@ -254,7 +307,7 @@ class WorkerTurnUsageTests(unittest.TestCase):
             self.assertEqual(res2.usage.total_tokens, 62)
         self.assertEqual(
             client._worker_usage_baseline,
-            {"input_tokens": 55, "output_tokens": 7, "total_tokens": 62},
+            {"input_tokens": 55, "output_tokens": 7},
         )
 
     def test_decreasing_counter_resets_only_that_counter(self):
@@ -318,20 +371,20 @@ class WorkerTurnUsageTests(unittest.TestCase):
                 )
             )
 
-        self.assertEqual(usage1.prompt_tokens, 100)
+        self.assertEqual(usage1.prompt_tokens, 105)
         self.assertEqual(usage1.completion_tokens, 10)
         self.assertEqual(usage1.prompt_tokens_details.cached_tokens, 5)
-        self.assertEqual(usage1.total_tokens, 110)  # fallback: 100 + 10
+        self.assertEqual(usage1.total_tokens, 115)
 
         self.assertEqual(usage2.prompt_tokens, 150)
         self.assertEqual(usage2.completion_tokens, 30)  # 40 - 10
         self.assertEqual(usage2.prompt_tokens_details.cached_tokens, 0)
-        self.assertEqual(usage2.total_tokens, 180)  # fallback: 150 + 30
+        self.assertEqual(usage2.total_tokens, 180)
 
-        self.assertEqual(usage3.prompt_tokens, 150)
+        self.assertEqual(usage3.prompt_tokens, 175)
         self.assertEqual(usage3.completion_tokens, 0)
         self.assertEqual(usage3.prompt_tokens_details.cached_tokens, 25)  # 30 - 5
-        self.assertEqual(usage3.total_tokens, 150)  # fallback: 150 + 0
+        self.assertEqual(usage3.total_tokens, 175)
 
         self.assertEqual(
             client._worker_usage_baseline,
@@ -416,7 +469,6 @@ class WorkerTurnUsageTests(unittest.TestCase):
         turn_one_baseline = {
             "input_tokens": 12233,
             "output_tokens": 134,
-            "total_tokens": 12367,
             "cache_read_tokens": 0,
         }
         with patch("subprocess.Popen", return_value=proc):
@@ -471,7 +523,7 @@ class WorkerTurnUsageTests(unittest.TestCase):
             )
             self.assertEqual(
                 client._worker_usage_baseline,
-                {"input_tokens": 24673, "output_tokens": 209, "total_tokens": 24882, "cache_read_tokens": 0},
+                {"input_tokens": 24673, "output_tokens": 209, "cache_read_tokens": 0},
             )
 
     def test_concurrent_oneshot_fallback_does_not_touch_worker_baseline(self):
@@ -504,7 +556,7 @@ class WorkerTurnUsageTests(unittest.TestCase):
             baseline_after_worker_turn = dict(client._worker_usage_baseline)
             self.assertEqual(
                 baseline_after_worker_turn,
-                {"input_tokens": 100, "output_tokens": 10, "total_tokens": 110},
+                {"input_tokens": 100, "output_tokens": 10},
             )
 
             # A concurrent request falls back to oneshot while the worker lock
