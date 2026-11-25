@@ -1071,6 +1071,7 @@ class AntigravityStream(Iterator[Any]):
             terminate = self.client._terminate_process
             started = time.monotonic()
             idle_since = [started]
+            saw_output = [False]
 
             def _stall_loop() -> None:
                 # Sleeps exactly until the next moment that can matter, so
@@ -1085,7 +1086,9 @@ class AntigravityStream(Iterator[Any]):
                             break
                         idle = now - idle_since[0]
                         if idle >= stall_seconds:
-                            phase = "after its last output" if idle_since[0] != started else "since start"
+                            # A flag, not a clock comparison: Windows' ~15 ms
+                            # tick can stamp the first line with `started`.
+                            phase = "after its last output" if saw_output[0] else "since start"
                             stall_detail.append(
                                 f"agy silent for {idle:.0f}s {phase} "
                                 f"({_STREAM_STALL_ENV}={stall_seconds:g}); process terminated"
@@ -1126,6 +1129,7 @@ class AntigravityStream(Iterator[Any]):
 
                 last_stdout_at = time.monotonic()
                 idle_since[0] = last_stdout_at
+                saw_output[0] = True
                 if self.is_worker:
                     # The idle countdown reads this to tell a busy worker from
                     # one whose turn died holding the worker lock.
