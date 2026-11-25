@@ -406,6 +406,7 @@ class AntigravityStream(Iterator[Any]):
         # remain is a priming ACK. It is consumed here, never yielded, and
         # the next part is written. Oneshots close stdin after the last part.
         self._pending_segments: list[str] = list(followup_segments or [])
+        self._segment_step_usage: dict[str, Any] | None = None
         self._segment_total = len(self._pending_segments) + 1
         # The final call's input spans every part, so the delivery check
         # (issue #29) compares it against the size of all parts together.
@@ -906,6 +907,12 @@ class AntigravityStream(Iterator[Any]):
         same way a normal turn neutralizes it, but as an error: no answer
         exists yet that could carry the explanation.
         """
+        usage = step.get("usage")
+        if isinstance(usage, dict):
+            # The non-priming path accepts usage from either channel; a part
+            # that reports it only here would otherwise leave the baseline
+            # short and the final part over-reporting.
+            self._segment_step_usage = usage
         if step.get("step_type") != "tool":
             return
         tool_name = str(step.get("tool_name") or "")
@@ -925,6 +932,16 @@ class AntigravityStream(Iterator[Any]):
             "nothing was executed"
         )
 
+    def _note_agent_rejection(self, detail: object) -> None:
+        """Record that agy refused the plugin's agent, if this client named it.
+
+        The record is process-wide and matches on error text. A client whose
+        ANTIGRAVITY_ARGS name another agent, or one that opted out, must not
+        switch the feature off for every other client in the process.
+        """
+        if getattr(self.client, "_custom_agent_named", False):
+            note_custom_agent_rejection(detail)
+
     def _finish_priming_turn(self, res: dict[str, Any]) -> None:
         """Consume the result of a priming part and send the next part.
 
@@ -937,6 +954,9 @@ class AntigravityStream(Iterator[Any]):
         error = res.get("error")
         if error or status != "SUCCESS":
             if error:
+                # A split full send raises here, before the result handler
+                # that records a refused agent. Record it here too.
+                self._note_agent_rejection(error)
                 raise RuntimeError(f"Antigravity model error: {error}")
             raise RuntimeError(
                 "Antigravity execution failed: context priming part "
@@ -944,7 +964,8 @@ class AntigravityStream(Iterator[Any]):
             )
         if self.conversation_id and self.is_worker and self.client and hasattr(self.client, "_set_worker_conversation_id"):
             self.client._set_worker_conversation_id(self.conversation_id)
-        usage = res.get("usage")
+        usage = res.get("usage") or self._segment_step_usage
+        self._segment_step_usage = None
         baseline = self.usage_baseline if self.is_worker else self._segment_usage_baseline
         if isinstance(usage, dict) and baseline is not None:
             _delta_worker_usage(usage, baseline)
@@ -1362,7 +1383,7 @@ class AntigravityStream(Iterator[Any]):
                         # agy reports an agent it cannot run as a failed
                         # result. Recorded here so the retry of this turn
                         # spawns without the agent.
-                        note_custom_agent_rejection(error_msg)
+                        self._note_agent_rejection(error_msg)
                     saw_result = True
                     # Fold a response that never streamed as deltas into the
                     # buffer so the post-loop flush emits it as content.
@@ -1533,6 +1554,9 @@ class AntigravityStream(Iterator[Any]):
                     if quota_err:
                         raise RuntimeError(f"Antigravity model error: {quota_err}")
                     err_detail = error_msg or stderr_out.strip() or f"Process exited with return code {returncode}"
+                    # An agy that refuses the spawn says so on stderr and
+                    # exits (3) without a result event.
+                    self._note_agent_rejection(err_detail)
                     raise RuntimeError(f"Antigravity execution failed: {err_detail}")
 
                 # Precedence: this positive-evidence raise comes AFTER the
@@ -1599,6 +1623,7 @@ class AntigravityStream(Iterator[Any]):
                         raise RuntimeError(f"Antigravity model error: {quota_err}")
                     stderr_out = self._get_stderr_tail()
                     err_detail = error_msg or stderr_out.strip() or f"worker process exited with return code {worker_exit}"
+                    self._note_agent_rejection(err_detail)
                     raise RuntimeError(f"Antigravity execution failed: {err_detail}")
 
                 # Positive-evidence verdict, placed AFTER the quota and
@@ -1787,7 +1812,16 @@ def collect_stream_completion(stream: AntigravityStream) -> Any:
     if not tool_calls and full_content and "<tool_call>" in full_content:
         extracted_calls, cleaned = _parse_tool_block(full_content)
         # A call whose arguments could not be made valid is never returned.
-        extracted_calls = [c for c in extracted_calls if not getattr(c, "arguments_error", None)]
+        withheld = [c for c in extracted_calls if getattr(c, "arguments_error", None)]
+        if withheld:
+            # The streaming path raises here. Returning the rest would run a
+            # subset of what the model asked for, or nothing, without a word.
+            names = ", ".join(dict.fromkeys(c.function.name for c in withheld))
+            raise RuntimeError(
+                "Antigravity execution failed: tool call arguments for "
+                f"{names} are not valid JSON and could not be repaired "
+                f"({withheld[0].arguments_error}); nothing was executed"
+            )
         if extracted_calls:
             tool_calls = extracted_calls
             full_content = cleaned or None

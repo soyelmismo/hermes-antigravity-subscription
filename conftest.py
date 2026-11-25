@@ -94,7 +94,7 @@ def _agy_default_agent(monkeypatch):
     """
     for name in ("custom_agent", f"{CANONICAL_MODULE}.custom_agent"):
         module = importlib.import_module(name)
-        monkeypatch.setattr(module, "agy_version", lambda command: None)
+        monkeypatch.setattr(module, "agy_version", lambda command, env=None: None)
         monkeypatch.setattr(module, "_rejected", False)
     yield
 
