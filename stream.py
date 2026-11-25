@@ -1087,12 +1087,13 @@ class AntigravityStream(Iterator[Any]):
         stall_seconds = _stream_stall_seconds()
         stall_thread: threading.Thread | None = None
         stall_detail: list[str] = []
+        # Written for every stdout line, watchdog on or off, so they exist in both cases.
+        idle_since = [time.monotonic()]
+        saw_output = [False]
         if stall_seconds > 0:
             proc = self.proc
             terminate = self.client._terminate_process
             started = time.monotonic()
-            idle_since = [started]
-            saw_output = [False]
 
             def _stall_loop() -> None:
                 # Sleeps exactly until the next moment that can matter, so
