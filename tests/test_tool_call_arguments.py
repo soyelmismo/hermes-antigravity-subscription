@@ -39,6 +39,10 @@ TERMINAL_SCHEMA = {
     },
     "required": ["command"],
 }
+# POSIX only. On a Windows runner ``bash`` resolves to the WSL launcher in
+# System32 (no distribution installed: exit 1, empty stderr), not to Git's.
+_BASH = os.name == "posix" and bool(shutil.which("bash"))
+
 TOOLS = [{"type": "function", "function": {"name": "terminal", "parameters": TERMINAL_SCHEMA}}]
 SCHEMAS = {"terminal": TERMINAL_SCHEMA}
 
@@ -71,7 +75,7 @@ class CorpusTests(unittest.TestCase):
                     body = re.search(r"<<'PY'\n(.*?)\nPY", command, re.S).group(1)
                     compile(body, item["id"], "exec")
                     self.assertIn('"DIR" if', body)
-                if shutil.which("bash"):
+                if _BASH:
                     check = subprocess.run(["bash", "-n", "-c", command], capture_output=True, text=True)
                     self.assertEqual(check.returncode, 0, check.stderr)
 
@@ -110,7 +114,7 @@ class LenientDecoderTests(unittest.TestCase):
         self.assertIsNone(error)
         command = json.loads(args)["command"]
         self.assertEqual(command, r"printf 'a.b|c\n' | sed 's/\./,/g' | grep -c 'a\|z'")
-        if shutil.which("bash"):
+        if _BASH:
             # Run it: a semantic check bash -n cannot make.
             out = subprocess.run(["bash", "-c", command], capture_output=True, text=True)
             self.assertEqual(out.stdout.strip(), "1")
