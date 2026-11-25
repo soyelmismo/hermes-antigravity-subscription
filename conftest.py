@@ -23,6 +23,7 @@ place before the first ``import providers``.
 
 from __future__ import annotations
 
+import importlib
 import importlib.util
 import os
 import shutil
@@ -78,6 +79,23 @@ def _source_tree_profile_wins():
     profile = PLUGIN.antigravity_profile
     if providers.get_provider_profile(PROFILE_NAME) is not profile:
         providers.register_provider(profile)
+    yield
+
+
+@pytest.fixture(autouse=True)
+def _agy_default_agent(monkeypatch):
+    """Spawn agy's default agent unless a test asks for the custom one.
+
+    custom_agent.py names its agent only when the host's agy is new enough, so
+    the spawn arguments every other test pins would differ between a dev box
+    with a current agy and CI, which has none. Reporting no readable version
+    keeps them at the baseline; tests of the custom agent patch a version in.
+    The plugin's modules load under two names (see above), so both are covered.
+    """
+    for name in ("custom_agent", f"{CANONICAL_MODULE}.custom_agent"):
+        module = importlib.import_module(name)
+        monkeypatch.setattr(module, "agy_version", lambda command: None)
+        monkeypatch.setattr(module, "_rejected", False)
     yield
 
 

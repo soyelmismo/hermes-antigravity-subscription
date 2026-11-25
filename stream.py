@@ -17,6 +17,7 @@ from types import SimpleNamespace
 from typing import Any, Iterator, NamedTuple
 
 try:
+    from .custom_agent import note_custom_agent_rejection
     from .process import _check_early_quota_error
     from .prompt import (
         _TOOL_CALL_CLOSE,
@@ -31,6 +32,7 @@ try:
         media_reference_paths,
     )
 except ImportError:
+    from custom_agent import note_custom_agent_rejection
     from process import _check_early_quota_error
     from prompt import (
         _TOOL_CALL_CLOSE,
@@ -1260,6 +1262,10 @@ class AntigravityStream(Iterator[Any]):
                         usage_data = res["usage"]
                     if "error" in res:
                         error_msg = res["error"]
+                        # agy reports an agent it cannot run as a failed
+                        # result. Recorded here so the retry of this turn
+                        # spawns without the agent.
+                        note_custom_agent_rejection(error_msg)
                     saw_result = True
                     # Fold a response that never streamed as deltas into the
                     # buffer so the post-loop flush emits it as content.

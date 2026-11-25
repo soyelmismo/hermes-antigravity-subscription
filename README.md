@@ -20,6 +20,7 @@ This plugin lets Hermes use Gemini and Claude models through your existing Antig
 - **Stream timeouts**: Streaming calls use the read budget of the `httpx.Timeout` Hermes passes (for `agy://local`, normally `HERMES_API_TIMEOUT`, 1800 s) as the turn deadline. Scalar timeouts are unchanged; with no timeout the 300 s default applies. A turn that ends without agy's `result` event reports why reading stopped (`stream deadline` or `stdout closed`), the elapsed time, and the age of the last stdout line.
 - **Tool call routing**: The model emits `<tool_call>` tags in text. The plugin parses these into OpenAI function call deltas, so Hermes executes tools on the host instead of `agy`. A literal `</tool_call>` inside a JSON argument does not end the frame, multiple calls in one turn get unique indices and ids, and a stream that ends inside an unfinished block fails the turn instead of returning the raw block as assistant text.
 - **Early quota detection**: While waiting for the first content event, a log watcher aborts the turn on `RESOURCE_EXHAUSTED`/429 or credit-cap lines written during that turn. Log mtimes are compared in wall-clock time; `init` alone does not disarm the watcher, the first non-init event does.
+- **Own agent instead of agy's**: On `agy` 1.5.16 or newer the plugin spawns `agy` with `--agent hermes-inference-backend`, a Markdown agent it writes under the isolated HOME (`.gemini/config/agents/`) with `excludeDefaultComponents: true`. That agent carries none of `agy`'s default prompt sections and none of its built-in tools except `read_file`, which the media pipeline needs. Same one-line question through the plugin on `gemini-3.8-flash-low`: the default agent answers "I am Antigravity", lists 15 native tools and costs 10,749 input tokens; this agent answers "My name is Hermes", lists `read_file` and `manage_task` and costs 1,218. Older `agy` versions, `ANTIGRAVITY_DISABLE_CUSTOM_AGENT=1`, an `--agent` already present in `ANTIGRAVITY_ARGS`, or a spawn `agy` rejects all fall back to the default agent.
 - **Tool execution guard**: `agy` registers local system tools by default. This plugin runs `agy` in headless mode without permissions skip flags. If `agy` attempts to execute an internal tool step, the stream closes and terminates the child process.
 - **Thinking effort mapping**: Maps Hermes reasoning effort settings (`low`, `medium`, `high`) to backend model variants (`gemini-3.8-flash-low`, `gemini-3.8-flash-high`).
 - **Subagent concurrency**: Each completion turn runs in its own process group (`start_new_session=True`). Multiple Hermes subagents can request completions concurrently without shared state.
@@ -80,7 +81,7 @@ Reasoning text in `stream-json` remains blocked upstream: `agy` exposes no flag 
 
 ### Model Compatibility
 
-`agy` embeds its own system prompt ("you are Antigravity, you have `run_command`, `view_file`, ...") before the plugin's preamble. Some models obey `agy`'s prompt over the plugin's `<tool_call>` protocol and invoke native tools, which headless mode soft-denies. The plugin detects this and terminates the stream, but the turn is lost.
+`agy`'s default agent embeds its own system prompt ("you are Antigravity, you have `run_command`, `view_file`, ...") before the plugin's preamble. Some models obey `agy`'s prompt over the plugin's `<tool_call>` protocol and invoke native tools, which headless mode soft-denies. The plugin detects this and terminates the stream, but the turn is lost.
 
 | Model | `<tool_call>` Protocol | Notes |
 | :--- | :--- | :--- |
@@ -92,7 +93,9 @@ Reasoning text in `stream-json` remains blocked upstream: `agy` exposes no flag 
 | `claude-sonnet-4-6` | Partial | Works with moderate toolsets (tested up to 10 tools); refuses or flips to native with large toolsets (~40 tools) |
 | `gpt-oss-120b` | Follows | Tested with full toolset |
 
-Models that ignore the protocol attempt `agy`'s native `RunCommand`/`WriteToFile` steps. The plugin neutralizes these (stream watcher kills the process), but every tool-using turn fails. This is an upstream `agy` limitation: the persona prompt is embedded in the closed binary with no configuration surface to suppress it.
+Models that ignore the protocol attempt `agy`'s native `RunCommand`/`WriteToFile` steps. The plugin neutralizes these (stream watcher kills the process), but every tool-using turn fails. The table describes `agy`'s default agent, which is what runs on `agy` older than 1.5.16.
+
+On `agy` 1.5.16 or newer the plugin runs its own agent instead (see **Own agent instead of agy's** above), so the persona prompt and the `run_command`/`write_file` tools are not there to obey. Measured on `claude-sonnet-4-6` with Hermes' 37-tool schema and a prompt that needs the `terminal` tool, 8 runs each: the default agent emitted `<tool_call>` 6 times and went native (`run_command`, neutralized, turn lost) twice; the plugin's agent emitted `<tool_call>` 8 times. `read_file` stays available for media, so a model can still attempt a native read of a non-media path; that step is neutralized as before. `gemini-3.6-flash` was not on the account used for the measurement, so its row is unverified under the plugin's agent.
 
 ---
 
@@ -235,6 +238,7 @@ Multiple agy sessions on one account contend for the shared OAuth token: whoever
 | `HERMES_ANTIGRAVITY_SEGMENT_WEIGHT` | `90000` (Gemini), off (Claude) | Largest single message of a full send, in weight units (1 per ASCII character, 2 per non-ASCII character). Heavier full sends are split into consecutive turns of one conversation. Setting it applies to every model; `0` disables splitting (Gemini then declares 75,000). Also checks `ANTIGRAVITY_SEGMENT_WEIGHT`. |
 | `ANTIGRAVITY_COMMAND` | `agy` | Path to the `agy` binary. Also checks `AGY_CLI_PATH` and `ANTIGRAVITY_CLI_PATH`. |
 | `ANTIGRAVITY_ARGS` | (none) | Extra arguments to pass to the `agy` subprocess. |
+| `ANTIGRAVITY_DISABLE_CUSTOM_AGENT` | `false` | `1`, `true`, `yes` or `on`: spawn `agy`'s default agent instead of the plugin's `hermes-inference-backend` agent. The default agent brings back `agy`'s persona prompt and built-in tools. |
 | `ANTIGRAVITY_CONFIG_DIR` | (none) | Override the config directory, bypassing keyring and token-file detection. |
 | `ANTIGRAVITY_DEBUG_PROMPT_DIR` | (none) | Directory to dump outgoing prompts sent to `agy` for offline diagnosis. |
 | `ANTIGRAVITY_WORKER_IDLE_SECONDS` | `900` | Terminate the persistent `agy` worker after this many seconds without a finished turn. The next turn starts a fresh worker with the full prompt. `0` or a negative value disables the bound. |
