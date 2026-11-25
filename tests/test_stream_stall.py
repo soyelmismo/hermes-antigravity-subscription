@@ -159,6 +159,29 @@ class StreamStallTests(unittest.TestCase):
         self.assertIn("stdout closed", str(ctx.exception))
         self.assertNotIn("agy silent", str(ctx.exception))
 
+    def test_zero_keeps_a_turn_that_writes_stdout(self) -> None:
+        # Regression for the review on the catalog bump: the two cells the
+        # watchdog reads were created only when the watchdog ran, while every
+        # stdout line writes them, so 0 broke the first turn with output.
+        with patch.dict("os.environ", {_STREAM_STALL_ENV: "0"}):
+            proc = _HangingProc([
+                _line({"event": "init", "conversation_id": "c1"}),
+                _line({"event": "step_update", "step_update": {"text_delta": "partial answer"}}),
+            ])
+            proc.terminate()
+            stream, _client = self._stream(proc)
+            chunks = []
+            with self.assertRaises(RuntimeError) as ctx:
+                for chunk in stream:
+                    chunks.append(chunk)
+        text = "".join(
+            c.choices[0].delta.content for c in chunks if c.choices and c.choices[0].delta.content
+        )
+        self.assertEqual(text, "partial answer")
+        self.assertIn("stdout closed", str(ctx.exception))
+        self.assertNotIn("agy silent", str(ctx.exception))
+        self.assertIsNone(stream._stall_done)
+
     def test_budget_parsing(self) -> None:
         for raw, expected in (("", _DEFAULT_STREAM_STALL_SECONDS), ("120", 120.0), ("0", 0.0), ("-5", 0.0), ("soon", _DEFAULT_STREAM_STALL_SECONDS)):
             with self.subTest(raw=raw), patch.dict("os.environ", {_STREAM_STALL_ENV: raw}):
