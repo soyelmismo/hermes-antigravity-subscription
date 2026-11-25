@@ -24,6 +24,7 @@ if str(plugin_dir) not in sys.path:
 
 import custom_agent
 from client import AntigravityClient
+from stream import AntigravityStream
 from custom_agent import (
     AGENT_NAME,
     MIN_AGY_VERSION,
@@ -272,6 +273,36 @@ class ClientSpawnTests(unittest.TestCase):
             ))
         self.assertEqual(self.spawns[0].count("--agent"), 1)
         self.assertNotIn(AGENT_NAME, self.spawns[0])
+
+    def test_a_spawn_agy_rejects_at_exit_drops_the_agent_too(self):
+        # agy 1.2-era shapes: no result event, exit 3, the refusal on stderr.
+        # Recorded nowhere before, so every later turn repeated the spawn.
+        rejecting = _worker([])
+        rejecting.poll.return_value = 3
+        messages = [{"role": "user", "content": "hi"}]
+        client = self._client()
+        with self._popen(rejecting, _answering("hello")):
+            with patch.object(AntigravityStream, "_get_stderr_tail", return_value=UNKNOWN_AGENT):
+                with self.assertRaisesRegex(RuntimeError, "unknown agent"):
+                    list(client.chat.completions.create(model="gemini-3.8-flash", messages=messages, stream=True))
+            chunks = list(client.chat.completions.create(model="gemini-3.8-flash", messages=messages, stream=True))
+        self.assertIn("--agent", self.spawns[0])
+        self.assertNotIn("--agent", self.spawns[1])
+        text = "".join(chunk.choices[0].delta.content or "" for chunk in chunks if chunk.choices)
+        self.assertEqual(text, "hello")
+
+    def test_an_agent_this_client_never_named_is_not_marked_rejected(self):
+        # `_rejected` is process-wide: another client's `--agent` in
+        # ANTIGRAVITY_ARGS, or any error text containing the signature,
+        # must not switch this feature off for everybody.
+        rejecting = _worker([])
+        rejecting.poll.return_value = 3
+        client = self._client(args=["--output-format", "stream-json", "--agent", "someone-elses"])
+        with self._popen(rejecting):
+            with patch.object(AntigravityStream, "_get_stderr_tail", return_value=UNKNOWN_AGENT):
+                with self.assertRaisesRegex(RuntimeError, "unknown agent"):
+                    list(client.chat.completions.create(model="gemini-3.8-flash", messages=[{"role": "user", "content": "hi"}], stream=True))
+        self.assertFalse(custom_agent._rejected)
 
     def test_a_rejected_agent_fails_the_turn_and_the_retry_runs_the_default_agent(self):
         client = self._client()

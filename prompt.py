@@ -1513,7 +1513,12 @@ def _lenient_json_loads(text: str) -> tuple[Any, dict[str, int]]:
     """
     fixes = {"escape": 0, "quote": 0}
     s = text
-    for _ in range(_MAX_JSON_FIXES + 1):
+    # A slip is one character, so a body can carry at most len(text) of
+    # them; a generated grep pipeline runs to one every dozen. The budget
+    # bounds the quadratic loop (one decode attempt per fix) without
+    # refusing a long hand-escaped script for its number of slips.
+    budget = max(_MAX_JSON_FIXES, len(text) // 10)
+    for _ in range(budget + 1):
         try:
             return json.loads(s, strict=False), fixes
         except json.JSONDecodeError as exc:

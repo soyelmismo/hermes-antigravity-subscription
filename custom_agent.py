@@ -89,8 +89,13 @@ _versions: dict[str, tuple[int, ...] | None] = {}
 _rejected = False
 
 
-def agy_version(command: str) -> tuple[int, ...] | None:
-    """The version ``command --version`` prints, or None when it cannot be read."""
+def agy_version(command: str, env: dict[str, str] | None = None) -> tuple[int, ...] | None:
+    """The version ``command --version`` prints, or None when it cannot be read.
+
+    ``env`` is the environment the real spawn gets. Without it the probe would
+    run under Hermes' own HOME and without the auto-update lock the isolated
+    home exists to provide.
+    """
     with _lock:
         if command in _versions:
             return _versions[command]
@@ -101,6 +106,7 @@ def agy_version(command: str) -> tuple[int, ...] | None:
             capture_output=True,
             text=True,
             timeout=5,
+            env=env,
             **_no_window(),
         )
         match = re.search(r"(\d+)\.(\d+)\.(\d+)", str(res.stdout))
@@ -131,8 +137,17 @@ def custom_agent_args(command: str, isolated_home: Path | str) -> list[str]:
     """
     if _rejected or _opted_out():
         return []
-    version = agy_version(command)
+    try:
+        from .process import build_child_env
+    except ImportError:
+        from process import build_child_env
+    version = agy_version(command, env=build_child_env(isolated_home))
     if version is None or version < MIN_AGY_VERSION:
+        logger.debug(
+            "Antigravity %s is older than %s or its version is unreadable; running agy's default agent.",
+            ".".join(str(part) for part in version) if version else "version",
+            ".".join(str(part) for part in MIN_AGY_VERSION),
+        )
         return []
     path = agent_path(isolated_home)
     try:

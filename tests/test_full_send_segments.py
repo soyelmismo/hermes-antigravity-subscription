@@ -24,6 +24,8 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import client as client_module  # noqa: E402
 import prompt as prompt_module  # noqa: E402
+import custom_agent  # noqa: E402
+import stream as stream_module  # noqa: E402
 from client import AntigravityClient  # noqa: E402
 from prompt import (  # noqa: E402
     _format_messages_as_prompt,
@@ -369,6 +371,35 @@ class SegmentedSendTests(unittest.TestCase):
         self.assertEqual(len(proc.stdin.writes), 2)
         self.assertFalse(proc.alive)
         self.assertEqual(c._worker_history, [])
+
+    def test_priming_usage_reported_only_on_a_step_still_advances_the_baseline(self):
+        # agy may put a turn's usage on its step_update instead of the result.
+        turns = _cumulative(self.n_parts)
+        for i in range(self.n_parts - 1):
+            result = turns[i][-1]["result"]
+            usage = result.pop("usage")
+            turns[i].insert(2, {"event": "step_update", "step_update": {"usage": usage}})
+        proc = _TurnProcess(turns)
+        self.pending.append(proc)
+        c = self._client()
+        chunks = list(c.chat.completions.create(model=GEMINI, messages=_history(), stream=True))
+        usage = [ch.usage for ch in chunks if getattr(ch, "usage", None) is not None][-1]
+        self.assertEqual(usage.prompt_tokens, 1000 * self.n_parts)
+
+    def test_an_agent_refused_during_priming_is_recorded(self):
+        # A split full send fails in _finish_priming_turn, before the result
+        # handler that records a refused agent. It must be recorded here too.
+        turns = _cumulative(self.n_parts)
+        turns[0] = _turn("", {"input_tokens": 1}, status="ERROR", error='unknown agent "hermes-inference-backend"')
+        proc = _TurnProcess(turns)
+        self.pending.append(proc)
+        c = self._client()
+        # The client names the agent itself; a spawn overwrites the flag.
+        with patch.object(custom_agent, "agy_version", return_value=custom_agent.MIN_AGY_VERSION), \
+                patch.object(stream_module, "note_custom_agent_rejection", return_value=True) as note:
+            with self.assertRaisesRegex(RuntimeError, "unknown agent"):
+                list(c.chat.completions.create(model=GEMINI, messages=_history(), stream=True))
+        self.assertEqual(note.call_count, 1)
 
     def test_native_tool_while_priming_aborts_and_kills_the_worker(self):
         turns = _cumulative(self.n_parts)

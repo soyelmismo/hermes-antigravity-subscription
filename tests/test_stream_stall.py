@@ -20,6 +20,7 @@ from unittest.mock import MagicMock, patch
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import stream as stream_module  # noqa: E402
 from stream import (  # noqa: E402
+    collect_stream_completion,
     _DEFAULT_STREAM_STALL_SECONDS,
     _STREAM_STALL_ENV,
     AntigravityStream,
@@ -166,6 +167,23 @@ class StreamStallTests(unittest.TestCase):
             import os
             os.environ.pop(_STREAM_STALL_ENV, None)
             self.assertEqual(_stream_stall_seconds(), _DEFAULT_STREAM_STALL_SECONDS)
+
+
+class WithheldCallTests(unittest.TestCase):
+    def test_a_call_no_tools_were_offered_for_and_that_cannot_be_decoded_fails_the_turn(self):
+        # Non-streaming fallback. Dropping the call and returning the rest
+        # would answer as if the model had asked for nothing.
+        # The frame's own JSON is broken, so its arguments never decode.
+        text = '<tool_call>{"id": "1", "type": "function", "function": {"name": "terminal", "arguments": "{"}}</tool_call>'
+        proc = _HangingProc([
+            _line({"event": "init", "conversation_id": "c1"}),
+            _line({"event": "step_update", "step_update": {"text_delta": text}}),
+            _line({"event": "result", "result": {"status": "SUCCESS", "response": text, "usage": {}}}),
+        ])
+        proc.terminate()
+        stream = AntigravityStream(proc=proc, client=_Client(proc), model="fixture-only", timeout=5.0)
+        with self.assertRaisesRegex(RuntimeError, "could not be repaired"):
+            collect_stream_completion(stream)
 
 
 if __name__ == "__main__":

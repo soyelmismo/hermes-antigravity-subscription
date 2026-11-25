@@ -526,11 +526,17 @@ class AntigravityClient:
         return resolve_model_and_effort(model, reasoning_effort)
 
     def _agent_args(self) -> list[str]:
-        if any(arg == "--agent" or arg.startswith("--agent=") for arg in self._args):
-            return []  # ANTIGRAVITY_ARGS already names an agent; agy takes one.
-        # Asked at every spawn, not once: a rejected agent is dropped for the
-        # rest of the process, and the retry must already spawn without it.
-        return custom_agent_args(self._command, self._isolated_home)
+        args: list[str] = []
+        if not any(arg == "--agent" or arg.startswith("--agent=") for arg in self._args):
+            # ANTIGRAVITY_ARGS may already name an agent; agy takes one.
+            # Asked at every spawn, not once: a rejected agent is dropped for
+            # the rest of the process, and the retry must already spawn
+            # without it.
+            args = custom_agent_args(self._command, self._isolated_home)
+        # The rejection record is process-wide. Only a client that named the
+        # agent itself may set it (see AntigravityStream._note_agent_rejection).
+        self._custom_agent_named = bool(args)
+        return args
 
     def _child_env(self) -> dict[str, str]:
         return build_child_env(self._isolated_home)

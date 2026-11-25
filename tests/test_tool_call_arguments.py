@@ -179,6 +179,16 @@ class LenientDecoderTests(unittest.TestCase):
         self.assertTrue(calls[0].arguments_error)
 
 
+class RepairBudgetTests(unittest.TestCase):
+    def test_a_long_hand_escaped_script_is_not_refused_for_its_number_of_slips(self):
+        # One slip every 14 characters, 250 in all: a generated grep/find
+        # pipeline, not a body the repair should give up on.
+        text = '{"command": "' + " ".join(["grep 'a\\.b' f"] * 250) + '"}'
+        value, fixes = _lenient_json_loads(text)
+        self.assertEqual(fixes["escape"], 250)
+        self.assertEqual(value["command"].count("grep 'a\\.b' f"), 250)
+
+
 class StreamCorrectionTests(segment_tests.SegmentedSendTests):
     """Protocol through the client, reusing the fake agy of the segment tests."""
 
