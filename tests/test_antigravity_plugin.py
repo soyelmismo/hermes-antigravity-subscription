@@ -2161,9 +2161,13 @@ class AntigravityPluginTests(unittest.TestCase):
                 return real_monotonic()
             return real_monotonic() + _CLOCK_JUMP_SECONDS * calls
 
+        # The stall watchdog reads the same (jumping) clock and would
+        # rightly kill this fake-houred turn; this test is about the
+        # deadline message, not the watchdog.
         with self._stubbed_kill_path() as kill_record, \
                 patch("subprocess.Popen", return_value=proc), \
                 patch("stream.time.monotonic", side_effect=expiring_monotonic), \
+                patch.dict("os.environ", {"ANTIGRAVITY_STREAM_STALL_SECONDS": "0"}), \
                 patch.object(client, "_terminate_process", side_effect=recording_terminate):
             stream = client.chat.completions.create(
                 model="gemini-3.8-flash-high",

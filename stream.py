@@ -279,6 +279,27 @@ class _AwaitableCompletion(SimpleNamespace):
 
 _MAX_TOOL_CALL_CORRECTIONS = 2
 
+# Seconds without a stdout line from agy after which a turn counts as stuck
+# and the process is terminated (issue #65). The turn then fails with the
+# stall in its message and Hermes retries it, instead of waiting out the
+# whole read budget (1800 s under the gateway's default timeout). 300 s: on
+# agy 1.5.16 a healthy claude-sonnet-4-6 turn with a thinking prompt showed
+# 115 s of silence before its first line, so the 120 s the issue proposes
+# would kill live turns.
+_DEFAULT_STREAM_STALL_SECONDS = 300.0
+_STREAM_STALL_ENV = "ANTIGRAVITY_STREAM_STALL_SECONDS"
+
+
+def _stream_stall_seconds() -> float:
+    """Stall budget from ``ANTIGRAVITY_STREAM_STALL_SECONDS``; ``0`` disables it."""
+    raw = os.environ.get(_STREAM_STALL_ENV, "").strip()
+    if not raw:
+        return _DEFAULT_STREAM_STALL_SECONDS
+    try:
+        return max(float(raw), 0.0)
+    except ValueError:
+        return _DEFAULT_STREAM_STALL_SECONDS
+
 
 def _tool_schemas_by_name(tools: list[dict[str, Any]] | None) -> dict[str, Any]:
     """``{tool name: parameters schema}`` from OpenAI-style tool definitions."""
@@ -410,6 +431,10 @@ class AntigravityStream(Iterator[Any]):
         self._interrupted = False
         self._finished = False
         self._early_error: str | None = None
+        # Issue #65. Set by the stall watchdog thread while it lives. The
+        # thread itself never references the stream (see _stream_generator),
+        # so an abandoned stream stays collectable.
+        self._stall_done: threading.Event | None = None
         self._generator = self._stream_generator()
         # Private single-thread executor for the async path, created lazily on
         # the first __anext__ (sync consumers never create one, and a retired
@@ -608,6 +633,10 @@ class AntigravityStream(Iterator[Any]):
         The operation order is identical to the pre-extraction ``close()``
         body; every invariant documented on the individual steps still holds.
         """
+        if self._stall_done is not None:
+            # Stop the stall watchdog now rather than at the generator's exit:
+            # an abandoned generator never reaches that finally.
+            self._stall_done.set()
         if self.is_worker:
             # Terminate the worker only if it is still OURS. The interrupted
             # path runs at an arbitrary later time on an arbitrary thread --
@@ -998,6 +1027,7 @@ class AntigravityStream(Iterator[Any]):
         # None after the loop means the absolute deadline expired.
         stop_reason: str | None = None
         last_stdout_at: float | None = None
+        stall_done: threading.Event | None = None
 
         gemini_dir = getattr(self.client, "_isolated_gemini_dir", None)
         watchdog_stop = threading.Event()
@@ -1025,6 +1055,60 @@ class AntigravityStream(Iterator[Any]):
             )
             watchdog_thread.start()
 
+        # Stall watchdog (issue #65): agy can open its upstream request and
+        # then emit nothing and close nothing, which parks readline() until
+        # the whole read deadline. Any stdout line counts as life, so a model
+        # that thinks for minutes before its first token only has to beat the
+        # budget. Deliberately a second thread and free of `self`: the quota
+        # loop above closes over the stream, and a stream an abandoned
+        # consumer never closed is cyclic-GC-collectable only once every
+        # thread holding it is gone.
+        stall_seconds = _stream_stall_seconds()
+        stall_thread: threading.Thread | None = None
+        stall_detail: list[str] = []
+        if stall_seconds > 0:
+            proc = self.proc
+            terminate = self.client._terminate_process
+            started = time.monotonic()
+            idle_since = [started]
+            saw_output = [False]
+
+            def _stall_loop() -> None:
+                # Sleeps exactly until the next moment that can matter, so
+                # close() wakes it at once instead of within a poll period.
+                while True:
+                    now = time.monotonic()
+                    elapsed = now - started
+                    if elapsed < 1.0:
+                        wake_in = 1.0 - elapsed
+                    else:
+                        if proc.poll() is not None:
+                            break
+                        idle = now - idle_since[0]
+                        if idle >= stall_seconds:
+                            # A flag, not a clock comparison: Windows' ~15 ms
+                            # tick can stamp the first line with `started`.
+                            phase = "after its last output" if saw_output[0] else "since start"
+                            stall_detail.append(
+                                f"agy silent for {idle:.0f}s {phase} "
+                                f"({_STREAM_STALL_ENV}={stall_seconds:g}); process terminated"
+                            )
+                            logger.warning("Antigravity stream stalled: %s", stall_detail[0])
+                            terminate(proc)
+                            break
+                        wake_in = stall_seconds - idle
+                    if stall_done.wait(timeout=wake_in):
+                        break
+
+            stall_done = threading.Event()
+            self._stall_done = stall_done
+            stall_thread = threading.Thread(
+                target=_stall_loop,
+                name="agy-stall-watchdog",
+                daemon=True,
+            )
+            stall_thread.start()
+
         try:
             while time.monotonic() < deadline:
                 self._raise_if_cancelled()
@@ -1038,12 +1122,14 @@ class AntigravityStream(Iterator[Any]):
 
                 if not line:
                     if self.proc.poll() is not None:
-                        stop_reason = "stdout closed"
+                        stop_reason = stall_detail[0] if stall_detail else "stdout closed"
                         break
                     time.sleep(0.01)
                     continue
 
                 last_stdout_at = time.monotonic()
+                idle_since[0] = last_stdout_at
+                saw_output[0] = True
                 if self.is_worker:
                     # The idle countdown reads this to tell a busy worker from
                     # one whose turn died holding the worker lock.
@@ -1428,6 +1514,13 @@ class AntigravityStream(Iterator[Any]):
                 # verdict above, so this failed turn can never reach the
                 # worker-history update.
                 if error_msg or status == "ERROR":
+                    if stall_detail:
+                        # The stall watchdog killed agy and it had time to
+                        # report `interrupted`. Name the stall, or the turn
+                        # reads as a model refusal rather than a hang.
+                        raise RuntimeError(
+                            f"Antigravity execution failed: {stall_detail[0]}; agy reported: {error_msg}"
+                        )
                     raise RuntimeError(f"Antigravity model error: {error_msg}")
 
                 # `not in (None, 0)`, not `!= 0`: with the raw poll() above,
@@ -1490,6 +1583,13 @@ class AntigravityStream(Iterator[Any]):
                 # update; the deltas already yielded cannot be retracted --
                 # Hermes aggregates a stream that raises mid-way.
                 if error_msg or status == "ERROR":
+                    if stall_detail:
+                        # The stall watchdog killed agy and it had time to
+                        # report `interrupted`. Name the stall, or the turn
+                        # reads as a model refusal rather than a hang.
+                        raise RuntimeError(
+                            f"Antigravity execution failed: {stall_detail[0]}; agy reported: {error_msg}"
+                        )
                     raise RuntimeError(f"Antigravity model error: {error_msg}")
 
                 worker_exit = self.proc.poll()
@@ -1621,6 +1721,10 @@ class AntigravityStream(Iterator[Any]):
             raise
         finally:
             watchdog_stop.set()
+            if stall_done is not None:
+                stall_done.set()
+            if stall_thread and stall_thread.is_alive():
+                stall_thread.join(timeout=0.2)
             if watchdog_thread and watchdog_thread.is_alive():
                 watchdog_thread.join(timeout=0.2)
             if self.is_worker:
