@@ -812,7 +812,8 @@ class AntigravityStream(Iterator[Any]):
             error = getattr(call, "arguments_error", None)
             if error:
                 logger.warning("Withholding <tool_call> %s from Hermes: %s", name, error)
-                self._rejected_calls.append((name, error))
+                if (name, error) not in self._rejected_calls:
+                    self._rejected_calls.append((name, error))
                 continue
             key = (name, args)
             if self._corrections_sent and key in self._yielded_call_keys:
@@ -879,7 +880,7 @@ class AntigravityStream(Iterator[Any]):
         if step.get("step_type") != "tool":
             return
         tool_name = str(step.get("tool_name") or "")
-        if self._is_permitted_native_media_step(tool_name, str(step.get("tool_info") or "")):
+        if self._is_permitted_native_media_step(tool_name, step.get("tool_info")):
             logger.info("Antigravity native media attach allowed during context priming: %s", tool_name)
             return
         logger.warning(

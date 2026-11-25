@@ -1482,6 +1482,8 @@ def _has_unfinished_tool_call_frame(
 
 _JSON_QUOTE_FIX_ERRORS = ("Expecting ',' delimiter", "Expecting ':' delimiter", "Extra data")
 _MAX_JSON_FIXES = 200
+# A quoted key right after the quote the decoder stopped at.
+_MISSING_MEMBER_COMMA_RE = re.compile(r'\s*"[^"\\]*"\s*:')
 
 
 def _lenient_json_loads(text: str) -> tuple[Any, dict[str, int]]:
@@ -1539,6 +1541,13 @@ def _lenient_json_loads(text: str) -> tuple[Any, dict[str, int]]:
                     slashes += 1
                 if slashes % 2:
                     raise ValueError(f"{exc.msg} (char {pos})") from None
+                if _MISSING_MEMBER_COMMA_RE.match(s, quote + 1):
+                    # A quoted key follows: the slip is a missing comma between
+                    # two members, not a bare quote inside a string. Escaping
+                    # would merge the key into the previous value, and the
+                    # schema check cannot see it when that key was optional
+                    # ({"path": "/x" "content": "hi"} wrote to /x" "content": "hi).
+                    raise ValueError(f"missing ',' between members (char {quote + 1})") from None
                 s = s[:quote] + "\\" + s[quote:]
                 fixes["quote"] += 1
                 continue

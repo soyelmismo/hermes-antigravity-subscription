@@ -129,6 +129,34 @@ class LenientDecoderTests(unittest.TestCase):
         args, error = _normalize_tool_arguments("edit", '{"path":"x" "content"}', schema)
         self.assertIn("missing required content", error)
 
+    def test_missing_comma_before_an_optional_key_is_not_repaired(self):
+        """The schema check cannot see a merged key that was optional.
+
+        Escaping the quote turned ``{"path": "/tmp/x" "content": "hi"}`` into a
+        valid object whose only key, ``path``, held the rest of the text, and
+        the call reached Hermes with that path.
+        """
+        schema = {"write_file": {
+            "type": "object", "properties": {"path": {}, "content": {}}, "required": ["path"],
+        }}
+        for written in (
+            '{"path": "/tmp/x" "content": "hi"}',
+            '{"path": "/tmp/x" "content": "hi", "overwrite": true}',
+            '{ "path" : "/tmp/x" , "content": "a" "mode": "append" }',
+        ):
+            with self.subTest(written=written):
+                args, error = _normalize_tool_arguments("write_file", written, schema)
+                self.assertIn("missing ',' between members", str(error))
+                self.assertIn("not valid JSON", str(error))
+                self.assertEqual(args, written)
+
+        # No key after the quote: still a bare quote inside the string, and
+        # every quote the model wrote is kept (the value ends unbalanced
+        # because the model's own text does).
+        value, fixes = _lenient_json_loads('{"command": "echo "done" && printf "%s" "x"}')
+        self.assertEqual(value["command"], 'echo "done" && printf "%s" "x')
+        self.assertEqual(fixes["quote"], 5)
+
     def test_non_object_arguments_are_rejected_after_repair(self):
         args, error = _normalize_tool_arguments("terminal", '"ls \\("', SCHEMAS)
         self.assertEqual(error, "arguments must be a JSON object")
