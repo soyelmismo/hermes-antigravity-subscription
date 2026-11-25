@@ -63,6 +63,10 @@ class PrunedWorkspaceTests(unittest.TestCase):
 
         client = AntigravityClient()
         self.addCleanup(client.close)
+        # Model resolution and the agent lookup spawn `agy models` and `agy
+        # --version` through the same Popen: warm them so the mock only sees workers.
+        client._resolve_model_and_effort(MODEL, None)
+        client._agent_args()
         with patch("subprocess.Popen", side_effect=popen):
             first = client.chat.completions.create(
                 model=MODEL, messages=list(MESSAGES), stream=False
