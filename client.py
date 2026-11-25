@@ -120,6 +120,16 @@ logger = logging.getLogger(__name__)
 
 _DEFAULT_TIMEOUT_SECONDS = 300.0
 
+# Appended to the prompt that retries a turn the host ended because the
+# model called one of agy's native tools (issue #61). It exists only in the
+# prompt: Hermes retries an empty completion without adding to its history,
+# and without an explanation the model repeated the native call.
+_NATIVE_BLOCK_NOTE = (
+    "[HOST] Your previous attempt called the native tool '{tool}'. The host blocked it and "
+    "nothing was executed. Re-issue that step as a <tool_call> block using the host's tools "
+    "and continue from there."
+)
+
 # agy prints these when its token source cannot be built — the signature of
 # OAuth contention with ANOTHER agy session on the same Google account (each
 # process refreshes the shared token; the loser logs this and produces no
@@ -490,6 +500,11 @@ class AntigravityClient:
         self._resume_usage_baseline: tuple[str, dict[str, int]] | None = None
         self._worker_lock = threading.Lock()
         self._worker_idle_timer: threading.Timer | None = None
+        # Native tool steps the stream neutralized without a compliant turn
+        # in between (issue #61). Only the first ends its turn empty, so
+        # Hermes retries it with _NATIVE_BLOCK_NOTE in the prompt.
+        self._native_block_streak = 0
+        self._native_block_note: tuple[str, list[dict[str, Any]]] | None = None
         # Last moment each worker showed a sign of life: its spawn, or the last
         # stdout line it produced (stamped by AntigravityStream). Read by the
         # abandon check in _reap_idle_worker, which needs to tell a genuinely
@@ -743,6 +758,59 @@ class AntigravityClient:
             self._terminate_worker_locked(keep_conversation=False)
             self._isolated_home, self._isolated_gemini_dir = setup_isolated_home(self._cwd)
             self._purge_isolated_conversations()
+
+    def _note_native_block(self, tool_name: str, messages: list[dict[str, Any]]) -> bool:
+        """Record a native tool step the stream neutralized.
+
+        Returns True when that turn should end as an empty completion, so
+        Hermes retries it: its empty-response ladder re-asks the model
+        (right away mid-task, after a short backoff otherwise) and
+        :meth:`_apply_native_block_note` puts the explanation in the prompt.
+        Before this the turn ended with the notice as its final answer
+        (issue #61): the user read it and the task stopped.
+
+        Only the first blocked step in a row does. A second one ends with
+        the notice again, because Hermes treats two empties in a row as a
+        deterministic failure and fails the turn over to another provider
+        (the soyelmismo/hermes-antigravity-subscription#52 shape).
+        """
+        with self._lock:
+            # getattr: a client built without __init__ (some tests) has neither field.
+            self._native_block_streak = getattr(self, "_native_block_streak", 0) + 1
+            if self._native_block_streak > 1:
+                return False
+            self._native_block_note = (
+                _NATIVE_BLOCK_NOTE.format(tool=tool_name),
+                list(messages),
+            )
+        return True
+
+    def _clear_native_block_streak(self) -> None:
+        """A turn ended without a native tool step: the model complied."""
+        with self._lock:
+            self._native_block_streak = 0
+            self._native_block_note = None
+
+    def _apply_native_block_note(
+        self, segments: list[str], messages: list[dict[str, Any]]
+    ) -> None:
+        """Append the pending native-block note to the last prompt part.
+
+        The note is written into the prompt only, never into Hermes'
+        history. It is spent on the request that retries the blocked turn:
+        the same history up to its tail, which Hermes may decorate with its
+        own retry hint. Any other request drops it and ends the streak.
+        """
+        with self._lock:
+            pending = getattr(self, "_native_block_note", None)
+            self._native_block_note = None
+        if pending is None:
+            return
+        note, earlier = pending
+        if len(messages) < len(earlier) or earlier[:-1] != messages[: len(earlier) - 1]:
+            self._clear_native_block_streak()
+            return
+        segments[-1] = f"{segments[-1].rstrip()}\n\n{note}"
 
     def _purge_isolated_conversations(self) -> None:
         """Purge isolated conversation database files on session reset or new conversation."""
@@ -1187,6 +1255,9 @@ class AntigravityClient:
                         pending_user_text=_latest_user_text(messages_list),
                         media_sink=self._materialized_media,
                     )
+                    holder = [prompt_payload]
+                    self._apply_native_block_note(holder, messages_list)
+                    prompt_payload = holder[0]
                     dump_prompt_debug(
                         prompt=prompt_payload,
                         branch="delta",
@@ -1206,6 +1277,7 @@ class AntigravityClient:
                         tool_choice=tool_choice,
                         branch="full",
                     )
+                    self._apply_native_block_note(segments, messages_list)
                     prompt_payload, followup_segments = segments[0], segments[1:]
 
                 event_msg = {"event": "user", "message": {"content": prompt_payload}}
@@ -1227,6 +1299,7 @@ class AntigravityClient:
                         tool_choice=tool_choice,
                         branch="retry",
                     )
+                    self._apply_native_block_note(segments, messages_list)
                     prompt_payload, followup_segments = segments[0], segments[1:]
                     event_msg = {"event": "user", "message": {"content": prompt_payload}}
                     self._raise_if_cancelled()
