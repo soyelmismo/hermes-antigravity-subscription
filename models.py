@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import importlib
 import logging
 import re
 import subprocess
@@ -42,17 +43,32 @@ def fallback_rows() -> list[str]:
     until somebody ran ``/model --refresh`` — the account's real catalog (with the
     current families) was still on disk but had been replaced by the fallback.
 
-    ``hermes_cli.models_catalog_static.CuratedFallbackModels`` is the marker core
-    already understands (``hermes_cli/models.py::_live_result_entry``): a marked row
-    never replaces a verified one for the same credentials, and when it is stored it
-    expires on the short fallback TTL (~60s) instead of the full provider TTL. On a
-    core without the marker the plain list keeps the old behaviour.
+    ``CuratedFallbackModels`` is the marker core understands
+    (``hermes_cli/models.py::_live_result_entry``): a marked row never
+    replaces a verified one for the same credentials, and when it is stored
+    it expires on the short fallback TTL (~60s) instead of the full provider
+    TTL. On a core without the marker the plain list keeps the old behaviour.
     """
-    try:
-        from hermes_cli.models_catalog_static import CuratedFallbackModels
-    except Exception:  # old core, or a host that cannot import Hermes' CLI package
+    marker = _fallback_marker()
+    if marker is None:
         return list(_FALLBACK_MODELS)
-    return CuratedFallbackModels(_FALLBACK_MODELS)
+    return marker(_FALLBACK_MODELS)
+
+
+def _fallback_marker() -> type | None:
+    """The marker class Hermes' catalog cache honours, or None on a core without it.
+
+    It lives in ``hermes_cli.models_catalog_static`` since 2026-10-02 and in
+    ``hermes_cli.models`` on the cores between 2026-09-23 and that date.
+    """
+    for module_name in ("hermes_cli.models_catalog_static", "hermes_cli.models"):
+        try:
+            marker = getattr(importlib.import_module(module_name), "CuratedFallbackModels", None)
+        except Exception:  # a core without that module
+            continue
+        if isinstance(marker, type):
+            return marker
+    return None
 
 
 _MODEL_ALIASES = {
@@ -86,10 +102,18 @@ _EFFORT_RANK = {"low": 0, "medium": 1, "high": 2}
 _SPINNER_CHARS = ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏")
 _SKIP_LINE_PREFIXES = ("error:", "usage:", "available models:", "warning:", "--")
 
-_CATALOG_TTL_SECONDS = 3600.0
+# A successful `agy models` result is reused for this long. Short enough that a
+# family agy added, renamed or moved to another effort set stops resolving
+# through the heuristics within minutes, not an hour.
+_CATALOG_TTL_SECONDS = 900.0
 _CATALOG_FAILURE_TTL_SECONDS = 60.0
+# A model the cached snapshot does not list triggers one re-probe at most this
+# often, so a mistyped name still costs no process spawn per request.
+_CATALOG_UNKNOWN_REPROBE_SECONDS = 60.0
 _catalog_lock = threading.Lock()
-_catalog_cache: tuple[float, dict[str, tuple[str, ...]]] | None = None
+# (expires_at, catalog, probed_at) on the monotonic clock.
+_catalog_cache: tuple[float, dict[str, tuple[str, ...]], float] | None = None
+_catalog_warned_at = float("-inf")
 
 
 def _normalize_effort(effort: str | None) -> str | None:
@@ -150,17 +174,23 @@ def parse_catalog(text: str) -> dict[str, tuple[str, ...]]:
 
 
 def load_catalog(
-    timeout: float = 15.0, *, only_if_stale: bool = False
+    timeout: float = 15.0, *, only_if_stale: bool = False, max_age: float | None = None
 ) -> dict[str, tuple[str, ...]]:
     """Run `agy models`, cache the parsed result, and return it.
 
     Returns an empty dict when agy is missing, slow, or prints nothing usable.
     Failures are cached briefly so an absent agy does not cost a process
-    spawn per request. With `only_if_stale`, a thread that waited on the lock
-    reuses the result the previous holder just cached instead of spawning agy
-    again.
+    spawn per request, and are logged at `warning` once per failure window
+    (the traceback stays at `debug`). With `only_if_stale`, a thread that
+    waited on the lock reuses the result the previous holder just cached
+    instead of spawning agy again; `max_age` makes it re-probe a snapshot
+    probed longer ago than that.
+
+    A failed probe keeps the last good snapshot in the cache (under the
+    failure TTL), so effort resolution keeps answering from the account's
+    real catalog instead of the built-in table while agy is unavailable.
     """
-    global _catalog_cache
+    global _catalog_cache, _catalog_warned_at
     try:
         from .process import _no_window, resolve_agy_command
     except ImportError:
@@ -168,9 +198,10 @@ def load_catalog(
 
     with _catalog_lock:
         if only_if_stale:
-            fresh = _cached_catalog()
+            fresh = _cached_catalog(max_age=max_age)
             if fresh is not None:
                 return fresh
+        previous = _catalog_cache
         try:
             res = subprocess.run(
                 [resolve_agy_command(), "models"],
@@ -180,19 +211,47 @@ def load_catalog(
                 **_no_window(),
             )
             catalog = parse_catalog(res.stdout)
+            failure = "" if catalog else f"exit {res.returncode}, no model ids in output"
         except Exception as exc:
-            logger.debug("Antigravity model catalog unavailable: %s", exc)
             catalog = {}
-        ttl = _CATALOG_TTL_SECONDS if catalog else _CATALOG_FAILURE_TTL_SECONDS
-        _catalog_cache = (time.monotonic() + ttl, catalog)
+            failure = str(exc) or type(exc).__name__
+            logger.debug("Antigravity model catalog probe failed", exc_info=True)
+        now = time.monotonic()
+        if catalog:
+            _catalog_cache = (now + _CATALOG_TTL_SECONDS, catalog, now)
+            return catalog
+        if now - _catalog_warned_at >= _CATALOG_FAILURE_TTL_SECONDS:
+            _catalog_warned_at = now
+            logger.warning(
+                "Antigravity model catalog unavailable (%s); serving built-in fallback, "
+                "retrying in %ss",
+                failure,
+                int(_CATALOG_FAILURE_TTL_SECONDS),
+            )
+        kept = previous[1] if previous is not None and previous[1] else {}
+        _catalog_cache = (now + _CATALOG_FAILURE_TTL_SECONDS, kept, now)
         return catalog
 
 
-def _cached_catalog() -> dict[str, tuple[str, ...]] | None:
+def _cached_catalog(*, max_age: float | None = None) -> dict[str, tuple[str, ...]] | None:
+    """The cached catalog while it is unexpired and, with `max_age`, recently probed."""
     cache = _catalog_cache
-    if cache is not None and time.monotonic() < cache[0]:
-        return cache[1]
-    return None
+    if cache is None:
+        return None
+    now = time.monotonic()
+    if now >= cache[0]:
+        return None
+    if max_age is not None and len(cache) > 2 and now - cache[2] >= max_age:
+        return None
+    return cache[1]
+
+
+def _unknown_probe_due() -> bool:
+    """True when the cached snapshot is older than the unknown-model re-probe interval."""
+    cache = _catalog_cache
+    if cache is None or len(cache) < 3:
+        return False
+    return time.monotonic() - cache[2] >= _CATALOG_UNKNOWN_REPROBE_SECONDS
 
 
 def model_efforts(base_model: str, *, refresh: bool = True) -> tuple[str, ...] | None:
@@ -302,6 +361,13 @@ def resolve_model_and_effort(
 
     base_model, suffix_effort = split_effort_suffix(m)
     supported = model_efforts(base_model, refresh=False)
+    if supported is None and _unknown_probe_due():
+        # The warm snapshot predates this model: agy may have added the family.
+        load_catalog(only_if_stale=True, max_age=_CATALOG_UNKNOWN_REPROBE_SECONDS)
+        base_model, suffix_effort = split_effort_suffix(
+            resolve_model_alias(raw_model, _cached_catalog())
+        )
+        supported = model_efforts(base_model, refresh=False)
     if supported is None:
         supported = _heuristic_efforts(base_model, suffix_effort is not None)
     if not supported:
