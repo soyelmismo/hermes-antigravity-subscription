@@ -1128,12 +1128,22 @@ class AntigravityStream(Iterator[Any]):
                             # close(), and __next__'s ``if self._closed`` guard
                             # would end the stream before the finish chunk
                             # could ever be emitted.
+                            # Issue #61: when the host offered tools and this is
+                            # the first blocked step in a row, the turn ends
+                            # empty instead and Hermes retries it with the
+                            # explanation in the prompt (client._note_native_block).
+                            # A repeated step keeps the notice: two empties in
+                            # a row make Hermes fail over to another provider.
                             has_content = True
                             neutralized_text = (
                                 f"[Antigravity] Native tool invocation '{tool_name}' was blocked by host security policy; "
                                 "nothing was executed. Re-issue the step as a <tool_call> block using the host's tools "
                                 "instead of Antigravity's native tools."
                             )
+                            if self.has_tools and self.client is not None and hasattr(
+                                self.client, "_note_native_block"
+                            ) and self.client._note_native_block(tool_name, self.messages) is True:
+                                neutralized_text = ""
                             break
                     if "usage" in step:
                         usage_data = step["usage"]
@@ -1565,9 +1575,16 @@ class AntigravityStream(Iterator[Any]):
             if neutralized_tool_step:
                 # Issue #52: the security abort carries its explanation and
                 # the finish reason in one chunk — content makes the host
-                # treat the turn as answered instead of empty.
-                yield self._make_chunk(content=neutralized_text, finish_reason=finish_reason)
+                # treat the turn as answered instead of empty. Issue #61: the
+                # first blocked step in a row is the exception and ends
+                # empty, so Hermes retries the turn.
+                if neutralized_text:
+                    yield self._make_chunk(content=neutralized_text, finish_reason=finish_reason)
+                else:
+                    yield self._make_chunk(finish_reason=finish_reason)
             else:
+                if self.client is not None and hasattr(self.client, "_clear_native_block_streak"):
+                    self.client._clear_native_block_streak()
                 yield self._make_chunk(finish_reason=finish_reason)
 
             usage = SimpleNamespace(
