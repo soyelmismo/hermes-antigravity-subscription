@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import importlib
 import logging
 import re
 import subprocess
@@ -42,17 +43,32 @@ def fallback_rows() -> list[str]:
     until somebody ran ``/model --refresh`` — the account's real catalog (with the
     current families) was still on disk but had been replaced by the fallback.
 
-    ``hermes_cli.models_catalog_static.CuratedFallbackModels`` is the marker core
-    already understands (``hermes_cli/models.py::_live_result_entry``): a marked row
-    never replaces a verified one for the same credentials, and when it is stored it
-    expires on the short fallback TTL (~60s) instead of the full provider TTL. On a
-    core without the marker the plain list keeps the old behaviour.
+    ``CuratedFallbackModels`` is the marker core understands
+    (``hermes_cli/models.py::_live_result_entry``): a marked row never
+    replaces a verified one for the same credentials, and when it is stored
+    it expires on the short fallback TTL (~60s) instead of the full provider
+    TTL. On a core without the marker the plain list keeps the old behaviour.
     """
-    try:
-        from hermes_cli.models_catalog_static import CuratedFallbackModels
-    except Exception:  # old core, or a host that cannot import Hermes' CLI package
+    marker = _fallback_marker()
+    if marker is None:
         return list(_FALLBACK_MODELS)
-    return CuratedFallbackModels(_FALLBACK_MODELS)
+    return marker(_FALLBACK_MODELS)
+
+
+def _fallback_marker() -> type | None:
+    """The marker class Hermes' catalog cache honours, or None on a core without it.
+
+    It lives in ``hermes_cli.models_catalog_static`` since 2026-10-02 and in
+    ``hermes_cli.models`` on the cores between 2026-09-23 and that date.
+    """
+    for module_name in ("hermes_cli.models_catalog_static", "hermes_cli.models"):
+        try:
+            marker = getattr(importlib.import_module(module_name), "CuratedFallbackModels", None)
+        except Exception:  # a core without that module
+            continue
+        if isinstance(marker, type):
+            return marker
+    return None
 
 
 _MODEL_ALIASES = {

@@ -34,7 +34,7 @@ env:
   # Upstream Hermes tag whose pyproject version satisfies the plugin's
   # requires_hermes floor (0.21.4). Keep in sync with release.yml's
   # HERMES_REF so PRs test against the same source the release gate uses.
-  HERMES_REF: v2026.9.21
+  HERMES_REF: v2026.9.24
 
 jobs:
   tests:

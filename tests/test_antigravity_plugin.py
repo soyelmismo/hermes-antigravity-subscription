@@ -927,8 +927,11 @@ class AntigravityPluginTests(unittest.TestCase):
         account's real catalog with the built-in families for hours.
         """
         import models
-        from hermes_cli.models import _cache_entry, _live_result_entry
 
+        try:
+            from hermes_cli.models import _cache_entry, _live_result_entry
+        except ImportError as exc:
+            self.skipTest(f"Hermes core without the fallback cache contract: {exc}")
         profile = get_provider_profile("antigravity-subscription-directsdk")
         self.assertIsNotNone(profile)
         with patch("models._catalog_cache", None), \
@@ -943,6 +946,28 @@ class AntigravityPluginTests(unittest.TestCase):
         assert stored is not None
         self.assertTrue(stored["fallback"])
         self.assertEqual(stored["models"], list(models._FALLBACK_MODELS))
+
+    def test_fallback_marker_is_found_in_either_core_module(self):
+        """Cores before 2026-10-02 define the marker in `hermes_cli.models`."""
+        import models
+
+        marker = models._fallback_marker()
+        if marker is None:
+            self.skipTest("Hermes core without CuratedFallbackModels")
+
+        # An older core: no `models_catalog_static` module, the class in `models`.
+        with patch.dict(sys.modules, {"hermes_cli.models_catalog_static": None}):
+            self.assertIs(models._fallback_marker(), marker)
+
+        # A core without the marker keeps the old behaviour: a plain list.
+        without_marker = SimpleNamespace(CuratedFallbackModels=None)
+        with patch.dict(sys.modules, {"hermes_cli.models_catalog_static": None, "hermes_cli.models": without_marker}), \
+                patch("models._catalog_cache", None), \
+                patch("process.resolve_agy_command", return_value="agy"), \
+                patch("models.subprocess.run", side_effect=FileNotFoundError("agy")):
+            self.assertIsNone(models._fallback_marker())
+            self.assertIs(type(models.fallback_rows()), list)
+        self.assertIsNot(type(models.fallback_rows()), list)
 
     def test_live_catalog_overrides_builtin_efforts(self):
         import models
