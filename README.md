@@ -34,10 +34,10 @@ This plugin lets Hermes use Gemini and Claude models through your existing Antig
 
 | Model | Suffix | LLM Context | Plugin Declared | Supported Efforts |
 | :--- | :--- | :--- | :--- | :--- |
-| `gemini-3.8-flash` | `-low`, `-medium`, `-high` | 1M tokens | 239k tokens | `low`, `medium`, `high` |
-| `gemini-3.7-flash` | `-low`, `-medium`, `-high` | 1M tokens | 239k tokens | `low`, `medium`, `high` |
-| `gemini-3.6-flash` | `-low`, `-medium`, `-high` | 1M tokens | 239k tokens | `low`, `medium`, `high` |
-| `gemini-3.1-pro` | `-low`, `-high` | 2M tokens | 239k tokens | `low`, `high` |
+| `gemini-3.8-flash` | `-low`, `-medium`, `-high` | 1M tokens | 460k tokens | `low`, `medium`, `high` |
+| `gemini-3.7-flash` | `-low`, `-medium`, `-high` | 1M tokens | 460k tokens | `low`, `medium`, `high` |
+| `gemini-3.6-flash` | `-low`, `-medium`, `-high` | 1M tokens | 460k tokens | `low`, `medium`, `high` |
+| `gemini-3.1-pro` | `-low`, `-high` | 2M tokens | 460k tokens | `low`, `high` |
 | `gpt-oss-120b` | `-medium` only | 128k tokens | 128k tokens | `medium` |
 | `claude-sonnet-4-6` | None | 200k tokens | 239k tokens | None (agy rejects `--effort`) |
 | `claude-opus-4-6-thinking` | None | 200k tokens | 239k tokens | None (agy rejects `--effort`) |
@@ -46,7 +46,9 @@ This plugin lets Hermes use Gemini and Claude models through your existing Antig
 
 > **Claude Model Aliases**: Requests for `claude-sonnet-5-5` or `claude-opus-5-5` resolve dynamically if present in the user's `agy models` catalog; if the account lacks them, they gracefully fall back to `claude-sonnet-4-6` and `claude-opus-4-6-thinking`.
 
-> **Trajectory Persistence & Context Length**: Multi-turn sessions persist across worker restarts via `agy --conversation <id>`, sending only incremental deltas on each turn. This bypasses `agy`'s single-turn 100,000-token prompt trimmer. The plugin declares 239,000 tokens to Hermes (configurable via `HERMES_ANTIGRAVITY_CONTEXT_LENGTH` or `ANTIGRAVITY_CONTEXT_LENGTH`), ensuring Hermes auto-compaction triggers safely below `agy`'s internal checkpoint threshold (239,616 tokens / 256k - 16k output tokens) and preserves sovereign context control. Conversation databases are strictly isolated inside the worker's private temp directory and automatically purged on session resets (`/new`).
+> **Gemini full sends are split into parts**: `agy` silently cuts one long Gemini user message and keeps only its head (a 397k-char history arrived with its middle and end missing). When a full send (new worker, gateway restart, history rewritten by compaction) is heavier than one part (`HERMES_ANTIGRAVITY_SEGMENT_WEIGHT`, default 90,000: one unit per ASCII character, two per non-ASCII character, about 60k tokens), the plugin sends it as consecutive turns of one `agy` conversation. Parts 1..N-1 ask for a bare `ACK`; those replies are consumed and never reach Hermes, and the usage Hermes sees is the final call alone. Cuts fall on message boundaries, so a `<tool_call>` frame or tool result is never split; a single message heavier than a part is split at line boundaries with continuation markers. Each part is one extra model call (about 8-10 s each measured on `gemini-4-neon-low`). Gemini routes declare 460,000 tokens: one conversation accepted eleven ~56k-token turns with no error, but after a turn reports more than ~512k context `agy` runs its own checkpoint summary, so Hermes must compact first (460k = 512k - 32k output reserve - ~19k margin). Setting `HERMES_ANTIGRAVITY_SEGMENT_WEIGHT=0` disables splitting and returns Gemini routes to the 75,000-token single-message ceiling.
+
+> **Trajectory Persistence & Context Length**: Multi-turn sessions persist across worker restarts via `agy --conversation <id>`, sending only incremental deltas on each turn. This bypasses `agy`'s single-message prompt trimmer. The plugin declares 239,000 tokens for Claude routes to Hermes (configurable via `HERMES_ANTIGRAVITY_CONTEXT_LENGTH` or `ANTIGRAVITY_CONTEXT_LENGTH`), ensuring Hermes auto-compaction triggers safely below `agy`'s internal checkpoint threshold (239,616 tokens / 256k - 16k output tokens) and preserves sovereign context control. Conversation databases are strictly isolated inside the worker's private temp directory and automatically purged on session resets (`/new`).
 
 ### Prompt recovery and delivery diagnostics
 
@@ -227,7 +229,8 @@ Multiple agy sessions on one account contend for the shared OAuth token: whoever
 
 | Variable | Default | Description |
 | :--- | :--- | :--- |
-| `HERMES_ANTIGRAVITY_CONTEXT_LENGTH` | `239000` | Override the declared context window (tokens). Also checks `ANTIGRAVITY_CONTEXT_LENGTH`. Hermes triggers auto-compression based on this value (e.g. at 75% threshold, ~179k tokens). |
+| `HERMES_ANTIGRAVITY_CONTEXT_LENGTH` | `239000` (Claude), `460000` (Gemini) | Override the declared context window (tokens). Also checks `ANTIGRAVITY_CONTEXT_LENGTH`. Hermes triggers auto-compression based on this value (e.g. at 75% threshold, ~179k tokens). |
+| `HERMES_ANTIGRAVITY_SEGMENT_WEIGHT` | `90000` (Gemini), off (Claude) | Largest single message of a full send, in weight units (1 per ASCII character, 2 per non-ASCII character). Heavier full sends are split into consecutive turns of one conversation. Setting it applies to every model; `0` disables splitting (Gemini then declares 75,000). Also checks `ANTIGRAVITY_SEGMENT_WEIGHT`. |
 | `ANTIGRAVITY_COMMAND` | `agy` | Path to the `agy` binary. Also checks `AGY_CLI_PATH` and `ANTIGRAVITY_CLI_PATH`. |
 | `ANTIGRAVITY_ARGS` | (none) | Extra arguments to pass to the `agy` subprocess. |
 | `ANTIGRAVITY_CONFIG_DIR` | (none) | Override the config directory, bypassing keyring and token-file detection. |
