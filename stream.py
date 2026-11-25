@@ -446,6 +446,9 @@ class AntigravityStream(Iterator[Any]):
         # thread itself never references the stream (see _stream_generator),
         # so an abandoned stream stays collectable.
         self._stall_done: threading.Event | None = None
+        self._emitted_content_parts: list[str] = []
+        self._emitted_tool_calls: list[tuple[str, str, str]] = []
+        self._turn_mutated = False
         self._generator = self._stream_generator()
         # Private single-thread executor for the async path, created lazily on
         # the first __anext__ (sync consumers never create one, and a retired
@@ -739,6 +742,18 @@ class AntigravityStream(Iterator[Any]):
         tool_calls: list[Any] | None = None,
         finish_reason: str | None = None,
     ) -> Any:
+        if content:
+            self._emitted_content_parts.append(content)
+        if tool_calls:
+            for tc in tool_calls:
+                fn = getattr(tc, "function", None)
+                self._emitted_tool_calls.append(
+                    (
+                        str(getattr(tc, "id", "") or ""),
+                        str(getattr(fn, "name", "") or "") if fn else "",
+                        str(getattr(fn, "arguments", "") or "") if fn else "",
+                    )
+                )
         delta = SimpleNamespace(
             role="assistant",
             content=content,
@@ -1032,8 +1047,11 @@ class AntigravityStream(Iterator[Any]):
             for call in calls:
                 call.index = next_tool_call_index
                 next_tool_call_index += 1
+                if getattr(call, "protocol_mutated", False):
+                    self._turn_mutated = True
                 call_id = getattr(call, "id", "")
                 if not call_id or call_id in used_tool_call_ids:
+                    self._turn_mutated = True
                     suffix = next_tool_call_index
                     call_id = f"call_{suffix}"
                     while call_id in used_tool_call_ids:
@@ -1720,7 +1738,17 @@ class AntigravityStream(Iterator[Any]):
             if self.is_worker:
                 if (success and not self._interrupted
                         and getattr(self.client, "_cancelled", False) is not True):
+                    last_assistant = (
+                        None
+                        if (self._turn_mutated or self._corrections_sent > 0 or neutralized_tool_step)
+                        else {
+                            "content": "".join(self._emitted_content_parts).strip() or None,
+                            "tool_calls": list(self._emitted_tool_calls),
+                        }
+                    )
                     self.client._update_worker_history(self.messages)
+                    if hasattr(self.client, "_set_last_worker_assistant"):
+                        self.client._set_last_worker_assistant(last_assistant)
                     self._release_worker_lock_once()
                 else:
                     self.close()
