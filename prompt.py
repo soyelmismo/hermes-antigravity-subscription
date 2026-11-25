@@ -896,6 +896,30 @@ def _latest_user_text(messages: Sequence[Any]) -> str:
     return ""
 
 
+_PENDING_USER_REQUEST_MAX_CHARS = 800
+_PENDING_USER_REQUEST_HEAD_CHARS = 500
+_PENDING_USER_REQUEST_TAIL_CHARS = 300
+
+
+def _bound_pending_user_request(user_text: str) -> str:
+    """Keep short requests verbatim; excerpt oversized pastes for tool-loop reminders.
+
+    The complete user message is already in the conversation (in the worker's
+    prior user turn or earlier in the full-send transcript). Re-attaching
+    multi-KB logs or specs verbatim on every tool result duplicates thousands
+    of tokens across long tool loops without adding new information.
+    """
+    if len(user_text) <= _PENDING_USER_REQUEST_MAX_CHARS:
+        return user_text
+    head = user_text[:_PENDING_USER_REQUEST_HEAD_CHARS].rstrip()
+    tail = user_text[-_PENDING_USER_REQUEST_TAIL_CHARS:].lstrip()
+    return (
+        f"{head}\n"
+        f"[... full user request ({len(user_text)} chars) already in conversation above ...]\n"
+        f"{tail}"
+    )
+
+
 def _pending_user_request_section(user_text: str) -> str:
     """Restate the user request that the current tool loop is serving.
 
@@ -904,8 +928,9 @@ def _pending_user_request_section(user_text: str) -> str:
     and the model drifts back to the dominant pattern in the transcript (for
     example re-sending an earlier completion report).
     """
+    bounded = _bound_pending_user_request(user_text)
     return (
-        f"### USER REQUEST THIS TOOL LOOP IS SERVING:\nUser:\n{user_text}\n\n"
+        f"### USER REQUEST THIS TOOL LOOP IS SERVING:\nUser:\n{bounded}\n\n"
         "INSTRUCTION: Use the tool results only to answer THIS request. "
         "When you have enough information, answer it directly and specifically. "
         "Do NOT repeat earlier reports or summaries from the transcript unless this request asks for them."
@@ -1006,6 +1031,7 @@ def _assemble_full_prompt_parts(
 
     _HISTORICAL_TOOL_RETENTION_COUNT = 8
     _HISTORICAL_TOOL_MAX_CHARS = 300
+    _HISTORICAL_TOOL_CALL_ARGS_MAX_CHARS = 500
     _TOOL_MAX_CHARS_CAP = 20000
 
     transcript: list[str] = []
@@ -1020,6 +1046,15 @@ def _assemble_full_prompt_parts(
         set(tool_indices[-_HISTORICAL_TOOL_RETENTION_COUNT:])
         if len(tool_indices) > _HISTORICAL_TOOL_RETENTION_COUNT
         else set(tool_indices)
+    )
+    assistant_tool_indices = [
+        i for i, msg in enumerate(prior_messages)
+        if str(msg.get("role") or "").strip().lower() == "assistant" and msg.get("tool_calls")
+    ]
+    recent_assistant_tool_cutoff = (
+        set(assistant_tool_indices[-_HISTORICAL_TOOL_RETENTION_COUNT:])
+        if len(assistant_tool_indices) > _HISTORICAL_TOOL_RETENTION_COUNT
+        else set(assistant_tool_indices)
     )
 
     for i, message in enumerate(prior_messages):
@@ -1050,15 +1085,41 @@ def _assemble_full_prompt_parts(
             if rendered_content:
                 parts.append(rendered_content)
             if tool_calls := message.get("tool_calls"):
+                is_recent_call = i in recent_assistant_tool_cutoff
                 for tc in tool_calls:
                     if isinstance(tc, dict):
                         fn = tc.get("function") or {}
+                        raw_args = fn.get("arguments", "{}")
+                        args_str = raw_args if isinstance(raw_args, str) else json.dumps(raw_args, ensure_ascii=False)
+                        if not is_recent_call and len(args_str) > _HISTORICAL_TOOL_CALL_ARGS_MAX_CHARS:
+                            summary: dict[str, Any] = {"_truncated": True, "chars": len(args_str)}
+                            try:
+                                parsed_args = json.loads(args_str)
+                                if isinstance(parsed_args, dict):
+                                    for meta_key in ("path", "file_path", "target", "url"):
+                                        meta_val = parsed_args.get(meta_key)
+                                        if isinstance(meta_val, str) and len(meta_val) <= 200:
+                                            summary[meta_key] = meta_val
+                            except Exception:
+                                pass
+                            summary["preview"] = args_str[:200]
+                            args_str = json.dumps(summary, ensure_ascii=False)
+                        elif len(args_str) > _TOOL_MAX_CHARS_CAP:
+                            args_str = json.dumps(
+                                {
+                                    "_truncated": True,
+                                    "chars": len(args_str),
+                                    "head": args_str[:12000],
+                                    "tail": args_str[-3000:],
+                                },
+                                ensure_ascii=False,
+                            )
                         call_obj = {
                             "id": tc.get("id") or "call_1",
                             "type": "function",
                             "function": {
                                 "name": fn.get("name", ""),
-                                "arguments": fn.get("arguments", "{}") if isinstance(fn.get("arguments"), str) else json.dumps(fn.get("arguments", {}), ensure_ascii=False)
+                                "arguments": args_str,
                             }
                         }
                         parts.append(f"<tool_call>{json.dumps(call_obj, ensure_ascii=False)}</tool_call>")
