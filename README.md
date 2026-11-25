@@ -16,7 +16,7 @@ This plugin lets Hermes use Gemini and Claude models through your existing Antig
 
 ## How It Works
 
-- **Token streaming**: Reads stdout chunks from `agy --output-format stream-json` and yields standard completion deltas. On Hermes versions that support `ProviderProfile.supports_streaming`, the profile opts in, so Hermes consumes these deltas as they arrive instead of waiting for the assembled response. Older Hermes versions keep the non-streaming path.
+- **Token streaming**: Reads stdout chunks from `agy --output-format stream-json` and yields standard completion deltas. With no tool schema, deltas are sent as they arrive. With tools, text and calls are buffered until the turn passes validation, so a late native tool attempt cannot leave a partial answer or tool batch in Hermes. Older Hermes versions without streaming support keep the non-streaming path.
 - **Stream timeouts**: Streaming calls use the read budget of the `httpx.Timeout` Hermes passes (for `agy://local`, normally `HERMES_API_TIMEOUT`, 1800 s) as the turn deadline. Scalar timeouts are unchanged; with no timeout the 300 s default applies. A turn that ends without agy's `result` event reports why reading stopped (`stream deadline` or `stdout closed`), the elapsed time, and the age of the last stdout line.
 - **Tool call routing**: The model emits `<tool_call>` tags in text. The plugin parses these into OpenAI function call deltas, so Hermes executes tools on the host instead of `agy`. A literal `</tool_call>` inside a JSON argument does not end the frame, multiple calls in one turn get unique indices and ids, and a stream that ends inside an unfinished block fails the turn instead of returning the raw block as assistant text.
 - **Early quota detection**: While waiting for the first content event, a log watcher aborts the turn on `RESOURCE_EXHAUSTED`/429 or credit-cap lines written during that turn. Log mtimes are compared in wall-clock time; `init` alone does not disarm the watcher, the first non-init event does.
@@ -83,7 +83,7 @@ Reasoning text in `stream-json` remains blocked upstream: `agy` exposes no flag 
 
 ### Model Compatibility
 
-`agy`'s default agent embeds its own system prompt ("you are Antigravity, you have `run_command`, `view_file`, ...") before the plugin's preamble. Some models obey `agy`'s prompt over the plugin's `<tool_call>` protocol and invoke native tools, which headless mode soft-denies. The plugin detects this and terminates the stream, but the turn is lost.
+`agy`'s default agent embeds its own system prompt ("you are Antigravity, you have `run_command`, `view_file`, ...") before the plugin's preamble. Some models obey `agy`'s prompt over the plugin's `<tool_call>` protocol and attempt native tool calls. The plugin terminates the worker on a disallowed native step and never forwards that invocation to Hermes.
 
 | Model | `<tool_call>` Protocol | Notes |
 | :--- | :--- | :--- |
@@ -96,7 +96,7 @@ Reasoning text in `stream-json` remains blocked upstream: `agy` exposes no flag 
 | `claude-sonnet-4-6` | Partial | Works with moderate toolsets (tested up to 10 tools); refuses or flips to native with large toolsets (~40 tools) |
 | `gpt-oss-120b` | Follows | Tested with full toolset |
 
-Models that ignore the protocol attempt `agy`'s native `RunCommand`/`WriteToFile` steps. The plugin neutralizes these (stream watcher kills the process), but every tool-using turn fails. The table describes `agy`'s default agent, which is what runs on `agy` older than 1.5.16.
+When Hermes supplied tools, a blocked worker turn discards its provisional answer and lets Hermes retry once with a concrete `<tool_call>` example in the prompt. A second native attempt is reported as an incomplete provider response, not assistant text, so Hermes can use a configured fallback. The table describes `agy`'s default agent, which is what runs on `agy` older than 1.5.16.
 
 On `agy` 1.5.16 or newer the plugin runs its own agent instead (see **Own agent instead of agy's** above), so the persona prompt and the `run_command`/`write_file` tools are not there to obey. Measured on `claude-sonnet-4-6` with Hermes' 37-tool schema and a prompt that needs the `terminal` tool, 8 runs each: the default agent emitted `<tool_call>` 6 times and went native (`run_command`, neutralized, turn lost) twice; the plugin's agent emitted `<tool_call>` 8 times. `read_file` stays available for media, so a model can still attempt a native read of a non-media path; that step is neutralized as before. `gemini-3.6-flash` was not on the account used for the measurement, so its row is unverified under the plugin's agent.
 

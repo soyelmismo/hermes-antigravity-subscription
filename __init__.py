@@ -277,6 +277,14 @@ def _classify_antigravity_error(
     """Classify agy CLI specific runtime errors so Hermes' smart failover /
     recovery pipeline triggers auto-compression, billing failover, or permanent auth abort.
     """
+    if getattr(error, "code", None) == "agy_native_tool_protocol":
+        return {
+            "reason": "incomplete_response",
+            "retryable": False,
+            "should_compress": False,
+            "should_rotate_credential": False,
+            "should_fallback": True,
+        }
     err_str = f"{error} {message}".lower()
     if any(
         pattern in err_str

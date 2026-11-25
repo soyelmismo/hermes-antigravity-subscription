@@ -14,7 +14,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
-from typing import Any, Iterator, NamedTuple
+from typing import Any, Generator, Iterator, NamedTuple
 
 try:
     from .custom_agent import note_custom_agent_rejection
@@ -48,6 +48,13 @@ except ImportError:
     )
 
 logger = logging.getLogger(__name__)
+
+
+class NativeToolProtocolError(RuntimeError):
+    """agy attempted a native tool instead of speaking the Hermes protocol."""
+
+    code = "agy_native_tool_protocol"
+
 
 # agy's media pipeline attaches pixels THROUGH a native read: the model calls
 # read_file/view_file on the path referenced as [Image](path) and the CLI then
@@ -355,6 +362,7 @@ class AntigravityStream(Iterator[Any]):
         delivery_sample_key: str = "",
         followup_segments: list[str] | None = None,
         close_stdin_after_segments: bool = False,
+        native_block_retry: bool = False,
     ):
         # Loud pairing, not a defaulted bool (review nit): a future site
         # passing worker_lock WITHOUT worker_lock_held would silently never
@@ -376,6 +384,7 @@ class AntigravityStream(Iterator[Any]):
         self.model = model
         self.timeout = timeout
         self.has_tools = bool(tools)
+        self._native_block_retry = native_block_retry
         self.is_worker = is_worker
         self.worker_lock = worker_lock
         self.messages = messages
@@ -980,6 +989,29 @@ class AntigravityStream(Iterator[Any]):
             ) from exc
 
     def _stream_generator(self) -> Iterator[Any]:
+        if not self.has_tools:
+            yield from self._read_turn()
+            return
+
+        # Hermes treats an exception after visible deltas as truncation, not
+        # a provider failure. Keep tool-enabled output provisional until the
+        # turn has passed its protocol checks, including any late native step.
+        pending: list[Any] = []
+        with contextlib.closing(self._read_turn()) as turn:
+            for chunk in turn:
+                choices = chunk.choices
+                if choices and not choices[0].finish_reason:
+                    pending.append(chunk)
+                    continue
+                if pending:
+                    # A deliberately neutralized turn closes its worker before
+                    # emitting the empty finish used for the corrective retry.
+                    if not self._closed:
+                        yield from pending
+                    pending.clear()
+                yield chunk
+
+    def _read_turn(self) -> Generator[Any, None, None]:
         deadline = time.monotonic() + self.timeout
         text_buffer = ""
         usage_data: dict[str, Any] = {}
@@ -1021,7 +1053,6 @@ class AntigravityStream(Iterator[Any]):
         # agy attempted a native tool invocation (security neutralization)?
         saw_result = False
         neutralized_tool_step = False
-        neutralized_text = ""
         success = False
         start_time = time.monotonic()
         # File mtimes are wall-clock epoch seconds; durations and deadlines
@@ -1193,50 +1224,21 @@ class AntigravityStream(Iterator[Any]):
                                 "Antigravity attempted native tool invocation '%s'; neutralizing to prevent host execution.",
                                 step.get("tool_name"),
                             )
+                            # No provisional chunk is released by the outer
+                            # iterator. Only the first block on the owned worker
+                            # can request Hermes' corrective retry.
+                            if not (
+                                self.has_tools and self._worker_lock_held
+                                and not self._native_block_retry
+                            ):
+                                raise NativeToolProtocolError(
+                                    "Antigravity native tool protocol failure: "
+                                    f"blocked {tool_name!r}. Use Hermes tool calls, not agy native tools."
+                                )
+                            self.client._note_native_block(self.messages)
                             self.close()
-                            # Recorded so the post-loop positive-evidence check
-                            # does not treat this security abort as an empty
-                            # failed turn: the process is terminated right here
-                            # on purpose (see
-                            # test_native_tool_step_neutralization_in_stream).
-                            # The stop cause is recorded too, so diagnostics do
-                            # not misreport this deliberate abort as a deadline.
                             neutralized_tool_step = True
                             stop_reason = "native tool step neutralized"
-                            # Issue #52: a bare empty completion reads as "no
-                            # content or reasoning", so Hermes nudged, got the
-                            # same silence on every retry, and silently failed
-                            # the turn over to a different provider while the
-                            # quota meter still showed headroom. The block is
-                            # surfaced as real content instead: the host sees
-                            # WHY the turn stopped, the quota was never denied,
-                            # and on any Hermes retry the explanation sits in
-                            # the model's history so it can re-issue the step
-                            # as a <tool_call> block. Containment is unchanged:
-                            # the process dies here, nothing was executed.
-                            #
-                            # The chunk is emitted in ONE piece together with
-                            # the finish reason at the post-loop finish yield:
-                            # a yield here would suspend the generator after
-                            # close(), and __next__'s ``if self._closed`` guard
-                            # would end the stream before the finish chunk
-                            # could ever be emitted.
-                            # Issue #61: when the host offered tools and this is
-                            # the first blocked step in a row, the turn ends
-                            # empty instead and Hermes retries it with the
-                            # explanation in the prompt (client._note_native_block).
-                            # A repeated step keeps the notice: two empties in
-                            # a row make Hermes fail over to another provider.
-                            has_content = True
-                            neutralized_text = (
-                                f"[Antigravity] Native tool invocation '{tool_name}' was blocked by host security policy; "
-                                "nothing was executed. Re-issue the step as a <tool_call> block using the host's tools "
-                                "instead of Antigravity's native tools."
-                            )
-                            if self.has_tools and self.client is not None and hasattr(
-                                self.client, "_note_native_block"
-                            ) and self.client._note_native_block(tool_name, self.messages) is True:
-                                neutralized_text = ""
                             break
                     if "usage" in step:
                         usage_data = step["usage"]
@@ -1475,7 +1477,7 @@ class AntigravityStream(Iterator[Any]):
                     has_content = True
                     yield self._make_chunk(content=text_buffer)
 
-            if self._rejected_calls:
+            if self._rejected_calls and not neutralized_tool_step:
                 # Never hand Hermes a call it cannot decode: it would execute
                 # nothing useful or retry the turn with the same mistake.
                 names = ", ".join(name for name, _error in self._rejected_calls)
@@ -1657,7 +1659,7 @@ class AntigravityStream(Iterator[Any]):
                         )
                     )
 
-            finish_reason = "tool_calls" if has_tool_calls else "stop"
+            finish_reason = "tool_calls" if has_tool_calls and not neutralized_tool_step else "stop"
 
             # Resolve usage (advancing the cumulative worker baseline) BEFORE
             # emitting the finish-reason chunk. The common client pattern
@@ -1679,20 +1681,7 @@ class AntigravityStream(Iterator[Any]):
                     sample_key=self.delivery_sample_key,
                 )
 
-            if neutralized_tool_step:
-                # Issue #52: the security abort carries its explanation and
-                # the finish reason in one chunk — content makes the host
-                # treat the turn as answered instead of empty. Issue #61: the
-                # first blocked step in a row is the exception and ends
-                # empty, so Hermes retries the turn.
-                if neutralized_text:
-                    yield self._make_chunk(content=neutralized_text, finish_reason=finish_reason)
-                else:
-                    yield self._make_chunk(finish_reason=finish_reason)
-            else:
-                if self.client is not None and hasattr(self.client, "_clear_native_block_streak"):
-                    self.client._clear_native_block_streak()
-                yield self._make_chunk(finish_reason=finish_reason)
+            yield self._make_chunk(finish_reason=finish_reason)
 
             yield SimpleNamespace(
                 id=self.conversation_id or f"agy-{int(time.time() * 1000)}",

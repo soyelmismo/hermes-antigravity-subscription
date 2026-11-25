@@ -134,8 +134,8 @@ def test_incomplete_second_tool_block_after_a_complete_call_fails():
 
     assert "incomplete tool call block" in str(ctx.value)
     calls, _contents, finishes = _consumed(chunks)
-    # The first, complete call was already emitted and cannot be retracted.
-    assert [call.id for call in calls] == ["same"]
+    # Even a complete call is provisional until the entire turn validates.
+    assert calls == []
     assert finishes == []
 
 
@@ -415,7 +415,7 @@ def test_stream_cut_inside_opening_tag_after_a_complete_call_fails(tail):
 
     assert "incomplete tool call block" in str(ctx.value)
     calls, contents, finishes = _consumed(chunks)
-    assert [call.id for call in calls] == ["same"]
+    assert calls == []
     assert contents == []
     assert finishes == []
 
@@ -450,20 +450,18 @@ def test_stream_cut_inside_closing_tag_after_a_complete_call_fails():
 
     assert "incomplete tool call block" in str(ctx.value)
     calls, _contents, finishes = _consumed(chunks)
-    assert [call.id for call in calls] == ["same"]
+    assert calls == []
     assert finishes == []
 
 
 # ---------------------------------------------------------------------------
-# Native tool neutralization: security abort surfaced as explanatory content
-# (issue #52) instead of a bare empty completion that read as "no content"
-# and sent Hermes down the nudge/retry/silent-fallback path. Buffered frame
-# text is still never flushed after the abort.
+# Native tool neutralization must not flush buffered frame text or report
+# success when the colocated worker cannot make a corrective retry.
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize("partial", ['<tool_call>{"id":"x",', "<tool_cal"])
-def test_native_tool_step_neutralization_with_partial_block_does_not_fail(partial):
+def test_native_tool_step_neutralization_does_not_flush_partial_block(partial):
     events = [
         {"event": "step_update", "step_update": {"text_delta": partial}},
         {
@@ -473,16 +471,8 @@ def test_native_tool_step_neutralization_with_partial_block_does_not_fail(partia
     ]
     stream, _proc_mock, client = _stream(events)
 
-    chunks = list(stream)
-
-    calls, contents, finishes = _consumed(chunks)
-    assert calls == []
-    # The partial frame prefix stays buffered (never flushed), but the
-    # explanatory content chunk is emitted (issue #52).
-    assert len(contents) == 1
-    assert "blocked by host security policy" in contents[0]
-    assert "run_command" in contents[0]
-    assert finishes == ["stop"]
+    with pytest.raises(RuntimeError, match="native tool protocol.*run_command"):
+        next(stream)
     client._terminate_process.assert_called()
 
 
