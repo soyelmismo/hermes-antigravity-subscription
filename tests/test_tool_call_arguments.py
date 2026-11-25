@@ -39,6 +39,10 @@ TERMINAL_SCHEMA = {
     },
     "required": ["command"],
 }
+# POSIX only. On a Windows runner ``bash`` resolves to the WSL launcher in
+# System32 (no distribution installed: exit 1, empty stderr), not to Git's.
+_BASH = os.name == "posix" and bool(shutil.which("bash"))
+
 TOOLS = [{"type": "function", "function": {"name": "terminal", "parameters": TERMINAL_SCHEMA}}]
 SCHEMAS = {"terminal": TERMINAL_SCHEMA}
 
@@ -71,7 +75,7 @@ class CorpusTests(unittest.TestCase):
                     body = re.search(r"<<'PY'\n(.*?)\nPY", command, re.S).group(1)
                     compile(body, item["id"], "exec")
                     self.assertIn('"DIR" if', body)
-                if shutil.which("bash"):
+                if _BASH:
                     check = subprocess.run(["bash", "-n", "-c", command], capture_output=True, text=True)
                     self.assertEqual(check.returncode, 0, check.stderr)
 
@@ -110,7 +114,7 @@ class LenientDecoderTests(unittest.TestCase):
         self.assertIsNone(error)
         command = json.loads(args)["command"]
         self.assertEqual(command, r"printf 'a.b|c\n' | sed 's/\./,/g' | grep -c 'a\|z'")
-        if shutil.which("bash"):
+        if _BASH:
             # Run it: a semantic check bash -n cannot make.
             out = subprocess.run(["bash", "-c", command], capture_output=True, text=True)
             self.assertEqual(out.stdout.strip(), "1")
@@ -128,6 +132,34 @@ class LenientDecoderTests(unittest.TestCase):
         schema = {"edit": {"type": "object", "properties": {"path": {}, "content": {}}, "required": ["path", "content"]}}
         args, error = _normalize_tool_arguments("edit", '{"path":"x" "content"}', schema)
         self.assertIn("missing required content", error)
+
+    def test_missing_comma_before_an_optional_key_is_not_repaired(self):
+        """The schema check cannot see a merged key that was optional.
+
+        Escaping the quote turned ``{"path": "/tmp/x" "content": "hi"}`` into a
+        valid object whose only key, ``path``, held the rest of the text, and
+        the call reached Hermes with that path.
+        """
+        schema = {"write_file": {
+            "type": "object", "properties": {"path": {}, "content": {}}, "required": ["path"],
+        }}
+        for written in (
+            '{"path": "/tmp/x" "content": "hi"}',
+            '{"path": "/tmp/x" "content": "hi", "overwrite": true}',
+            '{ "path" : "/tmp/x" , "content": "a" "mode": "append" }',
+        ):
+            with self.subTest(written=written):
+                args, error = _normalize_tool_arguments("write_file", written, schema)
+                self.assertIn("missing ',' between members", str(error))
+                self.assertIn("not valid JSON", str(error))
+                self.assertEqual(args, written)
+
+        # No key after the quote: still a bare quote inside the string, and
+        # every quote the model wrote is kept (the value ends unbalanced
+        # because the model's own text does).
+        value, fixes = _lenient_json_loads('{"command": "echo "done" && printf "%s" "x"}')
+        self.assertEqual(value["command"], 'echo "done" && printf "%s" "x')
+        self.assertEqual(fixes["quote"], 5)
 
     def test_non_object_arguments_are_rejected_after_repair(self):
         args, error = _normalize_tool_arguments("terminal", '"ls \\("', SCHEMAS)
