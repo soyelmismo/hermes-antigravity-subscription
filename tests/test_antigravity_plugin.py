@@ -2,6 +2,7 @@ import contextlib
 import io
 import itertools
 import json
+import logging
 import os
 import subprocess
 import sys
@@ -974,6 +975,106 @@ class AntigravityPluginTests(unittest.TestCase):
             self.assertIsNone(models.model_efforts("mystery-model"))
             self.assertIsNone(models.model_efforts("another-mystery"))
         self.assertEqual(run.call_count, 1)
+
+    def test_failed_probe_warns_once_per_failure_window(self):
+        """Issue #55: a degraded catalog was silent at the default log level."""
+        import models
+
+        live = SimpleNamespace(stdout="gemini-3.8-flash-low\n", returncode=0)
+        with patch("models._catalog_cache", None), \
+                patch("models._catalog_warned_at", float("-inf")), \
+                patch("process.resolve_agy_command", return_value="agy"), \
+                patch("models.subprocess.run", side_effect=FileNotFoundError("agy")):
+            with self.assertLogs("models", level="WARNING") as logs:
+                self.assertEqual(models.load_catalog(), {})
+                self.assertEqual(models.load_catalog(), {})
+        warnings = [r for r in logs.records if r.levelno >= logging.WARNING]
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("serving built-in fallback", warnings[0].getMessage())
+        self.assertIn("retrying in 60s", warnings[0].getMessage())
+
+        # A probe that runs but prints no model id is the same degraded state.
+        blank = SimpleNamespace(stdout="", returncode=1)
+        with patch("models._catalog_cache", None), \
+                patch("models._catalog_warned_at", float("-inf")), \
+                patch("process.resolve_agy_command", return_value="agy"), \
+                patch("models.subprocess.run", return_value=blank):
+            with self.assertLogs("models", level="WARNING") as logs:
+                self.assertEqual(models.load_catalog(), {})
+        self.assertIn("no model ids in output", logs.records[0].getMessage())
+
+        # A successful probe stays silent.
+        with patch("models._catalog_cache", None), \
+                patch("process.resolve_agy_command", return_value="agy"), \
+                patch("models.subprocess.run", return_value=live):
+            with self.assertNoLogs("models", level="WARNING"):
+                self.assertEqual(
+                    models.load_catalog(), {"gemini-3.8-flash": ("low",)}
+                )
+
+    def test_failed_reprobe_keeps_the_last_good_catalog(self):
+        import models
+
+        live = {"gemini-4-neon": ("low", "high")}
+        stale = (
+            time.monotonic() + models._CATALOG_TTL_SECONDS,
+            live,
+            time.monotonic() - 300,
+        )
+        with patch("models._catalog_cache", stale), \
+                patch("models._catalog_warned_at", float("-inf")), \
+                patch("process.resolve_agy_command", return_value="agy"), \
+                patch("models.subprocess.run", side_effect=FileNotFoundError("agy")):
+            self.assertEqual(models.load_catalog(), {})
+            self.assertEqual(models._cached_catalog(), live)
+            # Effort resolution answers from the account's catalog, not the heuristics.
+            self.assertEqual(
+                models.resolve_model_and_effort("gemini-4-neon", "medium"),
+                ("gemini-4-neon-high", "high"),
+            )
+
+    def test_unknown_model_reprobes_a_warm_catalog(self):
+        """Issue #56: a family added after the snapshot must not resolve by guesswork."""
+        import models
+
+        listed = SimpleNamespace(
+            stdout="gemini-4-neon-low\ngemini-4-neon-high\n", returncode=0
+        )
+        warm = (
+            time.monotonic() + models._CATALOG_TTL_SECONDS,
+            {"gemini-3.8-flash": ("low", "medium", "high")},
+            time.monotonic() - 120,
+        )
+        with patch("models._catalog_cache", warm), \
+                patch("process.resolve_agy_command", return_value="agy"), \
+                patch("models.subprocess.run", return_value=listed) as run:
+            self.assertEqual(
+                models.resolve_model_and_effort("gemini-4-neon", "low"),
+                ("gemini-4-neon-low", "low"),
+            )
+            # The snapshot is fresh now: a second lookup spawns nothing.
+            self.assertEqual(
+                models.resolve_model_and_effort("gemini-4-neon", "high"),
+                ("gemini-4-neon-high", "high"),
+            )
+        self.assertEqual(run.call_count, 1)
+
+    def test_unknown_model_in_a_fresh_snapshot_costs_no_spawn(self):
+        import models
+
+        warm = (
+            time.monotonic() + models._CATALOG_TTL_SECONDS,
+            {"gemini-3.8-flash": ("low", "medium", "high")},
+            time.monotonic(),
+        )
+        with patch("models._catalog_cache", warm), \
+                patch("process.resolve_agy_command", return_value="agy"), \
+                patch("models.subprocess.run") as run:
+            self.assertEqual(
+                models.resolve_model_and_effort("gemini-9-titan"),
+                ("gemini-9-titan", None),
+            )
+        run.assert_not_called()
 
     def test_concurrent_lookups_spawn_agy_once(self):
         import threading
