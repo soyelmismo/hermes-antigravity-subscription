@@ -918,6 +918,31 @@ class AntigravityPluginTests(unittest.TestCase):
                 patch("models.subprocess.run", side_effect=FileNotFoundError("agy")):
             self.assertEqual(profile.fetch_models(), list(models._FALLBACK_MODELS))
 
+    def test_failed_probe_never_overwrites_a_verified_catalog(self):
+        """A fallback answer must stay non-authoritative in Hermes' catalog cache.
+
+        The picker reads ``provider_models_cache.json`` and re-probes only on
+        ``/model --refresh``, so one transient ``agy`` failure used to replace the
+        account's real catalog with the built-in families for hours.
+        """
+        import models
+        from hermes_cli.models import _cache_entry, _live_result_entry
+
+        profile = get_provider_profile("antigravity-subscription-directsdk")
+        self.assertIsNotNone(profile)
+        with patch("models._catalog_cache", None), \
+                patch("process.resolve_agy_command", return_value="agy"), \
+                patch("models.subprocess.run", side_effect=FileNotFoundError("agy")):
+            rows = profile.fetch_models()
+        assert isinstance(rows, list)  # narrows for type checkers; also the contract
+
+        verified = _cache_entry("fp", ["gemini-4-neon", "gemini-4-argon"])
+        self.assertIsNone(_live_result_entry("fp", rows, verified))
+        stored = _live_result_entry("fp", rows, None)
+        assert stored is not None
+        self.assertTrue(stored["fallback"])
+        self.assertEqual(stored["models"], list(models._FALLBACK_MODELS))
+
     def test_live_catalog_overrides_builtin_efforts(self):
         import models
 
