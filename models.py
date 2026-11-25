@@ -21,6 +21,8 @@ logger = logging.getLogger(__name__)
 # resolve without spawning a process, and covers the case where `agy models`
 # fails. An empty tuple means "bare name, no --effort".
 _KNOWN_EFFORTS: dict[str, tuple[str, ...]] = {
+    # agy 1.5.16 lists -xhigh and accepts `--effort xhigh` for it.
+    "gemini-4-hydrogen": ("low", "medium", "high", "xhigh"),
     "gemini-3.8-flash": ("low", "medium", "high"),
     "gemini-3.7-flash": ("low", "medium", "high"),
     "gemini-3.6-flash": ("low", "medium", "high"),
@@ -87,17 +89,18 @@ _MODEL_ALIASES = {
     "claude-opus-5-5": "claude-opus-4-6-thinking",
 }
 
-# Effort suffixes agy appends to a base model id. `-xhigh` is not an effort
-# agy accepts: it is an incorrect listing duplicate of `-high` (issue #47),
-# so it normalizes into the base model's `high` variant just like
-# `_normalize_effort` maps a requested "xhigh" effort to "high".
+# Effort suffixes agy appends to a base model id. `-xhigh` is a level of its
+# own above `high`: issue #47 took it for a listing duplicate of `-high`, but
+# agy 1.5.16 accepts `--effort xhigh` for gemini-4-hydrogen and thinks about
+# 75% longer than at `high` on the same prompt. A model agy lists without it
+# maps a request for it to `high` (`_nearest_effort`).
 _EFFORT_SUFFIXES = (
-    ("-xhigh", "high"),
+    ("-xhigh", "xhigh"),
     ("-high", "high"),
     ("-medium", "medium"),
     ("-low", "low"),
 )
-_EFFORT_RANK = {"low": 0, "medium": 1, "high": 2}
+_EFFORT_RANK = {"low": 0, "medium": 1, "high": 2, "xhigh": 3}
 
 _SPINNER_CHARS = ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏")
 _SKIP_LINE_PREFIXES = ("error:", "usage:", "available models:", "warning:", "--")
@@ -123,7 +126,9 @@ def _normalize_effort(effort: str | None) -> str | None:
     if e in ("none", "off", "minimal"):
         return "low"
     if e in ("xhigh", "max", "ultra"):
-        return "high"
+        # The strongest level agy takes. A model without it gets `high`
+        # from `_nearest_effort`, as before.
+        return "xhigh"
     if e in ("low", "medium", "high"):
         return e
     return "medium"
@@ -132,10 +137,8 @@ def _normalize_effort(effort: str | None) -> str | None:
 def split_effort_suffix(model: str) -> tuple[str, str | None]:
     """Split `gemini-3.8-flash-high` into (`gemini-3.8-flash`, `high`).
 
-    A trailing `-xhigh` splits as an effort alias for `high` (issue #47):
-    agy lists `gemini-4-hydrogen-xhigh` as a lesser duplicate of the real
-    `gemini-4-hydrogen-{low,medium,high}` variants, and it must group into
-    the base model instead of surfacing as a separate bare-name model.
+    A trailing `-xhigh` splits as the `xhigh` effort, so `gemini-4-hydrogen-xhigh`
+    groups into its base model instead of surfacing as a bare-name model.
     """
     for suffix, effort in _EFFORT_SUFFIXES:
         if model.endswith(suffix):
@@ -148,8 +151,8 @@ def parse_catalog(text: str) -> dict[str, tuple[str, ...]]:
 
     `gemini-3.8-flash-{low,medium,high}` becomes one `gemini-3.8-flash` entry
     with three efforts; an id with no effort suffix maps to an empty tuple.
-    A trailing `-xhigh` groups into its base as the `high` effort (issue #47),
-    so `gemini-4-hydrogen-xhigh` never surfaces as a separate bare-name model.
+    A trailing `-xhigh` groups into its base as the `xhigh` effort, so
+    `gemini-4-hydrogen-xhigh` never surfaces as a separate bare-name model.
     Insertion order follows the order agy printed the models in.
     """
     grouped: dict[str, list[str]] = {}

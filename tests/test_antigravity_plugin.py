@@ -736,6 +736,10 @@ class AntigravityPluginTests(unittest.TestCase):
         prov_models = sys.modules.get(f"{type(profile).__module__}.models", models)
         self.assertEqual(profile.supported_reasoning_efforts("gemini-3.8-flash"), ("low", "medium", "high"))
         self.assertEqual(profile.supported_reasoning_efforts("gemini-3.1-pro"), ("low", "high"))
+        self.assertEqual(
+            profile.supported_reasoning_efforts("gemini-4-hydrogen"),
+            ("low", "medium", "high", "xhigh"),
+        )
         self.assertEqual(profile.supported_reasoning_efforts("claude-sonnet-4-6"), ())
         self.assertEqual(profile.supported_reasoning_efforts("claude-opus-4-6-thinking"), ())
         self.assertEqual(profile.supported_reasoning_efforts("claude-sonnet-5-5"), ())
@@ -816,31 +820,31 @@ class AntigravityPluginTests(unittest.TestCase):
             },
         )
 
-    def test_parse_catalog_folds_xhigh_duplicate_into_high_effort(self):
-        # Issue #47: `agy models` lists gemini-4-hydrogen-xhigh as a lesser
-        # duplicate of the real gemini-4-hydrogen-{low,medium,high} variants.
+    def test_parse_catalog_keeps_xhigh_as_its_own_effort(self):
+        # agy 1.5.16 `agy models`, verbatim. Issue #47 took -xhigh for a
+        # duplicate of -high; agy accepts `--effort xhigh` for it.
         import models
 
         raw_output = (
             "⠋ Fetching available models...\n"
-            "gemini-4-hydrogen-low\tGemini 4 Hydrogen (Low)\n"
-            "gemini-4-hydrogen-medium\tGemini 4 Hydrogen (Medium)\n"
             "gemini-4-hydrogen-high\tGemini 4 Hydrogen (High)\n"
             "gemini-4-hydrogen-xhigh\tGemini 4 Hydrogen (XHigh)\n"
+            "gemini-4-hydrogen-medium\tGemini 4 Hydrogen (Medium)\n"
+            "gemini-4-hydrogen-low\tGemini 4 Hydrogen (Low)\n"
         )
         catalog = models.parse_catalog(raw_output)
-        self.assertEqual(catalog, {"gemini-4-hydrogen": ("low", "medium", "high")})
-        # The bogus bare-name duplicate must not surface in list_models().
+        self.assertEqual(catalog, {"gemini-4-hydrogen": ("low", "medium", "high", "xhigh")})
+        # It groups into the base model rather than surfacing as a bare-name model.
         self.assertNotIn("gemini-4-hydrogen-xhigh", catalog)
 
-    def test_split_effort_suffix_xhigh_normalizes_to_high(self):
+    def test_split_effort_suffix(self):
         import models
 
         self.assertEqual(
             models.split_effort_suffix("gemini-4-hydrogen-xhigh"),
-            ("gemini-4-hydrogen", "high"),
+            ("gemini-4-hydrogen", "xhigh"),
         )
-        # Non-suffixed and real-effort ids keep their existing behavior.
+        # `-high` is not a prefix match away from `-xhigh`.
         self.assertEqual(
             models.split_effort_suffix("gemini-4-hydrogen-high"),
             ("gemini-4-hydrogen", "high"),
@@ -850,18 +854,45 @@ class AntigravityPluginTests(unittest.TestCase):
             ("gemini-4-hydrogen", None),
         )
 
-    def test_resolve_model_and_effort_xhigh_request_resolves_to_high(self):
+    def test_resolve_model_and_effort_passes_xhigh_through(self):
         import time as _time
 
         import models
 
         models._catalog_cache = (
             _time.monotonic() + 60.0,
-            {"gemini-4-hydrogen": ("low", "medium", "high")},
+            {"gemini-4-hydrogen": ("low", "medium", "high", "xhigh")},
+            _time.monotonic(),
         )
+        self.addCleanup(setattr, models, "_catalog_cache", None)
+        # By model id, by an explicit effort, and by the ladder names above it.
         self.assertEqual(
             models.resolve_model_and_effort("gemini-4-hydrogen-xhigh"),
-            ("gemini-4-hydrogen-high", "high"),
+            ("gemini-4-hydrogen-xhigh", "xhigh"),
+        )
+        self.assertEqual(
+            models.resolve_model_and_effort("gemini-4-hydrogen", "xhigh"),
+            ("gemini-4-hydrogen-xhigh", "xhigh"),
+        )
+        self.assertEqual(
+            models.resolve_model_and_effort("gemini-4-hydrogen", "max"),
+            ("gemini-4-hydrogen-xhigh", "xhigh"),
+        )
+
+    def test_xhigh_on_a_model_without_it_falls_back_to_high(self):
+        import time as _time
+
+        import models
+
+        models._catalog_cache = (
+            _time.monotonic() + 60.0,
+            {"gemini-3.8-flash": ("low", "medium", "high")},
+            _time.monotonic(),
+        )
+        self.addCleanup(setattr, models, "_catalog_cache", None)
+        self.assertEqual(
+            models.resolve_model_and_effort("gemini-3.8-flash", "xhigh"),
+            ("gemini-3.8-flash-high", "high"),
         )
 
     def test_dynamic_alias_precedence_with_claude_5_5(self):
