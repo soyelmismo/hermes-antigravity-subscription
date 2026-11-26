@@ -365,6 +365,7 @@ class AntigravityStream(Iterator[Any]):
         followup_segments: list[str] | None = None,
         close_stdin_after_segments: bool = False,
         native_block_retry: bool = False,
+        media_paths: set[str] | frozenset[str] | None = None,
     ):
         # Loud pairing, not a defaulted bool (review nit): a future site
         # passing worker_lock WITHOUT worker_lock_held would silently never
@@ -392,7 +393,9 @@ class AntigravityStream(Iterator[Any]):
         self.messages = messages
         # Media paths referenced by this turn's messages: the allowlist for
         # agy's native media-attach reads (see _is_permitted_native_media_step).
-        self._media_paths = self._collect_media_reference_paths()
+        self._media_paths = (
+            set(media_paths) if media_paths is not None else self._collect_media_reference_paths()
+        )
         # Ownership record for the worker request lock. threading.Lock is
         # NOT owner-bound: locked() is true and release() succeeds from any
         # thread, so a lock()/locked() probe cannot tell "my lock" from
@@ -1069,7 +1072,9 @@ class AntigravityStream(Iterator[Any]):
 
         has_content = False
         in_tool_call = False
+        tool_close_scan_from = 0
         md_state = _MarkdownCodeState()
+        last_activity_noted_at = float("-inf")
         error_msg = ""
         status = ""
         # Positive evidence about how the stream ended: did a `result`
@@ -1192,10 +1197,13 @@ class AntigravityStream(Iterator[Any]):
                 last_stdout_at = time.monotonic()
                 idle_since[0] = last_stdout_at
                 saw_output[0] = True
-                if self.is_worker:
+                if self.is_worker and (last_stdout_at - last_activity_noted_at) >= 1.0:
                     # The idle countdown reads this to tell a busy worker from
-                    # one whose turn died holding the worker lock.
+                    # one whose turn died holding the worker lock. Sampling at
+                    # 1 Hz avoids opening /proc/<pid>/stat on every token delta
+                    # while keeping the multi-minute abandon grace accurate.
                     self.client._note_worker_activity(self.proc)
+                    last_activity_noted_at = last_stdout_at
                 line = line.strip()
                 if not line.startswith("{"):
                     continue
@@ -1276,12 +1284,16 @@ class AntigravityStream(Iterator[Any]):
                             text_buffer += text_delta
                             while text_buffer:
                                 if in_tool_call:
+                                    if text_buffer.find(_TOOL_CALL_CLOSE, tool_close_scan_from) == -1:
+                                        tool_close_scan_from = max(0, len(text_buffer) - len(_TOOL_CALL_CLOSE) + 1)
+                                        break
                                     end_idx = _find_tool_call_close(text_buffer)
                                     if end_idx != -1:
                                         full_end = end_idx + len(_TOOL_CALL_CLOSE)
                                         block = text_buffer[:full_end]
                                         text_buffer = text_buffer[full_end:]
                                         in_tool_call = False
+                                        tool_close_scan_from = 0
                                         parsed_calls, extra_text = _parse_tool_block(
                                             block, tool_schemas=self._tool_schemas
                                         )
@@ -1308,6 +1320,7 @@ class AntigravityStream(Iterator[Any]):
                                                 has_content = True
                                                 yield self._make_chunk(content=extra_text)
                                     else:
+                                        tool_close_scan_from = max(0, len(text_buffer) - len(_TOOL_CALL_CLOSE) + 1)
                                         break
                                 else:
                                     idx = _find_unquoted_tool_call_open(text_buffer, md_state)
@@ -1320,6 +1333,7 @@ class AntigravityStream(Iterator[Any]):
                                                 yield self._make_chunk(content=safe_text)
                                         text_buffer = text_buffer[idx:]
                                         in_tool_call = True
+                                        tool_close_scan_from = 0
                                     else:
                                         k = _longest_tool_call_prefix_match(text_buffer)
                                         if k > 0:
@@ -1382,6 +1396,7 @@ class AntigravityStream(Iterator[Any]):
                         self._send_tool_call_correction(res)
                         text_buffer = ""
                         in_tool_call = False
+                        tool_close_scan_from = 0
                         md_state = _MarkdownCodeState()
                         deadline = time.monotonic() + self.timeout
                         continue

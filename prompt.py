@@ -109,6 +109,8 @@ def _canonical_tool_call_arguments(args: Any) -> str:
 def _clean_rendered_text(text: str) -> str:
     if not text:
         return ""
+    if "[" not in text:
+        return text.strip()
     return _ATTACHMENT_ANNOTATION_RE.sub("", text).strip()
 
 
@@ -712,52 +714,112 @@ def _trailing_unclosed_fence(tokens: Sequence[Any], lines: list[str]) -> Any | N
     return None
 
 
+_MD_COMPACT_THRESHOLD = 4096
+_TOOL_CALL_CLOSE_OUTSIDE_RE = re.compile(r'"|</tool_call>')
+_TOOL_CALL_CLOSE_INSIDE_RE = re.compile(r'["\\]')
+
+
 class _MarkdownCodeState:
     """Track active CommonMark code context across stream chunks via ``markdown-it-py``.
 
     Retains only the active unclosed block (an open fence or the current
     paragraph since the last blank line) so incremental streaming stays bounded
-    while preserving full CommonMark semantics.
+    while preserving full CommonMark semantics. Compaction is deferred until
+    the active buffer is read or crosses a newline past ``_MD_COMPACT_THRESHOLD``,
+    avoiding O(N^2) CommonMark reparses across small token deltas.
     """
 
     def __init__(self, tail: str = "") -> None:
-        self._tail = tail
+        self._buf = tail
+        self._pending: list[str] = []
+        self._pending_len = 0
+        self._dirty = False
+
+    @property
+    def _tail(self) -> str:
+        if self._dirty or self._pending:
+            self._compact()
+        return self._buf
+
+    @_tail.setter
+    def _tail(self, value: str) -> None:
+        self._buf = value
+        self._pending.clear()
+        self._pending_len = 0
+        self._dirty = False
 
     def clone(self) -> "_MarkdownCodeState":
-        return _MarkdownCodeState(self._tail)
+        copy = _MarkdownCodeState(self._buf)
+        if self._pending:
+            copy._pending = list(self._pending)
+            copy._pending_len = self._pending_len
+        copy._dirty = self._dirty
+        return copy
+
+    def _compact(self) -> None:
+        if not self._dirty and not self._pending:
+            return
+        if self._pending:
+            self._buf += "".join(self._pending)
+            self._pending.clear()
+            self._pending_len = 0
+        self._dirty = False
+        if not self._buf or _MD_PARSER is None:
+            return
+        min_trim_pos = 0
+        if "`" in self._buf or "~" in self._buf:
+            lines = self._buf.splitlines(keepends=True)
+            tokens = _MD_PARSER.parse(self._buf)
+            fence_tok = _trailing_unclosed_fence(tokens, lines)
+            if fence_tok is not None:
+                s_line = fence_tok.map[0]
+                opener = lines[s_line]
+                if not opener.endswith(("\n", "\r")):
+                    opener += "\n"
+                trailing = (
+                    lines[-1]
+                    if len(lines) > s_line + 1 and not self._buf.endswith(("\n", "\r"))
+                    else ""
+                )
+                self._buf = opener + trailing
+                return
+            # Never trim at a blank line inside a closed fenced code block, or
+            # its closing delimiter would become an unmatched opening fence.
+            line_starts: list[int] | None = None
+            for tok in tokens:
+                if tok.type == "fence" and tok.map:
+                    if line_starts is None:
+                        line_starts = [0]
+                        for ln in lines:
+                            line_starts.append(line_starts[-1] + len(ln))
+                    end_pos = line_starts[min(tok.map[1], len(lines))]
+                    if end_pos > min_trim_pos:
+                        min_trim_pos = end_pos
+        for sep in ("\r\n\r\n", "\n\n"):
+            pos = self._buf.rfind(sep, min_trim_pos)
+            if pos != -1:
+                self._buf = self._buf[pos + len(sep):]
+                return
 
     def in_code(self) -> bool:
-        if not self._tail or _MD_PARSER is None:
+        tail = self._tail
+        if not tail or _MD_PARSER is None:
             return False
-        lines = self._tail.splitlines(keepends=True)
-        tokens = _MD_PARSER.parse(self._tail)
+        if "`" not in tail and "~" not in tail:
+            return False
+        lines = tail.splitlines(keepends=True)
+        tokens = _MD_PARSER.parse(tail)
         return _trailing_unclosed_fence(tokens, lines) is not None
 
     def advance(self, text: str) -> None:
         """Advance markdown code state through *text* and compact completed blocks."""
         if not text or _MD_PARSER is None:
             return
-        self._tail += text
-        lines = self._tail.splitlines(keepends=True)
-        tokens = _MD_PARSER.parse(self._tail)
-        fence_tok = _trailing_unclosed_fence(tokens, lines)
-        if fence_tok is not None:
-            s_line = fence_tok.map[0]
-            opener = lines[s_line]
-            if not opener.endswith(("\n", "\r")):
-                opener += "\n"
-            trailing = (
-                lines[-1]
-                if len(lines) > s_line + 1 and not self._tail.endswith(("\n", "\r"))
-                else ""
-            )
-            self._tail = opener + trailing
-            return
-        for sep in ("\r\n\r\n", "\n\n"):
-            pos = self._tail.rfind(sep)
-            if pos != -1:
-                self._tail = self._tail[pos + len(sep):]
-                return
+        self._pending.append(text)
+        self._pending_len += len(text)
+        self._dirty = True
+        if self._pending_len >= _MD_COMPACT_THRESHOLD and ("\n" in text or "\r" in text):
+            self._compact()
 
 
 def _find_unquoted_tool_call_open(
@@ -794,23 +856,26 @@ def _find_tool_call_close(text: str, start: int = 0) -> int:
     single frame boundary used by both the incremental stream splitter and
     :func:`_parse_tool_block`.
     """
-    in_string = False
-    escaped = False
-    for index in range(start, len(text)):
-        char = text[index]
-        if in_string:
-            if escaped:
-                escaped = False
-            elif char == "\\":
-                escaped = True
-            elif char == '"':
-                in_string = False
-            continue
-        if char == '"':
-            in_string = True
-            continue
-        if text.startswith(_TOOL_CALL_CLOSE, index):
-            return index
+    if text.find(_TOOL_CALL_CLOSE, start) == -1:
+        return -1
+    pos = start
+    length = len(text)
+    while pos < length:
+        match = _TOOL_CALL_CLOSE_OUTSIDE_RE.search(text, pos)
+        if match is None:
+            return -1
+        if match.group(0) == _TOOL_CALL_CLOSE:
+            return match.start()
+        pos = match.end()
+        while pos < length:
+            inner = _TOOL_CALL_CLOSE_INSIDE_RE.search(text, pos)
+            if inner is None:
+                return -1
+            if inner.group(0) == "\\":
+                pos = inner.end() + 1
+            else:
+                pos = inner.end()
+                break
     return -1
 
 
@@ -1045,7 +1110,7 @@ def _assemble_full_prompt_parts(
 
     for i, message in enumerate(prior_messages):
         role = str(message.get("role") or "unknown").strip().lower()
-        rendered_content = _render_message_content(message.get("content"))
+        rendered_content = _render_message_content(message.get("content"), media_sink)
 
         if role == "tool":
             tool_id = str(message.get("tool_call_id") or message.get("name") or "tool").strip()
@@ -1169,7 +1234,7 @@ def _prompt_weight(text: str) -> int:
     """Conservative size proxy for token budgeting (see _GEMINI_SEGMENT_WEIGHT)."""
     if text.isascii():
         return len(text)
-    return len(text) + sum(1 for ch in text if ord(ch) > 127)
+    return 2 * len(text) - len(text.encode("ascii", "ignore"))
 
 
 def full_send_segment_budget(model: str | None) -> int | None:
