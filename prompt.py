@@ -1057,6 +1057,27 @@ def _join_full_prompt_parts(parts: "_FullPromptParts") -> str:
     return "\n\n".join(s.strip() for s in _apply_media_viewing_protocol(sections) if s and s.strip())
 
 
+def _historical_tool_call_note(call_id: Any, name: Any, args: str, limit: int) -> str:
+    """Summarize an old call as transcript data, not as a runnable frame."""
+    def quote(value: Any) -> str:
+        return json.dumps(str(value), ensure_ascii=False).replace("<", r"\u003c").replace(">", r"\u003e")
+
+    note = "Historical tool call (arguments omitted):"
+    fields = [("id", call_id), ("tool", name)]
+    try:
+        parsed = json.loads(args)
+    except (ValueError, RecursionError):
+        parsed = None
+    if isinstance(parsed, dict):
+        fields.extend((key, parsed[key]) for key in ("path", "file_path", "target", "url") if isinstance(parsed.get(key), str))
+    for key, value in fields:
+        if len(str(value)) <= limit:
+            field = f" {key}={quote(value)}"
+            if _prompt_weight(note + field) <= limit:
+                note += field
+    return note
+
+
 def _assemble_full_prompt_parts(
     messages: list[dict[str, Any]],
     tools: list[dict[str, Any]] | None = None,
@@ -1098,6 +1119,7 @@ def _assemble_full_prompt_parts(
 
     _HISTORICAL_TOOL_RETENTION_COUNT = 8
     _HISTORICAL_TOOL_MAX_CHARS = 300
+    _HISTORICAL_TOOL_CALL_MAX_WEIGHT = 500
     _TOOL_MAX_CHARS_CAP = 20000
 
     transcript: list[str] = []
@@ -1113,6 +1135,11 @@ def _assemble_full_prompt_parts(
         if len(tool_indices) > _HISTORICAL_TOOL_RETENTION_COUNT
         else set(tool_indices)
     )
+    assistant_tool_indices = [
+        i for i, msg in enumerate(prior_messages)
+        if str(msg.get("role") or "").strip().lower() == "assistant" and msg.get("tool_calls")
+    ]
+    recent_assistant_tool_cutoff = set(assistant_tool_indices[-_HISTORICAL_TOOL_RETENTION_COUNT:])
 
     for i, message in enumerate(prior_messages):
         role = str(message.get("role") or "unknown").strip().lower()
@@ -1142,18 +1169,26 @@ def _assemble_full_prompt_parts(
             if rendered_content:
                 parts.append(rendered_content)
             if tool_calls := message.get("tool_calls"):
+                is_recent_call = i in recent_assistant_tool_cutoff
                 for tc in tool_calls:
                     if isinstance(tc, dict):
                         fn = tc.get("function") or {}
+                        raw_args = fn.get("arguments", "{}")
+                        args_str = raw_args if isinstance(raw_args, str) else json.dumps(raw_args, ensure_ascii=False)
                         call_obj = {
                             "id": tc.get("id") or "call_1",
                             "type": "function",
                             "function": {
                                 "name": fn.get("name", ""),
-                                "arguments": fn.get("arguments", "{}") if isinstance(fn.get("arguments"), str) else json.dumps(fn.get("arguments", {}), ensure_ascii=False)
+                                "arguments": args_str,
                             }
                         }
-                        parts.append(f"<tool_call>{json.dumps(call_obj, ensure_ascii=False)}</tool_call>")
+                        frame = f"<tool_call>{json.dumps(call_obj, ensure_ascii=False)}</tool_call>"
+                        if not is_recent_call and _prompt_weight(frame) > _HISTORICAL_TOOL_CALL_MAX_WEIGHT:
+                            frame = _historical_tool_call_note(
+                                call_obj["id"], fn.get("name", ""), args_str, _HISTORICAL_TOOL_CALL_MAX_WEIGHT
+                            )
+                        parts.append(frame)
             if parts:
                 transcript.append("Assistant:\n" + "\n".join(parts))
             continue
