@@ -1621,7 +1621,11 @@ def _normalize_tool_arguments(
 
 
 def _tool_call_from_object(
-    obj: Any, ordinal: int, tool_schemas: dict[str, Any] | None = None
+    obj: Any,
+    ordinal: int,
+    tool_schemas: dict[str, Any] | None = None,
+    *,
+    frame_repaired: bool = False,
 ) -> Any | None:
     """Build one tool-call delta object from a decoded JSON value.
 
@@ -1642,20 +1646,23 @@ def _tool_call_from_object(
     if not isinstance(fn_name, str) or not fn_name.strip():
         return None
     fn_name = fn_name.strip()
-    call_id = obj.get("id")
-    if not isinstance(call_id, str) or not call_id.strip():
-        call_id = f"call_{ordinal}"
-    fn_args = fn.get("arguments", "{}")
+    raw_call_id = obj.get("id")
+    id_synthesized = not isinstance(raw_call_id, str) or not raw_call_id.strip()
+    call_id = f"call_{ordinal}" if id_synthesized else raw_call_id
+    raw_args = fn.get("arguments", "{}")
     arguments_error = None
-    if isinstance(fn_args, str):
-        fn_args, arguments_error = _normalize_tool_arguments(fn_name, fn_args, tool_schemas)
+    args_repaired = False
+    if isinstance(raw_args, str):
+        fn_args, arguments_error = _normalize_tool_arguments(fn_name, raw_args, tool_schemas)
+        args_repaired = fn_args != raw_args
     else:
-        fn_args = json.dumps(fn_args, ensure_ascii=False)
+        fn_args = json.dumps(raw_args, ensure_ascii=False)
     return SimpleNamespace(
         id=call_id,
         type="function",
         function=SimpleNamespace(name=fn_name, arguments=fn_args),
         arguments_error=arguments_error,
+        protocol_mutated=bool(frame_repaired or id_synthesized or args_repaired),
     )
 
 
@@ -1728,6 +1735,7 @@ def _extract_tagged_tool_calls(
         end = close + len(_TOOL_CALL_CLOSE)
         body = block[start + len(_TOOL_CALL_OPEN):close].strip()
         parsed = None
+        frame_repaired = False
         try:
             parsed = json.loads(body)
         except Exception:
@@ -1735,6 +1743,7 @@ def _extract_tagged_tool_calls(
             # one level up: an object-valued "arguments" carries the command.
             try:
                 parsed, fixes = _lenient_json_loads(body)
+                frame_repaired = True
                 logger.warning(
                     "Repaired <tool_call> frame JSON: %d invalid escape(s), %d unescaped quote(s)",
                     fixes["escape"],
@@ -1742,7 +1751,9 @@ def _extract_tagged_tool_calls(
                 )
             except ValueError:
                 parsed = None
-        call = _tool_call_from_object(parsed, len(calls) + 1, tool_schemas)
+        call = _tool_call_from_object(
+            parsed, len(calls) + 1, tool_schemas, frame_repaired=frame_repaired
+        )
         if call is None:
             text_parts.append(block[start:end])
             cur.advance(block[start:end])
@@ -1790,6 +1801,7 @@ def _parse_tool_block(
                 type="function",
                 function=SimpleNamespace(name=name, arguments=args),
                 arguments_error=getattr(call, "arguments_error", None),
+                protocol_mutated=bool(getattr(call, "protocol_mutated", False)),
             )
         )
     return deltas, cleaned_text.strip()

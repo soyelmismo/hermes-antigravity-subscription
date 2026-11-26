@@ -146,6 +146,61 @@ _AUTH_CONTENTION_SIGNATURES = (
 )
 
 
+def _assistant_matches_emitted(
+    message: Any, emitted: dict[str, Any] | None
+) -> bool:
+    """True when *message* is verbatim the assistant turn agy already emitted.
+
+    On a persistent worker or resumed ``--conversation``, agy already holds its
+    own prior assistant reply in conversation state. Skipping that leading
+    assistant message on the next delta avoids duplicating every assistant
+    reply (and large ``<tool_call>`` payloads) inside the following user turn.
+    Any mismatch (middleware edits, multipart content, fallback-provider reply,
+    repaired JSON arguments, or synthesized call IDs) returns False so the
+    message is echoed as before.
+    """
+    if not isinstance(emitted, dict) or not isinstance(message, dict):
+        return False
+    if str(message.get("role") or "").strip().lower() != "assistant":
+        return False
+    emitted_content = emitted.get("content")
+    emitted_calls = emitted.get("tool_calls") or []
+    if emitted_content is None and not emitted_calls:
+        return False
+
+    raw_content = message.get("content")
+    if raw_content is None:
+        norm_content = None
+    elif isinstance(raw_content, str):
+        norm_content = raw_content.strip() or None
+    else:
+        return False
+    if norm_content != emitted_content:
+        return False
+
+    raw_calls = message.get("tool_calls") or []
+    if len(raw_calls) != len(emitted_calls):
+        return False
+    norm_calls: list[tuple[str, str, str]] = []
+    for tc in raw_calls:
+        if not isinstance(tc, dict):
+            return False
+        fn = tc.get("function")
+        if not isinstance(fn, dict):
+            return False
+        args = fn.get("arguments", "{}")
+        if not isinstance(args, str):
+            args = json.dumps(args, ensure_ascii=False)
+        norm_calls.append(
+            (
+                str(tc.get("id") or ""),
+                str(fn.get("name") or ""),
+                args,
+            )
+        )
+    return norm_calls == list(emitted_calls)
+
+
 def _empty_no_result(completion: Any) -> bool:
     """True when a completion carries neither content, tool calls, nor a
     finish reason — the shape ``collect_stream_completion`` returns when the
@@ -480,6 +535,13 @@ class AntigravityClient:
         self._worker_history: list[dict[str, Any]] = []
         self._worker_conversation_id: str | None = None
         self._conversation_history: list[dict[str, Any]] = []
+        # Exact assistant turn this worker emitted on its last completed turn.
+        # Kept separate from _worker_history so history prefix matching and
+        # existing lifecycle invariants stay unchanged; used on continuation
+        # turns to avoid echoing agy's own previous reply back inside the next
+        # user delta message.
+        self._worker_last_assistant: dict[str, Any] | None = None
+        self._conversation_last_assistant: dict[str, Any] | None = None
         # Media rules the LIVE worker's settings.json contained at spawn:
         # agy reads permissions only at spawn, so a turn referencing new
         # media paths must respawn the worker (conversation preserved).
@@ -721,6 +783,7 @@ class AntigravityClient:
             self._worker_model = None
             self._worker_effort = None
             self._worker_history = []
+            self._worker_last_assistant = None
             self._active_processes.discard(proc)
             self._worker_last_activity.pop(proc, None)
             self._worker_cpu_at_activity.pop(proc, None)
@@ -734,6 +797,7 @@ class AntigravityClient:
         if not keep_conversation:
             self._worker_conversation_id = None
             self._conversation_history = []
+            self._conversation_last_assistant = None
             self._resume_usage_baseline = None
 
     def _terminate_worker(self, keep_conversation: bool = False) -> None:
@@ -827,6 +891,13 @@ class AntigravityClient:
             self._worker_history = msg_list
             self._conversation_history = msg_list
             self._arm_idle_timer_locked()
+
+    def _set_last_worker_assistant(self, assistant: dict[str, Any] | None) -> None:
+        with self._lock:
+            if self._cancelled:
+                return
+            self._worker_last_assistant = assistant
+            self._conversation_last_assistant = assistant
 
     def _cancel_idle_timer_locked(self) -> None:
         timer = self._worker_idle_timer
@@ -1023,6 +1094,12 @@ class AntigravityClient:
             self._worker_model = model
             self._worker_effort = effort
             self._worker_history = list(self._conversation_history) if conversation_id else []
+            saved_assistant = getattr(self, "_conversation_last_assistant", None)
+            self._worker_last_assistant = (
+                dict(saved_assistant)
+                if (conversation_id and saved_assistant is not None)
+                else None
+            )
             # Stamp what the fresh worker's settings.json granted: agy reads
             # permissions only at spawn (verified: rewriting the file under a
             # live worker changes nothing for its next turn).
@@ -1235,10 +1312,12 @@ class AntigravityClient:
                 native_block_retry = self._take_native_block_note(messages_list) and bool(tools)
                 retry_note = "\n\n" + _NATIVE_BLOCK_NOTE if native_block_retry else ""
                 with self._lock:
-                    ref_history = (
-                        self._worker_history
-                        if (self._worker_proc is not None and self._worker_proc.poll() is None)
-                        else self._conversation_history
+                    worker_alive = self._worker_proc is not None and self._worker_proc.poll() is None
+                    ref_history = self._worker_history if worker_alive else self._conversation_history
+                    ref_last_assistant = (
+                        getattr(self, "_worker_last_assistant", None)
+                        if worker_alive
+                        else getattr(self, "_conversation_last_assistant", None)
                     )
                     is_continuation = _messages_match_prefix(ref_history, messages_list)
                     conv_id_to_resume = self._worker_conversation_id if is_continuation else None
@@ -1250,6 +1329,8 @@ class AntigravityClient:
                         resolved_model, effort, conversation_id=conv_id_to_resume
                     )
                     delta_msgs = messages_list[len(ref_history):]
+                    if len(delta_msgs) >= 2 and _assistant_matches_emitted(delta_msgs[0], ref_last_assistant):
+                        delta_msgs = delta_msgs[1:]
                     prompt_payload = _format_delta_prompt(
                         delta_msgs,
                         pending_user_text=_latest_user_text(messages_list),
