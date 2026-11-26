@@ -126,6 +126,15 @@ class MarkdownCodeStateTests(unittest.TestCase):
         state.advance("```\n")
         self.assertFalse(state.in_code())
 
+    def test_deferred_compaction_keeps_consecutive_closed_fences_bounded(self):
+        for separator in ("", "\n", "\nIntro\n\n"):
+            with self.subTest(separator=separator):
+                state = agy_prompt._MarkdownCodeState()
+                for _ in range(400):
+                    state.advance("```python\nfirst = 1\n\nsecond = 2\n```\n" + separator)
+                self.assertFalse(state.in_code())
+                self.assertLess(len(state._tail), 200)
+
     def test_clone_isolates_pending_chunks(self):
         state = agy_prompt._MarkdownCodeState()
         state.advance("intro paragraph ")

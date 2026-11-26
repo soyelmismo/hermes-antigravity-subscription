@@ -767,6 +767,7 @@ class _MarkdownCodeState:
         if not self._buf or _MD_PARSER is None:
             return
         min_trim_pos = 0
+        last_top_level_fence_start = 0
         if "`" in self._buf or "~" in self._buf:
             lines = self._buf.splitlines(keepends=True)
             tokens = _MD_PARSER.parse(self._buf)
@@ -783,8 +784,6 @@ class _MarkdownCodeState:
                 )
                 self._buf = opener + trailing
                 return
-            # Never trim at a blank line inside a closed fenced code block, or
-            # its closing delimiter would become an unmatched opening fence.
             line_starts: list[int] | None = None
             for tok in tokens:
                 if tok.type == "fence" and tok.map:
@@ -793,13 +792,20 @@ class _MarkdownCodeState:
                         for ln in lines:
                             line_starts.append(line_starts[-1] + len(ln))
                     end_pos = line_starts[min(tok.map[1], len(lines))]
-                    if end_pos > min_trim_pos:
-                        min_trim_pos = end_pos
+                    min_trim_pos = max(min_trim_pos, end_pos)
+                    if tok.level == 0:
+                        last_top_level_fence_start = line_starts[tok.map[0]]
+
+        # A closed top-level fence starts a self-contained block. Keep it if
+        # there is no later blank line, rather than retaining all earlier text
+        # or dropping its opener while keeping its closer.
+        cut = last_top_level_fence_start
         for sep in ("\r\n\r\n", "\n\n"):
             pos = self._buf.rfind(sep, min_trim_pos)
             if pos != -1:
-                self._buf = self._buf[pos + len(sep):]
-                return
+                cut = max(cut, pos + len(sep))
+        if cut:
+            self._buf = self._buf[cut:]
 
     def in_code(self) -> bool:
         tail = self._tail
