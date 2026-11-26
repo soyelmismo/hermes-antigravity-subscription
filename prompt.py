@@ -85,6 +85,27 @@ _ATTACHMENT_ANNOTATION_RE = re.compile(
 )
 
 
+def _canonical_tool_call_arguments(args: Any) -> str:
+    """Wire form Hermes sends assistant tool-call arguments in.
+
+    Hermes rewrites every assistant ``tool_calls[].function.arguments`` on the send
+    path before a provider sees the message (``_canonicalize_api_tool_calls`` ->
+    ``_canonicalize_tool_call_arguments``: compact separators, sorted keys). Anything
+    this plugin records about an emitted call must be reduced to the same form, or
+    the echoed copy of the next turn never compares equal. Values that are not valid
+    JSON come back untouched so a comparison against them fails closed.
+    """
+    if not isinstance(args, str):
+        try:
+            args = json.dumps(args, ensure_ascii=False)
+        except (TypeError, ValueError):
+            return ""
+    try:
+        return json.dumps(json.loads(args), separators=(",", ":"), sort_keys=True)
+    except (TypeError, ValueError):
+        return args
+
+
 def _clean_rendered_text(text: str) -> str:
     if not text:
         return ""

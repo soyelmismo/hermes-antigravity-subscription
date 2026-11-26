@@ -21,6 +21,7 @@ try:
     from .process import _check_early_quota_error
     from .prompt import (
         _TOOL_CALL_CLOSE,
+        _canonical_tool_call_arguments,
         _MarkdownCodeState,
         _find_tool_call_close,
         _find_unquoted_tool_call_open,
@@ -36,6 +37,7 @@ except ImportError:
     from process import _check_early_quota_error
     from prompt import (
         _TOOL_CALL_CLOSE,
+        _canonical_tool_call_arguments,
         _MarkdownCodeState,
         _find_tool_call_close,
         _find_unquoted_tool_call_open,
@@ -747,11 +749,15 @@ class AntigravityStream(Iterator[Any]):
         if tool_calls:
             for tc in tool_calls:
                 fn = getattr(tc, "function", None)
+                # Record arguments in the canonical form Hermes puts on the
+                # wire for assistant tool calls, so the next turn's echoed copy
+                # compares equal (see client._assistant_matches_emitted).
+                raw_args = getattr(fn, "arguments", "") or "" if fn else ""
                 self._emitted_tool_calls.append(
                     (
                         str(getattr(tc, "id", "") or ""),
                         str(getattr(fn, "name", "") or "") if fn else "",
-                        str(getattr(fn, "arguments", "") or "") if fn else "",
+                        _canonical_tool_call_arguments(raw_args),
                     )
                 )
         delta = SimpleNamespace(

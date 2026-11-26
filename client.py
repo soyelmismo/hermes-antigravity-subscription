@@ -54,6 +54,7 @@ try:
         write_media_read_permissions,
     )
     from .prompt import (
+        _canonical_tool_call_arguments,
         _EMPTY_TOOL_RESPONSE_NUDGE,
         _is_recovery_nudge,
         _PROMPT_PREAMBLE,
@@ -99,6 +100,7 @@ except ImportError:
         write_media_read_permissions,
     )
     from prompt import (
+        _canonical_tool_call_arguments,
         _EMPTY_TOOL_RESPONSE_NUDGE,
         _is_recovery_nudge,
         _PROMPT_PREAMBLE,
@@ -157,7 +159,8 @@ def _assistant_matches_emitted(
     reply (and large ``<tool_call>`` payloads) inside the following user turn.
     Any mismatch (middleware edits, multipart content, fallback-provider reply,
     repaired JSON arguments, or synthesized call IDs) returns False so the
-    message is echoed as before.
+    message is echoed as before. Tool-call arguments are compared in the
+    canonical form Hermes puts on the wire, not byte for byte.
     """
     if not isinstance(emitted, dict) or not isinstance(message, dict):
         return False
@@ -188,14 +191,11 @@ def _assistant_matches_emitted(
         fn = tc.get("function")
         if not isinstance(fn, dict):
             return False
-        args = fn.get("arguments", "{}")
-        if not isinstance(args, str):
-            args = json.dumps(args, ensure_ascii=False)
         norm_calls.append(
             (
                 str(tc.get("id") or ""),
                 str(fn.get("name") or ""),
-                args,
+                _canonical_tool_call_arguments(fn.get("arguments", "{}")),
             )
         )
     return norm_calls == list(emitted_calls)

@@ -190,6 +190,49 @@ class AssistantElisionTests(unittest.TestCase):
             self.client._terminate_worker(keep_conversation=False)
             self.assertIsNone(self.client._conversation_last_assistant)
 
+    def test_elides_tool_call_when_host_canonicalizes_arguments(self):
+        tc = {
+            "id": "call_canon_1",
+            "type": "function",
+            "function": {
+                "name": "write_file",
+                "arguments": {"path": "/tmp/a.py", "content": "CANON_PAYLOAD_XYZ"},
+            },
+        }
+        worker = _SequencedMockWorker([f"<tool_call>{json.dumps(tc)}</tool_call>", "all done"])
+        tools = [{"type": "function", "function": {"name": "write_file", "parameters": {"type": "object"}}}]
+        with patch("client.is_authenticated", return_value=True), \
+                patch("client.subprocess.Popen", return_value=worker), \
+                patch("client.custom_agent_args", return_value=[]):
+            m1 = [{"role": "user", "content": "write a.py"}]
+            c1 = self.client.chat.completions.create(model="gemini-3.8-flash", messages=m1, tools=tools, stream=False)
+            emitted = c1.choices[0].message.tool_calls[0]
+            # Hermes rewrites every assistant tool-call arguments string on the
+            # send path to compact separators and sorted keys before any provider
+            # sees it, so the echoed copy never matches the emitted bytes.
+            canonical = json.dumps(
+                json.loads(emitted.function.arguments), separators=(",", ":"), sort_keys=True
+            )
+            m2 = m1 + [
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": emitted.id,
+                            "type": "function",
+                            "function": {"name": emitted.function.name, "arguments": canonical},
+                        }
+                    ],
+                },
+                {"role": "tool", "tool_call_id": emitted.id, "name": "write_file", "content": "Wrote ok"},
+            ]
+            self.client.chat.completions.create(model="gemini-3.8-flash", messages=m2, tools=tools, stream=False)
+
+        self.assertEqual(len(worker.written_prompts), 2)
+        self.assertNotIn("CANON_PAYLOAD_XYZ", worker.written_prompts[1])
+        self.assertIn("Tool Result (call_canon_1):\nWrote ok", worker.written_prompts[1])
+
 
 if __name__ == "__main__":
     unittest.main()
