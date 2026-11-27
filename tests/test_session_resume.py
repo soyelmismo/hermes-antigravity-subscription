@@ -532,7 +532,7 @@ def test_ttl_expires_idle_snapshots(tmp_path, source_db, monkeypatch):
     reg = SessionRegistry(store_dir=tmp_path / "store")
     sid = _seed(reg, "k", 0, source=source_db, history=[U1])
     monkeypatch.setenv("ANTIGRAVITY_SESSION_TTL_SECONDS", "60")
-    reg._snapshots[sid].last_used -= 61
+    reg.touch(sid, time.time() - 61)
     assert reg.lookup("k", [U1, A1]) is None
     assert len(reg) == 0
     assert not (tmp_path / "store" / f"{sid}.db").exists()
@@ -551,33 +551,31 @@ def test_ttl_zero_or_garbage_env_values(monkeypatch):
         assert session_registry.session_resume_enabled() is False
 
 
-def test_store_directory_is_recreated_and_removed_at_shutdown(tmp_path, source_db):
-    reg = SessionRegistry()
+def test_store_directory_is_recreated_and_survives_shutdown(tmp_path, source_db):
+    reg = SessionRegistry(store_dir=tmp_path / "store")
     sid = _seed(reg, "k", 0, source=source_db, history=[U1])
     store = reg._dir
-    assert store is not None and store.is_dir() and store.name.startswith("hermes_agy_sessions_")
     import shutil
 
-    shutil.rmtree(store)  # e.g. Hermes' scratch pruner
-    assert reg.lookup("k", [U1, A1]) is not None  # index survives ...
-    assert reg.restore(reg._snapshots[sid], tmp_path / "dest") is False  # ... the file does not
-    assert sid not in reg._snapshots
+    snap = reg._snapshots[sid]
+    shutil.rmtree(store)  # e.g. a manual clean-up
+    assert reg.lookup("k", [U1, A1]) is None  # index gone with it
+    assert reg.restore(snap, tmp_path / "dest") is False
     assert _seed(reg, "k", 0, source=source_db, history=[U1]) is not None  # and a new one works
-    store = reg._dir
     reg.shutdown()
-    assert not store.exists()
+    assert store.is_dir() and len(reg) == 1  # shutdown no longer deletes anything
 
 
-def test_dead_process_store_directories_are_swept(tmp_path, monkeypatch, source_db):
+def test_dead_process_legacy_temp_directories_are_swept(tmp_path, monkeypatch, source_db):
     monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
     done = subprocess.Popen([sys.executable, "-c", "pass"])
     done.wait()
     dead = tmp_path / f"hermes_agy_sessions_{done.pid}_xyz"
     dead.mkdir()
     (dead / "x.db").write_bytes(b"x")
-    alive = tmp_path / f"hermes_agy_sessions_{os.getpid() + 0}_mine"
+    alive = tmp_path / f"hermes_agy_sessions_{os.getppid()}_other"
     alive.mkdir()
-    reg = SessionRegistry()
+    reg = SessionRegistry(store_dir=tmp_path / "store")
     _seed(reg, "k", 0, source=source_db, history=[U1])
     assert not dead.exists()
     assert alive.exists()

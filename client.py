@@ -1153,9 +1153,11 @@ class AntigravityClient:
         # after the turn instead of refreshing that one.
         self._session_snapshot_id = None
         logger.info(
-            "Antigravity session resume: adopted conversation %s (%d messages) for a new client",
+            "Antigravity session resume: pid=%d adopted conversation %s (%d messages, snapshot %s)",
+            os.getpid(),
             snapshot.conversation_id,
             len(snapshot.history),
+            snapshot.snapshot_id,
         )
 
     def _confirm_resume(self, proc: subprocess.Popen) -> None:
@@ -1181,6 +1183,12 @@ class AntigravityClient:
             with self._lock:
                 if self._worker_proc is proc:
                     self._resume_pending_id = None
+            logger.info(
+                "Antigravity resume confirmed: pid=%d agy worker pid=%s reported conversation %s",
+                os.getpid(),
+                getattr(proc, "pid", None),
+                actual,
+            )
             return
         if actual:
             logger.warning(
@@ -1202,6 +1210,22 @@ class AntigravityClient:
         with contextlib.suppress(Exception):
             get_registry().drop(adopted)
         raise _ResumeLost(expected)
+
+    def _log_worker_send(self, branch: str, sent: int, total: int, chars: int) -> None:
+        """One line per worker turn: what actually went to agy.
+
+        ``delta`` means the worker already holds the earlier messages (its own
+        live conversation or a resumed one); ``full`` re-sent the whole history.
+        """
+        logger.info(
+            "Antigravity worker send: pid=%d branch=%s conversation=%s messages=%d/%d chars=%d",
+            os.getpid(),
+            branch,
+            self._worker_conversation_id or "-",
+            sent,
+            total,
+            chars,
+        )
 
     def _cancel_idle_timer_locked(self) -> None:
         timer = self._worker_idle_timer
@@ -1682,6 +1706,7 @@ class AntigravityClient:
                         media_sink=self._materialized_media,
                     )
                     prompt_payload += retry_note
+                    sent_messages = len(delta_msgs)
                     dump_prompt_debug(
                         prompt=prompt_payload,
                         branch="delta",
@@ -1703,6 +1728,7 @@ class AntigravityClient:
                     )
                     segments[-1] += retry_note
                     prompt_payload, followup_segments = segments[0], segments[1:]
+                    sent_messages = len(messages_list)
 
                 event_msg = {"event": "user", "message": {"content": prompt_payload}}
                 try:
@@ -1729,7 +1755,14 @@ class AntigravityClient:
                     self._raise_if_cancelled()
                     proc.stdin.write(json.dumps(event_msg) + "\n")
                     proc.stdin.flush()
+                    sent_messages = len(messages_list)
 
+                self._log_worker_send(
+                    "delta" if not comparable_full_send else "full",
+                    sent_messages,
+                    len(messages_list),
+                    len(prompt_payload) + sum(len(seg) for seg in followup_segments),
+                )
                 with self._lock:
                     worker_usage_baseline = self._worker_usage_baseline
                 stream_iter = AntigravityStream(
