@@ -173,6 +173,13 @@ class AntigravitySubscriptionDirectSDKProfile(ProviderProfile):
         top_level: dict[str, Any] = {}
         if effort:
             top_level["reasoning_effort"] = str(effort).strip().lower()
+        # Hermes builds a new agent (and client) per gateway message, and a
+        # background review shares the parent's session id. The id is the only
+        # stable owner of an agy conversation the client can see; see
+        # session_registry.py. Auxiliary calls never carry one.
+        session_id = context.get("session_id")
+        if session_id:
+            top_level["hermes_session_id"] = str(session_id)
         return {}, top_level
 
     def fetch_models(

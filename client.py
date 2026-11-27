@@ -73,6 +73,11 @@ try:
     )
     from .custom_agent import custom_agent_args
     from .delivery import DeliveryWatch
+    from .session_registry import (
+        get_registry,
+        session_key,
+        session_resume_enabled,
+    )
     from .stream import AntigravityStream, NativeToolProtocolError, collect_stream_completion
     from .debug import dump_prompt_debug
 except ImportError:
@@ -119,6 +124,11 @@ except ImportError:
     )
     from custom_agent import custom_agent_args
     from delivery import DeliveryWatch
+    from session_registry import (
+        get_registry,
+        session_key,
+        session_resume_enabled,
+    )
     from stream import AntigravityStream, NativeToolProtocolError, collect_stream_completion
     from debug import dump_prompt_debug
 
@@ -578,6 +588,11 @@ class AntigravityClient:
         # CPU seconds at the last sign of life: the discriminator between a
         # silent abandoned turn and a silent busy one.
         self._worker_cpu_at_activity: dict[subprocess.Popen, float] = {}
+        # Cross-client resume (session_registry.py). The key of the Hermes
+        # session the current turn belongs to, and the id of the snapshot this
+        # client last published for it (refreshed once at close()).
+        self._session_key: str | None = None
+        self._session_snapshot_id: str | None = None
 
     @staticmethod
     def _resolve_real_token_path() -> Path | None:
@@ -589,6 +604,28 @@ class AntigravityClient:
         reasoning_effort: str | None = None,
     ) -> tuple[str, str | None]:
         return resolve_model_and_effort(model, reasoning_effort)
+
+    def _session_key_for(
+        self,
+        session_id: Any,
+        model: str,
+        effort: str | None,
+        messages: list[dict[str, Any]],
+    ) -> str | None:
+        """Registry key of this request's Hermes session; None disables resume."""
+        if not session_id or not session_resume_enabled():
+            return None
+        try:
+            account = str(self._resolve_real_token_path() or "")
+        except Exception:
+            account = ""
+        return session_key(
+            session_id=str(session_id),
+            model=model,
+            effort=effort,
+            account=account,
+            messages=messages,
+        )
 
     def _agent_args(self) -> list[str]:
         args: list[str] = []
@@ -659,6 +696,10 @@ class AntigravityClient:
         # WinError 32. Ordering is therefore load-bearing, not cosmetic.
         with self._lock:
             self.is_closed = True
+            # The state termination is about to drop: with the worker dead the
+            # conversation file is quiescent, so the snapshot taken at the end
+            # of the last turn is refreshed from it below.
+            session_state = self._session_state_locked()
             self._terminate_worker_locked()
             procs = tuple(self._active_processes)
             self._active_processes.clear()
@@ -666,6 +707,8 @@ class AntigravityClient:
             self._worker_cpu_at_activity.clear()
         for proc in procs:
             self._terminate_process(proc)
+        if session_state is not None and self._session_snapshot_id is not None:
+            self._publish_session_state(session_state, replace=self._session_snapshot_id)
         # Phase 1.5 -- delete the media files this session materialized.
         # After every child is dead (they may still have had the files open),
         # before the workspace removal; must never raise (issue #4 contract).
@@ -898,6 +941,104 @@ class AntigravityClient:
                 return
             self._worker_last_assistant = assistant
             self._conversation_last_assistant = assistant
+            # The last of the three calls that close a successful worker turn
+            # (history, conversation id, last assistant): the state is complete.
+            state = self._session_state_locked()
+        if state is not None:
+            self._session_snapshot_id = self._publish_session_state(state) or self._session_snapshot_id
+
+    def _session_state_locked(self) -> tuple[str, str, list[dict[str, Any]], dict[str, Any] | None, dict[str, int]] | None:
+        """(key, conversation id, history, last assistant, usage baseline) or None."""
+        key = self._session_key
+        conv_id = self._worker_conversation_id
+        if not key or not conv_id or not self._conversation_history:
+            return None
+        baseline = dict(self._worker_usage_baseline)
+        saved = self._resume_usage_baseline
+        if not baseline and saved is not None and saved[0] == conv_id:
+            baseline = dict(saved[1])
+        return (
+            key,
+            conv_id,
+            list(self._conversation_history),
+            self._conversation_last_assistant,
+            baseline,
+        )
+
+    def _publish_session_state(
+        self,
+        state: tuple[str, str, list[dict[str, Any]], dict[str, Any] | None, dict[str, int]],
+        *,
+        replace: str | None = None,
+    ) -> str | None:
+        """Snapshot the conversation for later clients of the same Hermes session.
+
+        Never raises: a failed snapshot only costs the next client a full send.
+        """
+        key, conv_id, history, last_assistant, baseline = state
+        try:
+            return get_registry().publish(
+                key,
+                conversation_id=conv_id,
+                history=history,
+                last_assistant=last_assistant,
+                usage_baseline=baseline,
+                source_db=self._isolated_gemini_dir / "conversations" / f"{conv_id}.db",
+                replace=replace,
+            )
+        except Exception:
+            logger.debug("Antigravity session snapshot failed", exc_info=True)
+            return None
+
+    def _maybe_adopt_session(self, key: str | None, messages: list[dict[str, Any]]) -> None:
+        """Resume the agy conversation an earlier client left for this session.
+
+        Runs at the start of a worker turn, under the worker lock. A live local
+        continuation always wins; the registry is consulted only when this
+        client cannot continue the request by itself, i.e. when it is new or
+        the request is not an extension of what it sent. The adopted state is
+        the same state an idle-reaped worker keeps (conversation file, id,
+        history, usage baseline), so the existing resume path does the rest:
+        ``--conversation <id>`` and a delta prompt.
+        """
+        with self._lock:
+            self._session_key = key
+            if key is None:
+                return
+            try:
+                self._adopt_snapshot_locked(key, messages)
+            except Exception:
+                # A registry failure must never fail the request: the turn
+                # simply goes out as the full send it would have been anyway.
+                logger.debug("Antigravity session resume skipped", exc_info=True)
+
+    def _adopt_snapshot_locked(self, key: str, messages: list[dict[str, Any]]) -> None:
+        worker_alive = self._worker_proc is not None and self._worker_proc.poll() is None
+        local_history = self._worker_history if worker_alive else self._conversation_history
+        if _messages_match_prefix(local_history, messages):
+            return
+        registry = get_registry()
+        snapshot = registry.lookup(key, messages)
+        if snapshot is None:
+            return
+        self._terminate_worker_locked(keep_conversation=False)
+        self._purge_isolated_conversations()
+        if not registry.restore(snapshot, self._isolated_gemini_dir / "conversations"):
+            return
+        self._worker_conversation_id = snapshot.conversation_id
+        self._conversation_history = list(snapshot.history)
+        self._conversation_last_assistant = (
+            dict(snapshot.last_assistant) if snapshot.last_assistant is not None else None
+        )
+        self._resume_usage_baseline = (snapshot.conversation_id, dict(snapshot.usage_baseline))
+        # The parent stays immutable: this client publishes its own snapshot
+        # after the turn instead of refreshing that one.
+        self._session_snapshot_id = None
+        logger.info(
+            "Antigravity session resume: adopted conversation %s (%d messages) for a new client",
+            snapshot.conversation_id,
+            len(snapshot.history),
+        )
 
     def _cancel_idle_timer_locked(self) -> None:
         timer = self._worker_idle_timer
@@ -1311,6 +1452,15 @@ class AntigravityClient:
                 self._worker_lock.release()
                 raise
             try:
+                self._maybe_adopt_session(
+                    self._session_key_for(
+                        extra_kwargs.get("hermes_session_id"),
+                        resolved_model,
+                        effort,
+                        messages_list,
+                    ),
+                    messages_list,
+                )
                 native_block_retry = self._take_native_block_note(messages_list) and bool(tools)
                 retry_note = "\n\n" + _NATIVE_BLOCK_NOTE if native_block_retry else ""
                 with self._lock:
