@@ -519,6 +519,11 @@ class AntigravityStream(Iterator[Any]):
             self._worker_lock_held = False
             with contextlib.suppress(Exception):
                 self.worker_lock.release()
+            # The turn is over: free its conversation id for other clients
+            # (session resume). Runs on every ending, success or not.
+            release = getattr(self.client, "_release_session_claim", None)
+            if release is not None:
+                release()
 
     def _retire_executor(self) -> None:
         """Shut down the private async executor, if the async path created one.

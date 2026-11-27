@@ -67,6 +67,12 @@ def worker(tmp_path, monkeypatch):
 
     def spawn(*args, **kwargs):
         spawned.media_rules_at_spawn = read_media_rules(tmp_path)
+        # agy announces the resumed conversation at start-up, before any input.
+        conv = args[0][args[0].index("--conversation") + 1] if "--conversation" in args[0] else "new"
+        spawned.stdout.readline.side_effect = [
+            json.dumps({"event": "init", "conversation_id": conv}) + "\n",
+            "",
+        ]
         return spawned
 
     monkeypatch.setattr(agy_client.subprocess, "Popen", MagicMock(side_effect=spawn))

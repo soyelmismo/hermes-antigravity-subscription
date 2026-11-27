@@ -29,7 +29,11 @@ class _SequencedMockWorker:
         self.stderr = io.StringIO("")
         self.stdin = self
         self.stdout = self
-        self._buf: list[str] = []
+        # Like agy, announce the conversation at start-up, before any input:
+        # the resume check reads this line before it sends the delta.
+        self._buf: list[str] = [
+            json.dumps({"event": "init", "conversation_id": conv_id}) + "\n"
+        ]
         self._closed = False
 
     def write(self, data: str) -> int:
