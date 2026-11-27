@@ -442,6 +442,75 @@ def _force_rmtree(path: str) -> None:
     shutil.rmtree(path, ignore_errors=True)
 
 
+# How long a resumed worker may take to announce its conversation (agy prints
+# its `init` event at start-up, before it reads any input).
+_RESUME_HANDSHAKE_SECONDS = 30.0
+
+
+class _ResumeLost(Exception):
+    """agy did not resume the requested conversation (or could not be asked)."""
+
+
+class _ReplayStdout:
+    """A worker's stdout with already-read lines handed back first.
+
+    The resume check reads the worker's `init` event before the delta is
+    sent; the stream must still see every line it would have seen.
+    """
+
+    def __init__(self, inner: Any, lines: list[str]):
+        self._inner = inner
+        self._lines = list(lines)
+
+    def readline(self, *args: Any) -> str:
+        if self._lines:
+            return self._lines.pop(0)
+        return self._inner.readline(*args)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)
+
+
+def _read_init_conversation_id(proc: Any, timeout: float) -> tuple[str | None, list[str]]:
+    """Read the worker's stdout up to its `init` event.
+
+    Returns (conversation id or None when it could not be learned, the lines
+    consumed). Never leaves a reader parked on the pipe: on timeout the worker
+    is terminated, which ends the read.
+    """
+    consumed: list[str] = []
+    found: list[str | None] = []
+
+    def reader() -> None:
+        try:
+            while True:
+                line = proc.stdout.readline()
+                if not line or not isinstance(line, str):
+                    return
+                consumed.append(line)
+                text = line.strip()
+                if not text.startswith("{"):
+                    continue
+                try:
+                    event = json.loads(text)
+                except Exception:
+                    continue
+                if event.get("event") == "init":
+                    init = event.get("init") or {}
+                    found.append(event.get("conversation_id") or init.get("conversation_id") or "")
+                return  # init, or an event that means init is not coming
+        except Exception:
+            return
+
+    thread = threading.Thread(target=reader, name="agy-resume-handshake", daemon=True)
+    thread.start()
+    thread.join(timeout)
+    if thread.is_alive():
+        terminate_process(proc)
+        thread.join(2.0)
+    return (found[0] if found else None), consumed
+
+
 class AntigravityClient:
     """OpenAI-compatible client facade driving Antigravity CLI.
 
@@ -469,6 +538,14 @@ class AntigravityClient:
     # Instruct Hermes not to wrap this client in wire transports or async adapters
     HERMES_SKIP_TRANSPORT_WRAP = True
     HERMES_SKIP_ASYNC_WRAP = True
+
+    # Session-resume state (see __init__). Class-level defaults keep clients
+    # built without __init__ (test doubles) and half-initialized ones working.
+    _session_key: str | None = None
+    _session_snapshot_id: str | None = None
+    _adopted_snapshot_id: str | None = None
+    _resume_pending_id: str | None = None
+    _preserve_claim = False
 
     def __init__(
         self,
@@ -593,6 +670,15 @@ class AntigravityClient:
         # client last published for it (refreshed once at close()).
         self._session_key: str | None = None
         self._session_snapshot_id: str | None = None
+        # Snapshot this client adopted for the current turn, so it can be
+        # dropped when agy refuses to resume it.
+        self._adopted_snapshot_id: str | None = None
+        # Conversation id the CURRENT worker process was spawned to resume with
+        # --conversation and whose init event has not been checked yet.
+        self._resume_pending_id: str | None = None
+        # Set while a respawn that keeps its conversation terminates the old
+        # worker: that termination must not free the conversation's claim.
+        self._preserve_claim = False
 
     @staticmethod
     def _resolve_real_token_path() -> Path | None:
@@ -815,6 +901,9 @@ class AntigravityClient:
 
     def _terminate_worker_locked(self, keep_conversation: bool = False) -> None:
         self._cancel_idle_timer_locked()
+        self._resume_pending_id = None
+        if not self._preserve_claim:
+            self._release_session_claim()
         if self._worker_proc is not None:
             if keep_conversation and self._worker_conversation_id:
                 self._resume_usage_baseline = (
@@ -851,6 +940,26 @@ class AntigravityClient:
         with self._lock:
             if conv_id and not self._cancelled:
                 self._worker_conversation_id = conv_id
+                # A new conversation learns its id at init: from here on it
+                # has a turn in flight that no other client may adopt.
+                self._claim_conversation(conv_id)
+
+    def _claim_conversation(self, conv_id: str) -> bool:
+        """Mark ``conv_id`` as in use by this client's turn (session resume only)."""
+        if not self._session_key or not conv_id:
+            return True
+        try:
+            return get_registry().claim(conv_id, self)
+        except Exception:
+            logger.debug("Antigravity conversation claim failed", exc_info=True)
+            return True
+
+    def _release_session_claim(self) -> None:
+        """The turn is over (snapshotted, failed, reaped or closed): free the id."""
+        try:
+            get_registry().release_owner(self)
+        except Exception:
+            logger.debug("Antigravity conversation release failed", exc_info=True)
 
     def _restore_pruned_workspace(self) -> None:
         """Recreate the private directory after something outside removed it.
@@ -1003,6 +1112,7 @@ class AntigravityClient:
         """
         with self._lock:
             self._session_key = key
+            self._adopted_snapshot_id = None
             if key is None:
                 return
             try:
@@ -1018,13 +1128,21 @@ class AntigravityClient:
         if _messages_match_prefix(local_history, messages):
             return
         registry = get_registry()
-        snapshot = registry.lookup(key, messages)
+        # Claims the conversation for this client in the same step, skipping a
+        # conversation another client has a turn in flight on.
+        snapshot = registry.lookup(key, messages, owner=self)
         if snapshot is None:
             return
-        self._terminate_worker_locked(keep_conversation=False)
+        self._preserve_claim = True  # the lookup just claimed the conversation
+        try:
+            self._terminate_worker_locked(keep_conversation=False)
+        finally:
+            self._preserve_claim = False
         self._purge_isolated_conversations()
         if not registry.restore(snapshot, self._isolated_gemini_dir / "conversations"):
+            self._release_session_claim()
             return
+        self._adopted_snapshot_id = snapshot.snapshot_id
         self._worker_conversation_id = snapshot.conversation_id
         self._conversation_history = list(snapshot.history)
         self._conversation_last_assistant = (
@@ -1039,6 +1157,51 @@ class AntigravityClient:
             snapshot.conversation_id,
             len(snapshot.history),
         )
+
+    def _confirm_resume(self, proc: subprocess.Popen) -> None:
+        """Check, before the delta is sent, that agy resumed the conversation asked for.
+
+        agy answers ``--conversation <id>`` for an unknown id by silently
+        starting a NEW conversation and reporting the new id with SUCCESS; a
+        delta sent into it would be answered without any of the earlier
+        context. agy prints its ``init`` event (with the conversation id) at
+        start-up, before it reads input, so the id is compared first and
+        nothing has been generated when it differs. On a mismatch, or when the
+        id cannot be learned, the worker is terminated, the conversation and
+        the adopted snapshot are dropped, and ``_ResumeLost`` makes the caller
+        send the turn as a full send.
+        """
+        with self._lock:
+            expected = self._resume_pending_id
+        if not expected:
+            return
+        actual, consumed = _read_init_conversation_id(proc, _RESUME_HANDSHAKE_SECONDS)
+        if actual == expected:
+            proc.stdout = _ReplayStdout(proc.stdout, consumed)
+            with self._lock:
+                if self._worker_proc is proc:
+                    self._resume_pending_id = None
+            return
+        if actual:
+            logger.warning(
+                "Antigravity resume lost: asked for conversation %s, agy started %s; "
+                "dropping the conversation and sending the turn as a full send.",
+                expected,
+                actual,
+            )
+        else:
+            logger.warning(
+                "Antigravity resume unverified: agy did not report conversation %s at start-up; "
+                "dropping it and sending the turn as a full send.",
+                expected,
+            )
+        with self._lock:
+            adopted, self._adopted_snapshot_id = self._adopted_snapshot_id, None
+            self._terminate_worker_locked(keep_conversation=False)
+            self._purge_isolated_conversations()
+        with contextlib.suppress(Exception):
+            get_registry().drop(adopted)
+        raise _ResumeLost(expected)
 
     def _cancel_idle_timer_locked(self) -> None:
         timer = self._worker_idle_timer
@@ -1201,7 +1364,12 @@ class AntigravityClient:
                     self._worker_cpu_at_activity[proc] = cpu
                 return proc
 
-            self._terminate_worker_locked(keep_conversation=bool(conversation_id))
+            # The conversation stays ours across this respawn: keep its claim.
+            self._preserve_claim = True
+            try:
+                self._terminate_worker_locked(keep_conversation=bool(conversation_id))
+            finally:
+                self._preserve_claim = False
 
             # Multiple agy processes share one Google account; whoever
             # refreshed last wins. Re-point the isolated token at the real
@@ -1245,6 +1413,9 @@ class AntigravityClient:
             # permissions only at spawn (verified: rewriting the file under a
             # live worker changes nothing for its next turn).
             self._worker_media_rules = read_media_rules(self._isolated_gemini_dir)
+            self._resume_pending_id = conversation_id or None
+            if conversation_id:
+                self._claim_conversation(conversation_id)
             self._worker_usage_baseline = {}
             saved = self._resume_usage_baseline
             self._resume_usage_baseline = None
@@ -1473,13 +1644,35 @@ class AntigravityClient:
                     )
                     is_continuation = _messages_match_prefix(ref_history, messages_list)
                     conv_id_to_resume = self._worker_conversation_id if is_continuation else None
+                    if (
+                        conv_id_to_resume
+                        and not self._claim_conversation(conv_id_to_resume)
+                    ):
+                        # Another client has a turn in flight on this very
+                        # conversation id: agy keeps only one of two writers.
+                        logger.info(
+                            "Antigravity conversation %s is in use by another turn; "
+                            "sending a full send instead of resuming it",
+                            conv_id_to_resume,
+                        )
+                        self._terminate_worker_locked(keep_conversation=False)
+                        self._purge_isolated_conversations()
+                        is_continuation = False
+                        conv_id_to_resume = None
 
                 comparable_full_send = not is_continuation
                 followup_segments: list[str] = []
                 if is_continuation:
-                    proc = self._get_or_spawn_worker(
-                        resolved_model, effort, conversation_id=conv_id_to_resume
-                    )
+                    try:
+                        proc = self._get_or_spawn_worker(
+                            resolved_model, effort, conversation_id=conv_id_to_resume
+                        )
+                        self._confirm_resume(proc)
+                    except _ResumeLost:
+                        # The state is already dropped: take the full-send branch.
+                        is_continuation = False
+                        comparable_full_send = True
+                if is_continuation:
                     delta_msgs = messages_list[len(ref_history):]
                     if len(delta_msgs) >= 2 and _assistant_matches_emitted(delta_msgs[0], ref_last_assistant):
                         delta_msgs = delta_msgs[1:]
@@ -1590,6 +1783,22 @@ class AntigravityClient:
                         effort,
                         conversation_id=None if followup_segments else self._worker_conversation_id,
                     )
+                    try:
+                        self._confirm_resume(proc)
+                    except _ResumeLost:
+                        # The delta would reach a conversation without its
+                        # context: redo the turn as a full send.
+                        comparable_full_send = True
+                        proc = self._get_or_spawn_worker(resolved_model, effort, conversation_id=None)
+                        segments = self._full_send_segments(
+                            messages_list,
+                            model=resolved_model,
+                            tools=tools,
+                            tool_choice=tool_choice,
+                            branch="retry",
+                        )
+                        segments[-1] += retry_note
+                        prompt_payload, followup_segments = segments[0], segments[1:]
                     event_msg = {"event": "user", "message": {"content": prompt_payload}}
                     try:
                         self._raise_if_cancelled()

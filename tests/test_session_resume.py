@@ -57,12 +57,21 @@ class FakeAgy:
     def __init__(self):
         self.spawns: list[dict] = []
         self._next = 0
+        # agy answers an unknown --conversation id with a NEW conversation.
+        self.lose_resume = False
+        # agy that never announces a conversation (dies / hangs at start-up).
+        self.silent_resume = False
+        # The next spawn's turn ends in an error result.
+        self.fail_next = False
 
     def popen(self, args, *a, **kw):
         if not args or args[0] != "agy":
             return _REAL_POPEN(args, *a, **kw)
         if "--conversation" in args:
             conv = args[args.index("--conversation") + 1]
+            if self.lose_resume:
+                self._next += 1
+                conv = f"lost-{self._next}"
         else:
             self._next += 1
             conv = f"conv-{self._next}"
@@ -76,14 +85,21 @@ class FakeAgy:
         con.commit()
         con.close()
         # A live worker may serve several turns: script three, usage cumulative.
-        proc = _mock_proc(
-            _turn_lines(
-                *[
-                    _turn_events(conv, f"reply {len(self.spawns)}.{i}", _usage(1000 * (i + 1), 10 * (i + 1)))
-                    for i in range(3)
+        turns = [
+            _turn_events(conv, f"reply {len(self.spawns)}.{i}", _usage(1000 * (i + 1), 10 * (i + 1)))
+            for i in range(3)
+        ]
+        if self.fail_next:
+            self.fail_next = False
+            turns = [
+                [
+                    {"event": "init", "conversation_id": conv},
+                    {"event": "result", "result": {"status": "ERROR", "error": "boom", "response": ""}},
                 ]
-            )
-        )
+            ]
+        proc = _mock_proc(_turn_lines(*turns))
+        if self.silent_resume and "--conversation" in args:
+            proc.stdout.readline.side_effect = [""]
         self.spawns.append(
             {"args": list(args), "conv": conv, "rows_before": rows_before, "cwd": kw["cwd"], "proc": proc}
         )
@@ -596,3 +612,281 @@ def test_profile_forwards_the_hermes_session_id_to_the_client():
     assert "hermes_session_id" not in top
     _, top = profile.build_api_kwargs_extras(reasoning_config=None, model=MODEL, session_id="")
     assert "hermes_session_id" not in top
+
+
+# -- agy refuses to resume the conversation --------------------------------------
+
+
+def _texts(chunks):
+    return "".join(
+        c.choices[0].delta.content or ""
+        for c in chunks
+        if getattr(c, "choices", None) and getattr(c.choices[0], "delta", None)
+    )
+
+
+@pytest.mark.parametrize("stream", [True, False])
+def test_lost_resume_discards_the_delta_turn_and_redoes_it_as_a_full_send(
+    agy, make_client, registry, caplog, stream
+):
+    a = make_client()
+    _turn(a, [SYSTEM, U1])
+    a.close()
+    assert len(registry) == 1
+
+    agy.lose_resume = True
+    b = make_client()
+    with caplog.at_level("WARNING"):
+        if stream:
+            output = _texts(_turn(b, [SYSTEM, U1, A1, U2]))
+        else:
+            completion = b.chat.completions.create(
+                model=MODEL, messages=[SYSTEM, U1, A1, U2], hermes_session_id=SESSION
+            )
+            output = completion.choices[0].message.content
+
+    first, lost, redo = agy.spawns
+    assert lost["args"][lost["args"].index("--conversation") + 1] == first["conv"]
+    # The resumed worker was never given the delta, so it produced nothing.
+    lost["proc"].stdin.write.assert_not_called()
+    assert "--conversation" not in redo["args"]
+    assert "turn one" in agy.prompt_sent(2)  # the full history went out
+    assert output == "reply 2.0"  # only the full send's output reached Hermes
+    assert "reply 1" not in output
+    assert any(
+        r.levelname == "WARNING" and "resume lost" in r.getMessage() and first["conv"] in r.getMessage()
+        for r in caplog.records
+    )
+    # The snapshot agy refused is gone; the redone turn published its own.
+    assert len(registry) == 1
+    assert all(snap.conversation_id == redo["conv"] for snap in registry._snapshots.values())
+    assert not registry.in_use(first["conv"])
+
+
+def test_lost_resume_after_an_idle_reap_also_falls_back(agy, make_client, caplog):
+    a = make_client()
+    _turn(a, [U1], session=None)
+    a._reap_idle_worker(a._worker_proc)  # keeps the conversation for --conversation resume
+    assert a._worker_conversation_id == agy.spawns[0]["conv"]
+
+    agy.lose_resume = True
+    with caplog.at_level("WARNING"):
+        output = _texts(_turn(a, [U1, A1, U2], session=None))
+    assert len(agy.spawns) == 3
+    agy.spawns[1]["proc"].stdin.write.assert_not_called()
+    assert "--conversation" not in agy.spawns[2]["args"]
+    assert "turn one" in agy.prompt_sent(2)
+    assert output == "reply 2.0"
+    assert any("resume lost" in r.getMessage() for r in caplog.records)
+    # The new conversation is the client's now; the next turn continues it.
+    agy.lose_resume = False
+    _turn(a, [U1, A1, U2, A2, U3], session=None)
+    assert len(agy.spawns) == 3  # live worker took the delta
+
+
+def test_unverifiable_resume_is_treated_like_a_lost_one(agy, make_client, registry, caplog):
+    a = make_client()
+    _turn(a, [SYSTEM, U1])
+    a.close()
+    agy.silent_resume = True
+    b = make_client()
+    with caplog.at_level("WARNING"):
+        output = _texts(_turn(b, [SYSTEM, U1, A1, U2]))
+    assert len(agy.spawns) == 3
+    agy.spawns[1]["proc"].stdin.write.assert_not_called()
+    assert "--conversation" not in agy.spawns[2]["args"]
+    assert output == "reply 2.0"
+    assert any("resume unverified" in r.getMessage() for r in caplog.records)
+
+
+def test_matching_conversation_id_is_not_disturbed_by_the_check(agy, make_client):
+    a = make_client()
+    _turn(a, [SYSTEM, U1])
+    a.close()
+    b = make_client()
+    output = _texts(_turn(b, [SYSTEM, U1, A1, U2]))
+    assert len(agy.spawns) == 2
+    assert output == "reply 1.0"
+    agy.spawns[1]["proc"].stdin.write.assert_called()
+
+
+# -- one in-flight turn per conversation id ---------------------------------------
+
+
+def test_fork_during_an_in_flight_turn_is_a_full_send_and_release_allows_adoption(
+    agy, make_client, registry
+):
+    a = make_client()
+    _turn(a, [SYSTEM, U1])
+    a.close()
+    conv = agy.spawns[0]["conv"]
+    assert not registry.in_use(conv)
+
+    main = make_client()
+    in_flight = main.chat.completions.create(
+        model=MODEL, messages=[SYSTEM, U1, A1, U2], stream=True, hermes_session_id=SESSION
+    )
+    assert registry.in_use(conv)  # adopted and being used
+
+    review = make_client()
+    _turn(review, [SYSTEM, U1, A1, {"role": "user", "content": "REVIEW"}])
+    assert "--conversation" not in agy.spawns[2]["args"]
+    assert agy.spawns[2]["rows_before"] == 0
+    assert "turn one" in agy.prompt_sent(2)
+
+    list(in_flight)  # the main turn completes, is snapshotted and releases
+    assert not registry.in_use(conv)
+
+    later = make_client()
+    _turn(later, [SYSTEM, U1, A1, U2, A2, U3])
+    assert agy.spawns[3]["args"][agy.spawns[3]["args"].index("--conversation") + 1] == conv
+    assert agy.spawns[3]["rows_before"] == 2
+
+
+def test_claim_is_released_when_the_turn_fails(agy, make_client, registry):
+    a = make_client()
+    _turn(a, [SYSTEM, U1])
+    a.close()
+    conv = agy.spawns[0]["conv"]
+
+    agy.fail_next = True
+    b = make_client()
+    with pytest.raises(RuntimeError):
+        _turn(b, [SYSTEM, U1, A1, U2])
+    assert not registry.in_use(conv)
+
+    c = make_client()
+    _turn(c, [SYSTEM, U1, A1, U2])
+    assert "--conversation" in agy.spawns[2]["args"]  # adoptable again
+
+
+def test_claim_is_released_when_the_stream_is_abandoned_and_closed(agy, make_client, registry):
+    a = make_client()
+    _turn(a, [SYSTEM, U1])
+    a.close()
+    conv = agy.spawns[0]["conv"]
+    b = make_client()
+    stream = b.chat.completions.create(
+        model=MODEL, messages=[SYSTEM, U1, A1, U2], stream=True, hermes_session_id=SESSION
+    )
+    assert registry.in_use(conv)
+    stream.close()
+    assert not registry.in_use(conv)
+
+
+def test_claim_is_released_at_close(agy, make_client, registry):
+    a = make_client()
+    _turn(a, [SYSTEM, U1])
+    a.close()
+    conv = agy.spawns[0]["conv"]
+    b = make_client()
+    b.chat.completions.create(
+        model=MODEL, messages=[SYSTEM, U1, A1, U2], stream=True, hermes_session_id=SESSION
+    )
+    assert registry.in_use(conv)
+    b.close()
+    assert not registry.in_use(conv)
+
+
+def test_own_continuation_on_a_claimed_conversation_is_a_full_send(agy, make_client, registry):
+    # Another client holds the id (a fork adopted it): this client's own delta
+    # on that id would be a second writer, so it starts a fresh conversation.
+    a = make_client()
+    _turn(a, [SYSTEM, U1])
+    conv = agy.spawns[0]["conv"]
+    class Rival:
+        pass
+
+    rival = Rival()
+    registry.release_owner(a)
+    assert registry.claim(conv, rival)
+    _turn(a, [SYSTEM, U1, A1, U2])
+    assert len(agy.spawns) == 2
+    assert "--conversation" not in agy.spawns[1]["args"]
+    assert "turn one" in agy.prompt_sent(1)
+
+
+# -- claim registry unit tests ------------------------------------------------------
+
+
+def test_claim_is_exclusive_idempotent_and_releasable(tmp_path):
+    reg = SessionRegistry(store_dir=tmp_path / "store")
+
+    class Owner:
+        pass
+
+    a, b = Owner(), Owner()
+    assert reg.claim("c1", a) and reg.claim("c1", a)
+    assert not reg.claim("c1", b)
+    assert reg.in_use("c1")
+    reg.release_owner(b)  # not the holder: nothing happens
+    assert reg.in_use("c1")
+    reg.release_owner(a)
+    assert not reg.in_use("c1")
+    assert reg.claim("c1", b)
+    assert not reg.claim("", a)
+    reg.shutdown()
+
+
+def test_an_owner_holds_one_claim_at_a_time(tmp_path):
+    reg = SessionRegistry(store_dir=tmp_path / "store")
+
+    class Owner:
+        pass
+
+    a = Owner()
+    reg.claim("c1", a)
+    reg.claim("c2", a)
+    assert not reg.in_use("c1") and reg.in_use("c2")
+    reg.shutdown()
+
+
+def test_claim_dies_with_its_owner_and_after_the_hour(tmp_path, monkeypatch):
+    import gc
+
+    reg = SessionRegistry(store_dir=tmp_path / "store")
+
+    class Owner:
+        pass
+
+    a = Owner()
+    reg.claim("c1", a)
+    del a
+    gc.collect()
+    assert not reg.in_use("c1")
+
+    b = Owner()
+    reg.claim("c2", b)
+    monkeypatch.setattr(session_registry, "_CLAIM_MAX_SECONDS", -1.0)
+    assert not reg.in_use("c2")
+    reg.shutdown()
+
+
+def test_lookup_skips_conversations_claimed_by_others_and_claims_for_its_owner(tmp_path, source_db):
+    reg = SessionRegistry(store_dir=tmp_path / "store")
+
+    class Owner:
+        pass
+
+    a, b = Owner(), Owner()
+    _seed(reg, "k", 0, source=source_db, history=[U1], conv="c1")
+    snap = reg.lookup("k", [U1, A1], owner=a)
+    assert snap is not None and reg.in_use("c1")
+    assert reg.lookup("k", [U1, A1], owner=b) is None  # held by a
+    assert reg.lookup("k", [U1, A1]) is not None  # no owner: claims are not consulted
+    assert reg.lookup("k", [U1, A1], owner=a) is not None  # idempotent for the holder
+    reg.release_owner(a)
+    assert reg.lookup("k", [U1, A1], owner=b) is not None
+    reg.shutdown()
+
+
+def test_drop_removes_the_snapshot_and_its_file(tmp_path, source_db):
+    reg = SessionRegistry(store_dir=tmp_path / "store")
+    sid = _seed(reg, "k", 0, source=source_db, history=[U1])
+    path = reg._snapshots[sid].db_path
+    reg.drop(None)
+    reg.drop("unknown")
+    assert len(reg) == 1
+    reg.drop(sid)
+    assert len(reg) == 0 and not path.exists()
+    reg.shutdown()

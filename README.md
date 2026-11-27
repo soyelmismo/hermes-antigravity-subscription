@@ -167,6 +167,8 @@ The provider profile now forwards Hermes' session id to the client (`hermes_sess
 
 - The key is the session id, model, effort, account token path and system prompt. A change in any of them starts a fresh conversation.
 - Snapshots are immutable and adopted by copy. A fork that shares the prefix (Hermes' background review) gets its own child snapshot and never becomes the state the main line continues from.
+- agy answers `--conversation <id>` for an unknown id with a new conversation and SUCCESS. A resumed worker prints its `init` event (with the conversation id) before it reads input, and the client compares that id with the one it asked for before sending the delta. On a mismatch, or when no id is reported within 30 s, the worker is terminated, the conversation and the adopted snapshot are dropped, a WARNING is logged and the turn is sent as a full send. This covers idle-reap resumes as well; nothing the refused worker could say reaches Hermes.
+- One in-flight turn per conversation id: while a client has a turn running on conversation X, no other client adopts a snapshot of X (it takes a full send instead). The claim is released when the turn has been snapshotted, fails, is abandoned, when the worker is reaped and at `close()`; it also dies with its client and expires after an hour.
 - A request that does not extend a snapshot (context compression, an unrelated call with the same session id) is a full send, as before. A live client still prefers its own state.
 - At most 3 snapshots per session and 16 in total are kept, least recently used first, for `ANTIGRAVITY_SESSION_TTL_SECONDS`. The directory (`hermes_agy_sessions_<pid>_*` under the temp dir) is removed at exit and swept when its process is gone. Nothing survives a Hermes restart.
 

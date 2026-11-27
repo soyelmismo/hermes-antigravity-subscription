@@ -27,6 +27,12 @@ Design rules
   system prompt)``. A model, effort or account change therefore never resumes
   an unrelated conversation, and an auxiliary call that shares a session id but
   not the system prompt stays on its own line.
+* One live user per conversation id. While a client has a turn in flight on
+  conversation X (adopted or its own), nobody else may adopt a snapshot of X
+  (agy keeps only one of two writers on one id); such a request is a full send.
+  The claim is released when the turn has been snapshotted, when the worker is
+  terminated or reaped, and at close(). A claim also dies with its owner (weak
+  reference) and after an hour, so no failure path can hold an id forever.
 * A snapshot is adopted only when the incoming messages strictly extend its
   history (``prompt._messages_match_prefix``): anything else is a full send,
   exactly as before.
@@ -55,6 +61,7 @@ import tempfile
 import threading
 import time
 import uuid
+import weakref
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Sequence
@@ -70,6 +77,9 @@ _DEFAULT_TTL_SECONDS = 6 * 3600.0
 _MAX_PER_KEY = 3
 _MAX_TOTAL = 16
 _STORE_PREFIX = "hermes_agy_sessions_"
+# Longest a claim is honoured: far beyond any single turn, so it only matters
+# when a release was skipped by a failure nobody anticipated.
+_CLAIM_MAX_SECONDS = 3600.0
 _OFF_VALUES = frozenset({"0", "false", "no", "off"})
 
 
@@ -168,6 +178,8 @@ class SessionRegistry:
     ) -> None:
         self._lock = threading.Lock()
         self._snapshots: dict[str, SessionSnapshot] = {}
+        # conversation id -> (weak ref to the owning client, monotonic claim time)
+        self._claims: dict[str, tuple[weakref.ref, float]] = {}
         self._fixed_dir = Path(store_dir) if store_dir else None
         self._dir: Path | None = None
         self._max_per_key = max(1, max_per_key)
@@ -213,6 +225,7 @@ class SessionRegistry:
     def shutdown(self) -> None:
         with self._lock:
             self._snapshots.clear()
+            self._claims.clear()
             directory, self._dir = self._dir, None
         if directory is not None and self._fixed_dir is None:
             shutil.rmtree(directory, ignore_errors=True)
@@ -261,8 +274,64 @@ class SessionRegistry:
             doomed.extend(oldest)
         return doomed
 
-    def lookup(self, key: str, messages: Sequence[dict[str, Any]]) -> SessionSnapshot | None:
-        """Longest snapshot of ``key`` whose history ``messages`` strictly extend."""
+    def _claim_holder_locked(self, conversation_id: str, now: float) -> Any:
+        """Live owner of a claim, pruning claims whose owner died or that expired."""
+        entry = self._claims.get(conversation_id)
+        if entry is None:
+            return None
+        owner = entry[0]()
+        if owner is None or now - entry[1] > _CLAIM_MAX_SECONDS:
+            del self._claims[conversation_id]
+            return None
+        return owner
+
+    def claim(self, conversation_id: str, owner: Any) -> bool:
+        """Mark ``conversation_id`` as being used by ``owner``; False if another live owner has it.
+
+        Idempotent for the same owner. An owner holds one claim at a time.
+        """
+        if not conversation_id:
+            return False
+        now = time.monotonic()
+        with self._lock:
+            holder = self._claim_holder_locked(conversation_id, now)
+            if holder is not None and holder is not owner:
+                return False
+            self._drop_owner_claims_locked(owner)
+            self._claims[conversation_id] = (weakref.ref(owner), now)
+            return True
+
+    def _drop_owner_claims_locked(self, owner: Any) -> None:
+        for cid in [c for c, (ref, _) in self._claims.items() if ref() is owner]:
+            del self._claims[cid]
+
+    def release_owner(self, owner: Any) -> None:
+        with self._lock:
+            if self._claims:
+                self._drop_owner_claims_locked(owner)
+
+    def in_use(self, conversation_id: str) -> bool:
+        with self._lock:
+            return self._claim_holder_locked(conversation_id, time.monotonic()) is not None
+
+    def drop(self, snapshot_id: str | None) -> None:
+        """Forget a snapshot (e.g. one whose conversation agy refused to resume)."""
+        if not snapshot_id:
+            return
+        with self._lock:
+            snap = self._snapshots.pop(snapshot_id, None)
+        if snap is not None:
+            self._unlink(snap.db_path)
+
+    def lookup(
+        self, key: str, messages: Sequence[dict[str, Any]], owner: Any = None
+    ) -> SessionSnapshot | None:
+        """Longest snapshot of ``key`` whose history ``messages`` strictly extend.
+
+        With ``owner``, snapshots of a conversation another client is using are
+        skipped and the chosen conversation is claimed for ``owner`` in the same
+        step, so two requests cannot both adopt it.
+        """
         now = time.monotonic()
         with self._lock:
             doomed = self._expire_locked(now)
@@ -272,10 +341,17 @@ class SessionRegistry:
                     continue
                 if best is not None and len(snap.history) <= len(best.history):
                     continue
+                if owner is not None:
+                    holder = self._claim_holder_locked(snap.conversation_id, now)
+                    if holder is not None and holder is not owner:
+                        continue
                 if _messages_match_prefix(snap.history, messages):
                     best = snap
             if best is not None:
                 best.last_used = now
+                if owner is not None:
+                    self._drop_owner_claims_locked(owner)
+                    self._claims[best.conversation_id] = (weakref.ref(owner), now)
         for snap in doomed:
             self._unlink(snap.db_path)
         return best
