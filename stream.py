@@ -51,6 +51,11 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
+try:  # plugin package import
+    from .agy_context import note_truncation
+except ImportError:  # standalone import (tests, plugin dev)
+    from agy_context import note_truncation  # type: ignore[no-redef]
+
 
 class NativeToolProtocolError(RuntimeError):
     """agy attempted a native tool instead of speaking the Hermes protocol."""
@@ -360,6 +365,7 @@ class AntigravityStream(Iterator[Any]):
         messages: list[dict[str, Any]] | None = None,
         usage_baseline: dict[str, int] | None = None,
         prompt_chars: int = 0,
+        prompt_bytes: int = 0,
         delivery_watch: Any = None,
         delivery_sample_key: str = "",
         followup_segments: list[str] | None = None,
@@ -412,6 +418,9 @@ class AntigravityStream(Iterator[Any]):
         # Size of the prompt this stream's process was fed, so the usage chunk
         # can be checked against it (delivery.py, issue #29).
         self.prompt_chars = max(int(prompt_chars or 0), 0)
+        # UTF-8 size of the same prompt: agy's per-frame cap is counted in
+        # bytes, and a truncation notice is checked against this number.
+        self.prompt_bytes = max(int(prompt_bytes or 0), 0) or self.prompt_chars
         # Captured per request, not looked up on a mutable client at completion.
         # Worker deltas and concurrent oneshots must never share samples.
         self.delivery_watch = delivery_watch
@@ -989,6 +998,7 @@ class AntigravityStream(Iterator[Any]):
             _delta_worker_usage(usage, baseline)
         self._segments_acked = part
         segment = self._pending_segments.pop(0)
+        self.prompt_bytes = len(segment.encode("utf-8", "replace"))
         logger.info(
             "Antigravity context part %d/%d acknowledged; sending part %d (%d chars)",
             part,
@@ -1414,7 +1424,13 @@ class AntigravityStream(Iterator[Any]):
                     saw_result = True
                     # Fold a response that never streamed as deltas into the
                     # buffer so the post-loop flush emits it as content.
+                    if error_msg:
+                        note_truncation(str(error_msg), self.prompt_bytes, learn=True)
                     final_resp = res.get("response", "")
+                    if final_resp:
+                        # Model output is untrusted: log truncation notices
+                        # without mutating the process-global learned cap.
+                        note_truncation(final_resp, self.prompt_bytes, learn=False)
                     if final_resp and not has_content and not has_tool_calls and not text_buffer:
                         text_buffer = final_resp
                     # POSITIVE success evidence only: status SUCCESS *and* an
