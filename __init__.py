@@ -116,6 +116,18 @@ def resolve_context_length(model: str) -> int:
     return _DEFAULT_CONTEXT_LENGTH
 
 
+def _timeout_kwarg(kwargs: dict[str, Any]) -> dict[str, float]:
+    """The hook's ``timeout`` argument, when the caller supplied a usable one.
+
+    Only ``timeout`` is forwarded: the module hooks take no other keyword and a
+    stray kwarg would raise into the hook's failure path.
+    """
+    timeout = kwargs.get("timeout")
+    if isinstance(timeout, (int, float)) and not isinstance(timeout, bool) and timeout > 0:
+        return {"timeout": float(timeout)}
+    return {}
+
+
 def _full_send_splitting_enabled(model: str) -> bool:
     try:
         from .prompt import full_send_segment_budget
@@ -263,6 +275,71 @@ class AntigravitySubscriptionDirectSDKProfile(ProviderProfile):
             from usage import get_account_usage_snapshot
 
         return get_account_usage_snapshot(force_refresh=force_refresh)
+
+    def setup_status(self, **kwargs: Any) -> dict[str, Any]:
+        """Installed / signed-in / plan / detail from the CLI itself."""
+        try:
+            try:
+                from .setup_hooks import setup_status as _setup_status
+            except ImportError:
+                from setup_hooks import setup_status as _setup_status
+            return _setup_status(**kwargs)
+        except Exception as exc:
+            logger.debug("Antigravity setup_status failed: %s", exc)
+            try:
+                try:
+                    from .process import resolve_agy_command as _resolve_agy_command
+                    from .setup_hooks import _is_executable_command
+                except ImportError:
+                    from process import resolve_agy_command as _resolve_agy_command
+                    from setup_hooks import _is_executable_command
+                available = _is_executable_command(_resolve_agy_command())
+            except Exception:
+                available = False
+            return {
+                "available": available,
+                "logged_in": False,
+                "plan": "",
+                # Exception text can carry local paths; the debug log above has it.
+                "detail": "Setup check failed. See the Hermes debug log for details.",
+                "login_command": None,
+            }
+
+    def discover_models(self, **kwargs: Any) -> list[dict[str, str]] | None:
+        """The account's live picker as ``[{id, label, note}]``, no inference."""
+        try:
+            try:
+                from .setup_hooks import discover_models as _discover_models
+            except ImportError:
+                from setup_hooks import discover_models as _discover_models
+            return _discover_models(**kwargs)
+        except Exception as exc:
+            logger.debug("Antigravity discover_models failed: %s", exc)
+            return None
+
+    def resolve_aux_model(self, *, vision: bool = False, **kwargs: Any) -> str:
+        """Cheapest live model id for auxiliary tasks, or ""."""
+        if vision:
+            return self.default_vision_model(**kwargs) or ""
+        try:
+            try:
+                from .setup_hooks import resolve_aux_model as _resolve_aux_model
+            except ImportError:
+                from setup_hooks import resolve_aux_model as _resolve_aux_model
+            return _resolve_aux_model(**_timeout_kwarg(kwargs))
+        except Exception:
+            return ""
+
+    def default_vision_model(self, **kwargs: Any) -> str | None:
+        """A model on this provider that accepts images natively."""
+        try:
+            try:
+                from .setup_hooks import default_vision_model as _default_vision_model
+            except ImportError:
+                from setup_hooks import default_vision_model as _default_vision_model
+            return _default_vision_model(**_timeout_kwarg(kwargs))
+        except Exception:
+            return None
 
 
 def _classify_antigravity_error(
