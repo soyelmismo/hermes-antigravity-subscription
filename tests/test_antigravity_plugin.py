@@ -2560,6 +2560,27 @@ class AntigravityPluginTests(unittest.TestCase):
             self.assertIsNotNone(err_cap)
             self.assertIn("daily or billing cap reached", err_cap)
 
+            # Verify bare retryable 429 does not abort (agy retries it itself)
+            log_file.write_text(
+                "I0921 21:19:51.264799 299 run.go:395] Run: attempt 1 failed "
+                "(RESOURCE_EXHAUSTED (code 429): transient rate limit), retrying in 4s\n",
+                encoding="utf-8",
+            )
+            self.assertIsNone(_check_early_quota_error(tmp_path))
+
+            # Verify non-retryable spend cap and weekly limit still abort
+            log_file.write_text(
+                "E1008 06:00:00.000000 100 run.go:100] RESOURCE_EXHAUSTED: weekly limit reached\n",
+                encoding="utf-8",
+            )
+            self.assertIsNotNone(_check_early_quota_error(tmp_path))
+
+            log_file.write_text(
+                "E1008 06:00:00.000000 100 run.go:100] Request halted: spend cap exceeded\n",
+                encoding="utf-8",
+            )
+            self.assertIsNotNone(_check_early_quota_error(tmp_path))
+
             # Check min_mtime filter: future timestamp ignores old log
             err_future = _check_early_quota_error(tmp_path, min_mtime=time.time() + 100)
             self.assertIsNone(err_future)

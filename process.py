@@ -1062,8 +1062,9 @@ def _check_early_quota_error(
 ) -> str | None:
     """Check isolated agy logs for early RESOURCE_EXHAUSTED / 429 quota exhaustion.
 
-    agy internally retries 429s up to 8 times with exponential backoff (~140s)
-    without emitting anything to stdout. Detecting this early allows fast failover.
+    agy retries 429s internally without emitting anything to stdout: 8 attempts
+    with exponential backoff (~140s) before 1.5.10, up to ~4 minutes since.
+    Detecting this early allows fast failover.
 
     ``min_mtime`` is wall-clock epoch seconds (``time.time()``), the same clock
     as ``st_mtime``. Callers must not pass ``time.monotonic()``: it is not an
@@ -1102,12 +1103,20 @@ def _check_early_quota_error(
                 "ai credits balance is too low" in lower_line
                 or "credits balance is too low" in lower_line
                 or "daily or billing cap" in lower_line
+                or "spend cap exceeded" in lower_line
+                or "spend cap reached" in lower_line
+                or "prepaid balance" in lower_line
             ):
                 return line.strip()
+            # agy retries transient 429s itself (up to ~4 minutes since 1.5.10),
+            # so a bare RESOURCE_EXHAUSTED/code 429 is not evidence the turn is
+            # dead. Only a non-retryable quota or billing verdict ends the turn.
             if "RESOURCE_EXHAUSTED" in line and (
-                "Individual quota reached" in line
+                "individual quota reached" in lower_line
                 or "quota exceeded" in lower_line
-                or "code 429" in line
+                or "spend cap" in lower_line
+                or "prepaid" in lower_line
+                or "weekly limit" in lower_line
             ):
                 start = line.find("RESOURCE_EXHAUSTED")
                 if start != -1:

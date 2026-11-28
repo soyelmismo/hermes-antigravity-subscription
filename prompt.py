@@ -955,8 +955,18 @@ def _render_message_content(content: Any, media_sink: Optional[set] = None) -> s
     return _normalize_media_notes(_clean_rendered_text(str(content)), media_sink)
 
 
-def _latest_user_request_section(user_text: str) -> str:
-    """Format the canonical LATEST USER REQUEST section and anti-loop instruction."""
+def _latest_user_request_section(user_text: str, *, restate: bool = False) -> str:
+    """Format the canonical LATEST USER REQUEST section and anti-loop instruction.
+
+    When *restate* is True (the full message already lives in the transcript or
+    an earlier turn), reduce compaction-summary boilerplate to the live ask.
+    Primary user message delivery passes ``restate=False`` so no user message
+    is ever silently stripped or dropped.
+    """
+    if restate:
+        user_text = _request_for_restatement(user_text)
+    if not user_text:
+        return ""
     return (
         f"### LATEST USER REQUEST TO ANSWER:\nUser:\n{user_text}\n\n"
         "INSTRUCTION: Respond directly and specifically to the LATEST USER REQUEST above. "
@@ -979,23 +989,103 @@ def _is_recovery_nudge(message: dict[str, Any]) -> bool:
     )
 
 
+# Hermes compaction folds the live request into one user message that starts
+# with this prefix. Restating that message on every agy delta re-sends the
+# whole summary instead of the user's live ask.
+_COMPACTION_SUMMARY_PREFIX = "[CONTEXT COMPACTION"
+_SUMMARY_END_MARKER = "--- END OF CONTEXT SUMMARY"
+_INFLIGHT_REPLAY_PREFIX = "[STILL IN PROGRESS"
+_USER_MESSAGES_HEADING = "## User Messages (verbatim, newest first)"
+_RESTATED_REQUEST_CAP = 2_000
+
+
+def _is_compaction_summary_text(text: str) -> bool:
+    """True only for a message that carries the compaction summary layout.
+
+    The prefix alone is not enough: a user can legitimately send a message that
+    starts with ``[PRIOR CONTEXT`` (see the primary-delivery test). Requiring a
+    marker keeps such a message from being reduced to an empty restatement on
+    tool-result turns.
+    """
+    head = text.lstrip()
+    if not (head.startswith(_COMPACTION_SUMMARY_PREFIX) or head.startswith("[PRIOR CONTEXT")):
+        return False
+    return _SUMMARY_END_MARKER in text or _USER_MESSAGES_HEADING in text
+
+
+def _cap_restated_request(text: str) -> str:
+    text = text.strip()
+    if len(text) <= _RESTATED_REQUEST_CAP:
+        return text
+    return text[:_RESTATED_REQUEST_CAP].rstrip() + "…"
+
+
+def _extract_request_from_summary(text: str) -> str:
+    """Extract the live ask inside a compaction summary, never the summary body."""
+    if _SUMMARY_END_MARKER in text:
+        after = text.split(_SUMMARY_END_MARKER, 1)[1]
+        newline = after.find("\n")
+        after = after[newline + 1:] if newline >= 0 else ""
+        after = after.strip()
+        if after.startswith(_INFLIGHT_REPLAY_PREFIX):
+            close = after.find("]")
+            after = after[close + 1:].strip() if close >= 0 else ""
+        if after:
+            return _cap_restated_request(after)
+    heading = text.find(_USER_MESSAGES_HEADING)
+    if heading >= 0:
+        section = text[heading + len(_USER_MESSAGES_HEADING):]
+        nxt = section.find("\n## ")
+        if nxt >= 0:
+            section = section[:nxt]
+        quoted_lines: list[str] = []
+        for line in section.splitlines():
+            quoted = line.strip()
+            if quoted.startswith("> "):
+                quoted_lines.append(quoted[2:])
+            elif quoted:
+                # Blank lines inside the quote block separate paragraphs of the
+                # same ask; anything else ends it.
+                if quoted_lines:
+                    break
+        if quoted_lines:
+            return _cap_restated_request("\n".join(quoted_lines))
+    return ""
+
+
+def _request_for_restatement(text: str) -> str:
+    """Text safe to repeat on a later agy turn. Compaction summaries are not."""
+    if not text:
+        return ""
+    if _is_compaction_summary_text(text):
+        extracted = _extract_request_from_summary(text)
+        # A summary whose layout we cannot parse still carries the user's words.
+        # Keep a bounded version rather than restating nothing.
+        return extracted or _cap_restated_request(text)
+    return text
+
+
 def _latest_user_text(messages: Sequence[Any]) -> str:
-    """Return the rendered text of the last user message, or an empty string."""
+    """Return the rendered text of the last user message, or an empty string.
+
+    A compaction summary is reduced to the live ask it carries so a tool-result
+    delta never restates the summary boilerplate.
+    """
     for msg in reversed(list(messages or [])):
         if isinstance(msg, dict) and str(msg.get("role") or "").strip().lower() == "user":
             if not _is_recovery_nudge(msg):
-                return _render_message_content(msg.get("content"))
+                return _request_for_restatement(_render_message_content(msg.get("content")))
     return ""
 
 
 def _pending_user_request_section(user_text: str) -> str:
     """Restate the user request that the current tool loop is serving.
 
-    Tool-result turns otherwise end with a generic "continue" line, so after a
-    few tool calls the request falls far behind the newest text the model sees
-    and the model drifts back to the dominant pattern in the transcript (for
-    example re-sending an earlier completion report).
+    A compaction summary passed here is reduced to its live ask.
     """
+    user_text = _request_for_restatement(user_text)
+    if not user_text:
+        return ""
     return (
         f"### USER REQUEST THIS TOOL LOOP IS SERVING:\nUser:\n{user_text}\n\n"
         "INSTRUCTION: Use the tool results only to answer THIS request. "
@@ -1124,7 +1214,22 @@ def _assemble_full_prompt_parts(
 
     transcript: list[str] = []
     recovery_turn = last_role == "user" and last_msg is not None and _is_recovery_nudge(last_msg)
-    prior_messages = history_messages[:-1] if last_role == "user" and not recovery_turn and len(history_messages) > 1 else history_messages
+    last_user_raw = (
+        _render_message_content(last_msg.get("content"), media_sink)
+        if last_role == "user" and last_msg is not None and not recovery_turn
+        else ""
+    )
+    last_user_is_summary = bool(last_user_raw) and _is_compaction_summary_text(last_user_raw)
+    # Keep a compaction summary in the transcript as reference context so
+    # ACTIVE OBJECTIVE and LATEST USER REQUEST can restate only its live ask
+    # without losing the summary body (or dropping a marker-less message).
+    exclude_last_from_transcript = (
+        last_role == "user"
+        and not recovery_turn
+        and len(history_messages) > 1
+        and not last_user_is_summary
+    )
+    prior_messages = history_messages[:-1] if exclude_last_from_transcript else history_messages
 
     tool_indices = [
         i for i, msg in enumerate(prior_messages)
@@ -1203,14 +1308,15 @@ def _assemble_full_prompt_parts(
         if objective:
             objective_sections.append(_tool_loop_objective_section(objective))
     elif last_role == "user" and last_msg is not None and len(history_messages) > 1:
-        user_text = _render_message_content(last_msg.get("content"), media_sink)
-        objective_sections.append(
-            "### ACTIVE OBJECTIVE:\n"
-            f"The user has submitted a new request:\n\"{user_text}\"\n\n"
-            "CRITICAL: The conversation transcript below is historical background. "
-            "Do NOT silently continue prior tool execution loops or earlier coding tasks unless explicitly requested by the ACTIVE OBJECTIVE. "
-            "Focus your attention on answering the new request."
-        )
+        user_text = _request_for_restatement(last_user_raw) if last_user_is_summary else last_user_raw
+        if user_text:
+            objective_sections.append(
+                "### ACTIVE OBJECTIVE:\n"
+                f"The user has submitted a new request:\n\"{user_text}\"\n\n"
+                "CRITICAL: The conversation transcript below is historical background. "
+                "Do NOT silently continue prior tool execution loops or earlier coding tasks unless explicitly requested by the ACTIVE OBJECTIVE. "
+                "Focus your attention on answering the new request."
+            )
     elif last_role == "tool":
         pending_objective = _latest_user_text(history_messages)
         if pending_objective:
@@ -1228,9 +1334,13 @@ def _assemble_full_prompt_parts(
         if pending:
             tail_sections.append(_pending_user_request_section(pending))
     elif last_role == "user" and last_msg is not None:
-        user_text = _latest_user_text(history_messages)
-        if user_text:
-            tail_sections.append(_latest_user_request_section(user_text))
+        if recovery_turn or last_user_is_summary:
+            user_text = _latest_user_text(history_messages)
+            section = _latest_user_request_section(user_text, restate=True)
+        else:
+            section = _latest_user_request_section(last_user_raw, restate=False)
+        if section:
+            tail_sections.append(section)
     else:
         tail_sections.append("Continue the conversation from the latest message.")
     return _FullPromptParts(
@@ -1536,9 +1646,14 @@ def _format_delta_prompt(
         if pending_user_text:
             parts.append(_pending_user_request_section(pending_user_text))
     elif last_role == "user":
-        user_text = (pending_user_text or _latest_user_text(valid_messages)) if recovery_turn else _render_message_content(last_msg.get("content"), media_sink)
-        if user_text:
-            parts.append(_latest_user_request_section(user_text))
+        if recovery_turn:
+            user_text = pending_user_text or _latest_user_text(valid_messages)
+            section = _latest_user_request_section(user_text, restate=True)
+        else:
+            user_text = _render_message_content(last_msg.get("content"), media_sink)
+            section = _latest_user_request_section(user_text, restate=False)
+        if section:
+            parts.append(section)
     else:
         parts.append("Continue the conversation from the latest message above.")
     return "\n\n".join(s.strip() for s in _apply_media_viewing_protocol(parts) if s and s.strip())
