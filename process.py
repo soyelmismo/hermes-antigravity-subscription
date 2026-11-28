@@ -1102,12 +1102,20 @@ def _check_early_quota_error(
                 "ai credits balance is too low" in lower_line
                 or "credits balance is too low" in lower_line
                 or "daily or billing cap" in lower_line
+                or "spend cap exceeded" in lower_line
+                or "spend cap reached" in lower_line
+                or "prepaid balance" in lower_line
             ):
                 return line.strip()
+            # agy retries transient 429s itself (up to ~4 minutes since 1.5.10),
+            # so a bare RESOURCE_EXHAUSTED/code 429 is not evidence the turn is
+            # dead. Only a non-retryable quota or billing verdict ends the turn.
             if "RESOURCE_EXHAUSTED" in line and (
-                "Individual quota reached" in line
+                "individual quota reached" in lower_line
                 or "quota exceeded" in lower_line
-                or "code 429" in line
+                or "spend cap" in lower_line
+                or "prepaid" in lower_line
+                or "weekly limit" in lower_line
             ):
                 start = line.find("RESOURCE_EXHAUSTED")
                 if start != -1:
