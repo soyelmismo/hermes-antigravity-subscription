@@ -35,6 +35,21 @@ except ImportError:  # standalone use (tests, plugin dev)
 
 logger = logging.getLogger(__name__)
 
+try:  # plugin package import
+    from .agy_context import (
+        hard_trim,
+        omitted_notice,
+        prompt_byte_budget,
+        prompt_bytes,
+    )
+except ImportError:  # standalone import (tests, plugin dev)
+    from agy_context import (  # type: ignore[no-redef]
+        hard_trim,
+        omitted_notice,
+        prompt_byte_budget,
+        prompt_bytes,
+    )
+
 # Media materialized for agy lives under the active Hermes home (profile-aware)
 # and is deleted when the owning client session closes. The dir is resolved at
 # USE time, not at import: one Hermes process can serve several profiles, and
@@ -1022,6 +1037,53 @@ def _tool_loop_objective_section(user_text: str) -> str:
     )
 
 
+#: Structured shrink ladder, mildest first. Level 0 matches the historical
+#: defaults, so prompts already within agy's byte cap render identically.
+_SHRINK_LEVELS: tuple[dict[str, int], ...] = (
+    {
+        "recent_tools": 8,
+        "historical_tool_chars": 300,
+        "tool_chars_cap": 20_000,
+        "text_chars_cap": 0,
+        "keep_messages": 0,
+    },
+    {
+        "recent_tools": 4,
+        "historical_tool_chars": 120,
+        "tool_chars_cap": 8_000,
+        "text_chars_cap": 6_000,
+        "keep_messages": 0,
+    },
+    {
+        "recent_tools": 2,
+        "historical_tool_chars": 60,
+        "tool_chars_cap": 2_000,
+        "text_chars_cap": 2_000,
+        "keep_messages": 80,
+    },
+    {
+        "recent_tools": 1,
+        "historical_tool_chars": 0,
+        "tool_chars_cap": 1_000,
+        "text_chars_cap": 800,
+        "keep_messages": 24,
+    },
+)
+
+
+def _cap_text(text: str, cap: int) -> str:
+    """Middle-truncate prose to *cap* characters, keeping both ends and saying so."""
+    if cap <= 0 or len(text) <= cap:
+        return text
+    head = cap // 2
+    tail = cap - head
+    return (
+        text[:head]
+        + f"\n[... {len(text)} chars truncated to fit the prompt budget ...]\n"
+        + text[-tail:]
+    )
+
+
 def _format_messages_as_prompt(
     messages: list[dict[str, Any]],
     model: str | None = None,
@@ -1029,9 +1091,34 @@ def _format_messages_as_prompt(
     tool_choice: Any = None,
     media_sink: Optional[set] = None,
 ) -> str:
-    """Assemble Hermes message history, system prompt, and tool schemas into a canonical prompt."""
-    parts = _assemble_full_prompt_parts(messages, tools=tools, tool_choice=tool_choice, media_sink=media_sink)
-    return _join_full_prompt_parts(parts)
+    """Assemble Hermes message history, system prompt, and tool schemas into a canonical prompt,
+    fitted to agy's single-frame UTF-8 byte budget when enabled."""
+    budget = prompt_byte_budget()
+    if budget is None:
+        parts = _assemble_full_prompt_parts(
+            messages, tools=tools, tool_choice=tool_choice, media_sink=media_sink
+        )
+        return _join_full_prompt_parts(parts)
+    text = ""
+    for level in _SHRINK_LEVELS:
+        parts = _assemble_full_prompt_parts(
+            messages,
+            tools=tools,
+            tool_choice=tool_choice,
+            media_sink=media_sink,
+            level=level,
+            budget_val=budget,
+        )
+        text = _join_full_prompt_parts(parts)
+        if prompt_bytes(text) <= budget:
+            return text
+    logger.warning(
+        "Prompt is still %d bytes over the %d-byte budget after every shrink step; "
+        "trimming the middle of the transcript.",
+        prompt_bytes(text) - budget,
+        budget,
+    )
+    return hard_trim(text, budget)
 
 
 class _FullPromptParts(NamedTuple):
@@ -1083,6 +1170,9 @@ def _assemble_full_prompt_parts(
     tools: list[dict[str, Any]] | None = None,
     tool_choice: Any = None,
     media_sink: Optional[set] = None,
+    *,
+    level: dict[str, int] | None = None,
+    budget_val: int | None = None,
 ) -> _FullPromptParts:
     """Build the pieces of the full-send prompt (see _format_messages_as_prompt)."""
     try:
@@ -1117,14 +1207,23 @@ def _assemble_full_prompt_parts(
     if system_parts:
         sections.append("### SYSTEM INSTRUCTIONS (HERMES AGENT):\n" + "\n\n".join(f"System:\n{p}" for p in system_parts))
 
-    _HISTORICAL_TOOL_RETENTION_COUNT = 8
-    _HISTORICAL_TOOL_MAX_CHARS = 300
+    lvl = level if level is not None else _SHRINK_LEVELS[0]
+    _HISTORICAL_TOOL_RETENTION_COUNT = lvl["recent_tools"]
+    _HISTORICAL_TOOL_MAX_CHARS = lvl["historical_tool_chars"]
     _HISTORICAL_TOOL_CALL_MAX_WEIGHT = 500
-    _TOOL_MAX_CHARS_CAP = 20000
+    _TOOL_MAX_CHARS_CAP = lvl["tool_chars_cap"]
+    _TEXT_CHARS_CAP = lvl["text_chars_cap"]
+    _KEEP_MESSAGES = lvl["keep_messages"]
 
     transcript: list[str] = []
     recovery_turn = last_role == "user" and last_msg is not None and _is_recovery_nudge(last_msg)
     prior_messages = history_messages[:-1] if last_role == "user" and not recovery_turn and len(history_messages) > 1 else history_messages
+
+    if _KEEP_MESSAGES and len(prior_messages) > _KEEP_MESSAGES:
+        omitted = len(prior_messages) - _KEEP_MESSAGES
+        prior_messages = prior_messages[-_KEEP_MESSAGES:]
+        notice_budget = budget_val if budget_val is not None else (prompt_byte_budget() or 0)
+        sections.append(omitted_notice(omitted, notice_budget))
 
     tool_indices = [
         i for i, msg in enumerate(prior_messages)
@@ -1148,16 +1247,25 @@ def _assemble_full_prompt_parts(
         if role == "tool":
             tool_id = str(message.get("tool_call_id") or message.get("name") or "tool").strip()
             if i not in recent_tool_cutoff and len(rendered_content) > _HISTORICAL_TOOL_MAX_CHARS:
-                rendered_content = (
-                    rendered_content[:200]
-                    + f"\n[... tool output truncated: {len(rendered_content)} chars ...]\n"
-                    + rendered_content[-100:]
-                )
+                if _HISTORICAL_TOOL_MAX_CHARS <= 0:
+                    rendered_content = (
+                        f"[... tool output omitted: {len(rendered_content)} chars over the prompt budget ...]"
+                    )
+                else:
+                    head = max(1, (_HISTORICAL_TOOL_MAX_CHARS * 2) // 3)
+                    tail = max(1, _HISTORICAL_TOOL_MAX_CHARS - head)
+                    marker = f"\n[... tool output truncated: {len(rendered_content)} chars ...]\n"
+                    if _HISTORICAL_TOOL_MAX_CHARS < 300 and head + tail + len(marker) >= len(rendered_content):
+                        rendered_content = rendered_content[:_HISTORICAL_TOOL_MAX_CHARS].rstrip() + "…"
+                    else:
+                        rendered_content = rendered_content[:head] + marker + rendered_content[-tail:]
             elif len(rendered_content) > _TOOL_MAX_CHARS_CAP:
+                head = max(int(_TOOL_MAX_CHARS_CAP * 0.6), 200)
+                tail = max(_TOOL_MAX_CHARS_CAP - head, 100)
                 rendered_content = (
-                    rendered_content[:12000]
+                    rendered_content[:head]
                     + f"\n[... large tool output truncated: {len(rendered_content)} chars ...]\n"
-                    + rendered_content[-3000:]
+                    + rendered_content[-tail:]
                 )
             transcript.append(f"Tool Result ({tool_id}):\n{rendered_content}")
             continue
@@ -1166,6 +1274,7 @@ def _assemble_full_prompt_parts(
             parts = []
             if "Tool Result (" in rendered_content:
                 rendered_content = rendered_content.split("Tool Result (")[0].strip()
+            rendered_content = _cap_text(rendered_content, _TEXT_CHARS_CAP)
             if rendered_content:
                 parts.append(rendered_content)
             if tool_calls := message.get("tool_calls"):
@@ -1194,6 +1303,7 @@ def _assemble_full_prompt_parts(
             continue
 
         label = _ROLE_LABELS.get(role, "Context")
+        rendered_content = _cap_text(rendered_content, _TEXT_CHARS_CAP)
         if rendered_content:
             transcript.append(f"{label}:\n{rendered_content}")
 
@@ -1302,8 +1412,8 @@ def full_send_segment_budget(model: str | None) -> int | None:
     return None
 
 
-def _split_oversized_block(block: str, budget: int) -> list[str]:
-    """Split one block heavier than *budget* at line boundaries.
+def _split_oversized_block(block: str, budget: int, byte_budget: int | None = None) -> list[str]:
+    """Split one block heavier than *budget* (or *byte_budget*) at line boundaries.
 
     A single line that is itself too heavy (a long JSON tool-call frame, a
     minified file) is split by characters as the last resort.
@@ -1311,27 +1421,39 @@ def _split_oversized_block(block: str, budget: int) -> list[str]:
     pieces: list[str] = []
     current: list[str] = []
     current_weight = 0
+    current_bytes = 0
     for line in block.split("\n"):
         line_weight = _prompt_weight(line) + 1
-        if line_weight > budget:
+        line_bytes = prompt_bytes(line) + 1 if byte_budget is not None else 0
+        if line_weight > budget or (byte_budget is not None and line_bytes > byte_budget):
             if current:
                 pieces.append("\n".join(current))
-                current, current_weight = [], 0
+                current, current_weight, current_bytes = [], 0, 0
             start = 0
             while start < len(line):
                 end = start
                 weight = 0
+                nbytes = 0
                 while end < len(line) and weight < budget:
-                    weight += 1 if ord(line[end]) < 128 else 2
+                    ch = line[end]
+                    ch_bytes = len(ch.encode("utf-8", "replace")) if byte_budget is not None else 0
+                    if byte_budget is not None and end > start and nbytes + ch_bytes > byte_budget:
+                        break
+                    weight += 1 if ord(ch) < 128 else 2
+                    nbytes += ch_bytes
                     end += 1
                 pieces.append(line[start:end])
                 start = end
             continue
-        if current and current_weight + line_weight > budget:
+        if current and (
+            current_weight + line_weight > budget
+            or (byte_budget is not None and current_bytes + line_bytes > byte_budget)
+        ):
             pieces.append("\n".join(current))
-            current, current_weight = [], 0
+            current, current_weight, current_bytes = [], 0, 0
         current.append(line)
         current_weight += line_weight
+        current_bytes += line_bytes
     if current:
         pieces.append("\n".join(current))
     total = len(pieces)
@@ -1386,12 +1508,20 @@ def _format_messages_as_segments(
     transcript entries that still fit, so the request is the last thing the
     model reads.
     """
-    parts = _assemble_full_prompt_parts(messages, tools=tools, tool_choice=tool_choice, media_sink=media_sink)
+    if budget is None:
+        return [_format_messages_as_prompt(messages, model=model, tools=tools, tool_choice=tool_choice, media_sink=media_sink)]
+    byte_cap = prompt_byte_budget()
+    parts = _assemble_full_prompt_parts(
+        messages, tools=tools, tool_choice=tool_choice, media_sink=media_sink, budget_val=byte_cap
+    )
     full = _join_full_prompt_parts(parts)
-    if budget is None or _prompt_weight(full) <= budget:
+    if _prompt_weight(full) <= budget and (byte_cap is None or prompt_bytes(full) <= byte_cap):
         return [full]
 
     content_budget = max(budget - _SEGMENT_WRAPPER_RESERVE, _MIN_SEGMENT_WEIGHT // 2)
+    content_byte_budget = (
+        max(byte_cap - _SEGMENT_WRAPPER_RESERVE, 1_024) if byte_cap is not None else None
+    )
     blocks = [s.strip() for s in parts.lead if s and s.strip()]
     if _MEDIA_REF_RE.search(full):
         # Same placement as the single-message prompt: before the transcript.
@@ -1401,17 +1531,22 @@ def _format_messages_as_segments(
     final_sections = [s.strip() for s in (*parts.objective, *parts.tail) if s and s.strip()]
     final_block = "\n\n".join(final_sections)
 
-    # Pieces never exceed content_budget; a heavy final block is split too, and
-    # only its last piece stays in the final part.
+    def _exceeds_limits(text: str) -> bool:
+        if _prompt_weight(text) > content_budget:
+            return True
+        return content_byte_budget is not None and prompt_bytes(text) > content_byte_budget
+
+    # Pieces never exceed content_budget (or content_byte_budget); a heavy
+    # final block is split too, and only its last piece stays in the final part.
     pieces: list[str] = []
     for block in blocks:
-        if _prompt_weight(block) > content_budget:
-            pieces.extend(_split_oversized_block(block, content_budget))
+        if _exceeds_limits(block):
+            pieces.extend(_split_oversized_block(block, content_budget, byte_budget=content_byte_budget))
         else:
             pieces.append(block)
     final_pieces = (
-        _split_oversized_block(final_block, content_budget)
-        if _prompt_weight(final_block) > content_budget
+        _split_oversized_block(final_block, content_budget, byte_budget=content_byte_budget)
+        if _exceeds_limits(final_block)
         else [final_block]
     )
     pieces.extend(final_pieces[:-1])
@@ -1419,29 +1554,52 @@ def _format_messages_as_segments(
 
     # The final part takes the newest pieces that still fit next to the request.
     final_weight = _prompt_weight(final_body)
+    final_bytes = prompt_bytes(final_body) if content_byte_budget is not None else 0
     tail_pieces: list[str] = []
-    while pieces and final_weight + _prompt_weight(pieces[-1]) + 2 <= content_budget:
-        final_weight += _prompt_weight(pieces[-1]) + 2
+    while pieces:
+        cand = pieces[-1]
+        cand_weight = _prompt_weight(cand) + 2
+        cand_bytes = prompt_bytes(cand) + 2 if content_byte_budget is not None else 0
+        if final_weight + cand_weight > content_budget:
+            break
+        if content_byte_budget is not None and final_bytes + cand_bytes > content_byte_budget:
+            break
+        final_weight += cand_weight
+        final_bytes += cand_bytes
         tail_pieces.insert(0, pieces.pop())
 
     chunks: list[list[str]] = []
     current: list[str] = []
     current_weight = 0
+    current_bytes = 0
     for piece in pieces:
         weight = _prompt_weight(piece) + 2
-        if current and current_weight + weight > content_budget:
+        nbytes = prompt_bytes(piece) + 2 if content_byte_budget is not None else 0
+        if current and (
+            current_weight + weight > content_budget
+            or (content_byte_budget is not None and current_bytes + nbytes > content_byte_budget)
+        ):
             chunks.append(current)
-            current, current_weight = [], 0
+            current, current_weight, current_bytes = [], 0, 0
         current.append(piece)
         current_weight += weight
+        current_bytes += nbytes
     if current:
         chunks.append(current)
     if not chunks:
+        if byte_cap is not None and prompt_bytes(full) > byte_cap:
+            return [
+                _format_messages_as_prompt(
+                    messages, model=model, tools=tools, tool_choice=tool_choice, media_sink=media_sink
+                )
+            ]
         return [full]
 
     total = len(chunks) + 1
     segments = [_priming_segment(i, total, "\n\n".join(chunk)) for i, chunk in enumerate(chunks, start=1)]
     segments.append(_final_segment(total, "\n\n".join([*tail_pieces, final_body])))
+    if byte_cap is not None:
+        segments = [hard_trim(seg, byte_cap) if prompt_bytes(seg) > byte_cap else seg for seg in segments]
     return segments
 
 
@@ -1472,7 +1630,46 @@ def _format_delta_prompt(
     ``pending_user_text`` is the latest user request from the full history.
     A tool-result delta does not contain it, so the caller passes it in and it
     is restated after the continue instruction.
+
+    Deltas are small by construction, but a single tool result or large user
+    paste can still blow past agy's single-frame byte cap, so the same byte
+    budget applies when enabled.
     """
+    budget = prompt_byte_budget()
+    if budget is None:
+        return _render_delta_prompt(
+            new_messages,
+            pending_user_text=pending_user_text,
+            media_sink=media_sink,
+        )
+    text = ""
+    for tool_cap, text_cap in ((20_000, 0), (4_000, 6_000), (1_000, 1_000)):
+        text = _render_delta_prompt(
+            new_messages,
+            pending_user_text=pending_user_text,
+            media_sink=media_sink,
+            tool_chars_cap=tool_cap,
+            text_chars_cap=text_cap,
+        )
+        if prompt_bytes(text) <= budget:
+            return text
+    logger.warning(
+        "Delta prompt is still %d bytes over the %d-byte budget; trimming it.",
+        prompt_bytes(text) - budget,
+        budget,
+    )
+    return hard_trim(text, budget)
+
+
+def _render_delta_prompt(
+    new_messages: Sequence[dict[str, Any]],
+    pending_user_text: str = "",
+    media_sink: Optional[set] = None,
+    *,
+    tool_chars_cap: int = 20_000,
+    text_chars_cap: int = 0,
+) -> str:
+    """Render the delta prompt with the given per-block caps."""
     valid_messages = [m for m in new_messages if isinstance(m, dict)]
     if not valid_messages:
         return ""
@@ -1492,11 +1689,13 @@ def _format_delta_prompt(
         rendered_content = _render_message_content(msg.get("content"), media_sink)
         if role == "tool":
             tool_id = str(msg.get("tool_call_id") or msg.get("name") or "tool").strip()
-            if len(rendered_content) > 20000:
+            if len(rendered_content) > tool_chars_cap:
+                head = max(int(tool_chars_cap * 0.6), 200)
+                tail = max(tool_chars_cap - head, 100)
                 rendered_content = (
-                    rendered_content[:12000]
+                    rendered_content[:head]
                     + f"\n[... large tool output truncated: {len(rendered_content)} chars ...]\n"
-                    + rendered_content[-3000:]
+                    + rendered_content[-tail:]
                 )
             parts.append(f"Tool Result ({tool_id}):\n{rendered_content}")
             continue
@@ -1504,6 +1703,7 @@ def _format_delta_prompt(
             subparts = []
             if "Tool Result (" in rendered_content:
                 rendered_content = rendered_content.split("Tool Result (")[0].strip()
+            rendered_content = _cap_text(rendered_content, text_chars_cap)
             if rendered_content:
                 subparts.append(rendered_content)
             if tool_calls := msg.get("tool_calls"):
@@ -1523,6 +1723,7 @@ def _format_delta_prompt(
                 parts.append("Assistant:\n" + "\n".join(subparts))
             continue
         label = _ROLE_LABELS.get(role, "Context")
+        rendered_content = _cap_text(rendered_content, text_chars_cap)
         if rendered_content:
             parts.append(f"{label}:\n{rendered_content}")
 

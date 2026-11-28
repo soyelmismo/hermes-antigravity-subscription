@@ -1242,6 +1242,7 @@ class AntigravityClient:
             tools=tools,
             is_worker=False,
             prompt_chars=len(prompt_text),
+            prompt_bytes=len(prompt_text.encode("utf-8", "replace")),
             # The turn's messages feed the native media-attach allowlist
             # (read_file/view_file on referenced media paths only).
             messages=messages,
@@ -1401,6 +1402,7 @@ class AntigravityClient:
                     messages=messages_list,
                     usage_baseline=worker_usage_baseline,
                     prompt_chars=len(prompt_payload),
+                    prompt_bytes=len(prompt_payload.encode("utf-8", "replace")),
                     delivery_watch=self._delivery_watch if comparable_full_send else None,
                     delivery_sample_key=f"{resolved_model}:{effort}",
                     followup_segments=followup_segments,
@@ -1462,6 +1464,7 @@ class AntigravityClient:
                         messages=messages_list,
                         usage_baseline=worker_usage_baseline,
                         prompt_chars=len(prompt_payload),
+                        prompt_bytes=len(prompt_payload.encode("utf-8", "replace")),
                         delivery_watch=self._delivery_watch if comparable_full_send else None,
                         delivery_sample_key=f"{resolved_model}:{effort}",
                         followup_segments=followup_segments,
