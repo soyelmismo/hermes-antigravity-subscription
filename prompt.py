@@ -1000,8 +1000,17 @@ _RESTATED_REQUEST_CAP = 2_000
 
 
 def _is_compaction_summary_text(text: str) -> bool:
+    """True only for a message that carries the compaction summary layout.
+
+    The prefix alone is not enough: a user can legitimately send a message that
+    starts with ``[PRIOR CONTEXT`` (see the primary-delivery test). Requiring a
+    marker keeps such a message from being reduced to an empty restatement on
+    tool-result turns.
+    """
     head = text.lstrip()
-    return head.startswith(_COMPACTION_SUMMARY_PREFIX) or head.startswith("[PRIOR CONTEXT")
+    if not (head.startswith(_COMPACTION_SUMMARY_PREFIX) or head.startswith("[PRIOR CONTEXT")):
+        return False
+    return _SUMMARY_END_MARKER in text or _USER_MESSAGES_HEADING in text
 
 
 def _cap_restated_request(text: str) -> str:
@@ -1034,8 +1043,11 @@ def _extract_request_from_summary(text: str) -> str:
             quoted = line.strip()
             if quoted.startswith("> "):
                 quoted_lines.append(quoted[2:])
-            elif quoted_lines:
-                break
+            elif quoted:
+                # Blank lines inside the quote block separate paragraphs of the
+                # same ask; anything else ends it.
+                if quoted_lines:
+                    break
         if quoted_lines:
             return _cap_restated_request("\n".join(quoted_lines))
     return ""
@@ -1046,7 +1058,10 @@ def _request_for_restatement(text: str) -> str:
     if not text:
         return ""
     if _is_compaction_summary_text(text):
-        return _extract_request_from_summary(text)
+        extracted = _extract_request_from_summary(text)
+        # A summary whose layout we cannot parse still carries the user's words.
+        # Keep a bounded version rather than restating nothing.
+        return extracted or _cap_restated_request(text)
     return text
 
 

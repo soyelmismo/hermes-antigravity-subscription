@@ -1062,8 +1062,9 @@ def _check_early_quota_error(
 ) -> str | None:
     """Check isolated agy logs for early RESOURCE_EXHAUSTED / 429 quota exhaustion.
 
-    agy internally retries 429s up to 8 times with exponential backoff (~140s)
-    without emitting anything to stdout. Detecting this early allows fast failover.
+    agy retries 429s internally without emitting anything to stdout: 8 attempts
+    with exponential backoff (~140s) before 1.5.10, up to ~4 minutes since.
+    Detecting this early allows fast failover.
 
     ``min_mtime`` is wall-clock epoch seconds (``time.time()``), the same clock
     as ``st_mtime``. Callers must not pass ``time.monotonic()``: it is not an

@@ -141,6 +141,44 @@ class TestToolLoopKeepsUserRequest(unittest.TestCase):
         )
         self.assertEqual(_latest_user_text([{"role": "user", "content": multiline_summary}]), "Line one\nLine two")
 
+    def test_prior_context_message_without_markers_keeps_its_text_in_tool_turns(self):
+        # A user message that merely starts with the prefix is not a compaction
+        # summary: tool-result and full prompts must not restate nothing.
+        raw = "[PRIOR CONTEXT] Please check why my note had this prefix."
+        history = [
+            {"role": "user", "content": raw},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [{"id": "c1", "function": {"name": "terminal", "arguments": "{}"}}],
+            },
+            {"role": "tool", "tool_call_id": "c1", "content": "supply.db 108K"},
+        ]
+        self.assertEqual(_latest_user_text(history), raw)
+
+        delta = _format_delta_prompt(history[-2:], pending_user_text=_latest_user_text(history))
+        self.assertIn(raw, delta)
+
+        full = _format_messages_as_prompt(history)
+        head = full[: full.index("Conversation transcript:")]
+        self.assertIn("### ACTIVE OBJECTIVE:", head)
+        self.assertIn(raw, head)
+
+    def test_summary_extraction_spans_blank_lines_between_quoted_lines(self):
+        summary = (
+            "[CONTEXT COMPACTION]\n## User Messages (verbatim, newest first)\n"
+            "> Fix the plugin\n\n> and rerun the tests\n\n## Next Section\n"
+        )
+        self.assertEqual(
+            _latest_user_text([{"role": "user", "content": summary}]),
+            "Fix the plugin\nand rerun the tests",
+        )
+
+    def test_unparseable_summary_falls_back_to_bounded_text(self):
+        # A summary with markers but no extractable ask must not restate nothing.
+        summary = "[CONTEXT COMPACTION] keep this ask\n--- END OF CONTEXT SUMMARY ---\n"
+        self.assertIn("keep this ask", _latest_user_text([{"role": "user", "content": summary}]))
+
 
 if __name__ == "__main__":
     unittest.main()
