@@ -1041,6 +1041,17 @@ class AntigravityStream(Iterator[Any]):
         usage_data: dict[str, Any] = {}
         has_tool_calls = False
         used_tool_call_ids: set[str] = set()
+        for msg in self.messages or []:
+            if not isinstance(msg, dict):
+                continue
+            for tc in msg.get("tool_calls") or []:
+                if isinstance(tc, dict):
+                    tc_id = tc.get("id")
+                    if isinstance(tc_id, str) and tc_id.strip():
+                        used_tool_call_ids.add(tc_id.strip())
+            prior_id = msg.get("tool_call_id")
+            if isinstance(prior_id, str) and prior_id.strip():
+                used_tool_call_ids.add(prior_id.strip())
         next_tool_call_index = 0
 
         def identify_calls(calls: list[Any]) -> Iterator[Any]:
@@ -1381,6 +1392,24 @@ class AntigravityStream(Iterator[Any]):
                         # arrive only in result.response).
                         if not text_buffer and not has_content and not has_tool_calls:
                             text_buffer = res.get("response", "") or ""
+                        if text_buffer and in_tool_call and _TOOL_CALL_CLOSE in text_buffer:
+                            # Odd unescaped quotes inside a tool call can mask </tool_call>
+                            # from strict string-aware scanning; recover at turn end.
+                            parsed_calls, extra_text = _parse_tool_block(
+                                text_buffer,
+                                state=md_state,
+                                tool_schemas=self._tool_schemas,
+                                allow_raw_close=True,
+                            )
+                            if parsed_calls:
+                                in_tool_call = False
+                                tool_close_scan_from = 0
+                                accepted_calls = self._accept_calls(parsed_calls)
+                                if accepted_calls:
+                                    has_tool_calls = True
+                                    for call_delta in identify_calls(accepted_calls):
+                                        yield self._make_chunk(tool_calls=[call_delta])
+                                text_buffer = extra_text
                         if text_buffer and not in_tool_call and _has_closed_tool_call_frame(text_buffer, md_state):
                             parsed_calls, extra_text = _parse_tool_block(
                                 text_buffer, state=md_state, tool_schemas=self._tool_schemas
@@ -1471,6 +1500,30 @@ class AntigravityStream(Iterator[Any]):
             # even after a complete call so a truncated second block is not
             # silently dropped. Native-tool neutralization is a deliberate
             # abort, not truncation, and never re-flushes buffered text.
+            if (
+                self.has_tools
+                and not neutralized_tool_step
+                and in_tool_call
+                and _TOOL_CALL_CLOSE in text_buffer
+            ):
+                # End-of-stream recovery when an odd unescaped quote inside a
+                # JSON string hid the closing </tool_call> tag from the strict
+                # incremental scanner.
+                parsed_calls, extra_text = _parse_tool_block(
+                    text_buffer,
+                    state=md_state,
+                    tool_schemas=self._tool_schemas,
+                    allow_raw_close=True,
+                )
+                if parsed_calls:
+                    in_tool_call = False
+                    accepted_calls = self._accept_calls(parsed_calls)
+                    if accepted_calls:
+                        has_tool_calls = True
+                        for call_delta in identify_calls(accepted_calls):
+                            yield self._make_chunk(tool_calls=[call_delta])
+                    text_buffer = extra_text
+
             if (
                 self.has_tools
                 and not neutralized_tool_step

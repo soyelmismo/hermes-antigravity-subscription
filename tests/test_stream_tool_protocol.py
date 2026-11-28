@@ -480,10 +480,9 @@ def test_native_tool_step_neutralization_does_not_flush_partial_block(partial):
 # A closed but unparseable frame is invalid protocol, never assistant text
 # ---------------------------------------------------------------------------
 
-# One representative per rejected shape: broken JSON, absent function, blank
-# function name, non-object function, non-object top level, empty body.
+# One representative per non-protocol / non-tool shape that falls back to plain text:
+# absent function, blank function name, non-object function, non-object top level, empty body.
 UNPARSEABLE_FRAME_BODIES = [
-    '{"id":"x","function":{"name":"write_file","arguments":"{"}',
     '{"id":"x"}',
     '{"function":{"name":"   ","arguments":"{}"}}',
     '{"function":[]}',
@@ -660,3 +659,204 @@ def test_prose_ending_with_lone_angle_bracket_after_a_complete_call_succeeds():
 
     assert [call.id for call in calls] == ["same"]
     assert finishes == ["tool_calls"]
+
+
+def test_prompt_and_history_use_plain_json_object_arguments():
+    from prompt import _PROMPT_PREAMBLE, _format_delta_prompt, _format_messages_as_prompt
+
+    preamble = "\n".join(_PROMPT_PREAMBLE)
+    assert "'arguments': {...}" in preamble
+    assert "JSON object" in preamble
+
+    messages = [
+        {"role": "user", "content": "check logs"},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "c1",
+                    "type": "function",
+                    "function": {
+                        "name": "terminal",
+                        "arguments": r'{"command": "echo \"hi\""}',
+                    },
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "c1", "content": "hi"},
+    ]
+    full_prompt = _format_messages_as_prompt(messages)
+    delta_prompt = _format_delta_prompt(messages[1:], pending_user_text="check logs")
+    expected_obj = r'"arguments": {"command": "echo \"hi\""}'
+    assert expected_obj in full_prompt
+    assert expected_obj in delta_prompt
+    assert "JSON object for 'arguments'" in delta_prompt
+
+
+def test_parse_tool_block_accepts_object_arguments_and_repairs_invalid_escapes():
+    body = (
+        r'{"id": "c1", "type": "function", "function": {'
+        r'"name": "search_files", '
+        r'"arguments": {"pattern": "foo\s+bar\.py|\'baz\'\n\u0041"}}}'
+    )
+    calls, cleaned = _parse_tool_block(f"<tool_call>{body}</tool_call>")
+    assert len(calls) == 1
+    assert calls[0].function.name == "search_files"
+    assert json.loads(calls[0].function.arguments) == {
+        "pattern": "foo\\s+bar\\.py|'baz'\nA"
+    }
+    assert cleaned == ""
+
+
+def test_parse_tool_block_repairs_string_encoded_arguments_with_invalid_escapes():
+    body = (
+        r'{"id": "c1", "type": "function", "function": {'
+        r'"name": "search_files", '
+        r'"arguments": "{\"pattern\": \"foo\s+bar\"}"}}'
+    )
+    calls, cleaned = _parse_tool_block(f"<tool_call>{body}</tool_call>")
+    assert len(calls) == 1
+    assert json.loads(calls[0].function.arguments) == {"pattern": r"foo\s+bar"}
+    assert cleaned == ""
+
+
+def test_parse_tool_block_bare_json_fallback_handles_object_arguments():
+    bare = r'{"id":"c1","type":"function","function":{"name":"search_files","arguments":{"pattern":"foo\s+bar","nested":{"brace":"}"}}}}'
+    calls, cleaned = _parse_tool_block(f"lead {bare} trail")
+    assert len(calls) == 1
+    assert calls[0].function.name == "search_files"
+    assert json.loads(calls[0].function.arguments) == {
+        "pattern": r"foo\s+bar",
+        "nested": {"brace": "}"},
+    }
+    assert cleaned == "lead\ntrail"
+
+
+def test_adjacent_unclosed_parallel_tool_calls_recover_all_calls():
+    raw = (
+        '<tool_call>{"id":"c1","type":"function","function":{"name":"write_file",'
+        '"arguments":{"path":"/tmp/a.txt","content":"first"}}}\n'
+        '<tool_call>{"id":"c2","type":"function","function":{"name":"write_file",'
+        '"arguments":{"path":"/tmp/b.txt","content":"second"}}}</tool_call>'
+    )
+    stream, _proc_mock, _client = _stream(_events(raw[:45], raw[45:]))
+    calls, contents, finishes = _consumed(list(stream))
+    assert [(c.id, c.function.name, json.loads(c.function.arguments)) for c in calls] == [
+        ("c1", "write_file", {"path": "/tmp/a.txt", "content": "first"}),
+        ("c2", "write_file", {"path": "/tmp/b.txt", "content": "second"}),
+    ]
+    assert contents == []
+    assert finishes == ["tool_calls"]
+
+
+def test_dense_html_unescaped_quotes_and_odd_quote_close_recover_cleanly():
+    # Even quotes: dense HTML attributes inside plain-object arguments.
+    html = "".join(f'<td id="c{i}" class="cell" alt="">v{i}</td>' for i in range(60))
+    even_raw = (
+        '<tool_call>{"id":"html_1","type":"function","function":{"name":"write_file",'
+        '"arguments":{"path":"/tmp/page.html","content":"' + html + '"}}}</tool_call>'
+    )
+    stream, _proc_mock, _client = _stream(_events(even_raw))
+    calls, contents, finishes = _consumed(list(stream))
+    assert len(calls) == 1
+    assert json.loads(calls[0].function.arguments) == {"path": "/tmp/page.html", "content": html}
+    assert contents == []
+    assert finishes == ["tool_calls"]
+
+    # Odd unescaped quote: strict _find_tool_call_close sees parity inversion,
+    # end-of-turn recovery still closes and repairs the call.
+    odd_raw = (
+        '<tool_call>{"id":"html_2","type":"function","function":{"name":"write_file",'
+        '"arguments":{"path":"/tmp/note.html","content":"<p>He said "hi</p>"}}}</tool_call>'
+    )
+    stream2, _proc_mock2, _client2 = _stream(_events(odd_raw))
+    calls2, contents2, finishes2 = _consumed(list(stream2))
+    assert len(calls2) == 1
+    assert json.loads(calls2[0].function.arguments) == {
+        "path": "/tmp/note.html",
+        "content": '<p>He said "hi</p>',
+    }
+    assert contents2 == []
+    assert finishes2 == ["tool_calls"]
+
+
+def test_broken_tool_call_json_withheld_and_not_leaked_as_prose():
+    # Broken outer JSON naming a real tool must never leak raw <tool_call> XML to assistant prose.
+    broken = '<tool_call>{"id":"x","function":{"name":"write_file","arguments":{"path":"/tmp/a" "content":"hi"}}}</tool_call>'
+    stream, _proc_mock, _client = _stream(_events(broken), is_worker=False)
+    (calls, contents, _finishes), err = _consume_until_error(stream)
+    assert calls == []
+    assert contents == []
+    assert "write_file" in err and "not valid JSON" in err
+
+
+def test_broken_outer_tool_call_triggers_worker_correction_reask():
+    broken = '<tool_call>{"id":"x","type":"function","function":{"name":"write_file","arguments":{"path":"/tmp/a" "content":"hi"}}}</tool_call>'
+    fixed = '<tool_call>{"id":"x","type":"function","function":{"name":"write_file","arguments":{"path":"/tmp/a","content":"hi"}}}</tool_call>'
+    events = _events(broken) + _events(fixed)
+    proc = _proc([json.dumps(e) for e in events], poll=None)
+    stdin_buf = io.StringIO()
+    proc.stdin = stdin_buf
+    client = MagicMock()
+    client._isolated_gemini_dir = None
+    client._cancelled = False
+    stream = AntigravityStream(
+        proc=proc,
+        client=client,
+        model="fixture-only",
+        timeout=5.0,
+        tools=[{"type": "function", "function": {"name": "write_file"}}],
+        is_worker=True,
+    )
+    calls, contents, finishes = _consumed(list(stream))
+    assert len(calls) == 1
+    assert json.loads(calls[0].function.arguments) == {"path": "/tmp/a", "content": "hi"}
+    assert contents == []
+    assert finishes == ["tool_calls"]
+    assert "NOT executed" in stdin_buf.getvalue()
+
+
+def test_literal_quoted_tool_call_tag_in_prose_does_not_trip_parser():
+    prose = 'Never emit "<tool_call>" or \'<tool_call>\' directly in plain text.'
+    stream, _proc_mock, _client = _stream(_events(prose))
+    calls, contents, finishes = _consumed(list(stream))
+    assert calls == []
+    assert "".join(contents) == prose
+    assert finishes == ["stop"]
+
+
+def test_cross_turn_reused_tool_call_id_is_uniquified():
+    prior_messages = [
+        {"role": "user", "content": "first"},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [{"id": "call_1", "type": "function", "function": {"name": "write_file", "arguments": "{}"}}],
+        },
+        {"role": "tool", "tool_call_id": "call_1", "content": "ok"},
+    ]
+    proc = _proc([json.dumps(e) for e in _events(_block("second", identifier="call_1"))])
+    client = MagicMock()
+    client._isolated_gemini_dir = None
+    stream = AntigravityStream(
+        proc=proc,
+        client=client,
+        model="fixture-only",
+        timeout=5.0,
+        tools=[{"type": "function", "function": {"name": "write_file"}}],
+        is_worker=False,
+        messages=prior_messages,
+    )
+    calls, contents, finishes = _consumed(list(stream))
+    assert len(calls) == 1
+    assert calls[0].id != "call_1"
+    assert contents == []
+    assert finishes == ["tool_calls"]
+
+
+def test_parse_tool_block_bare_json_fallback_leaves_unparseable_text_untouched():
+    raw = '{"id":"c1","type":"function","function":{"name":"search_files","arguments":{not valid}}'
+    calls, cleaned = _parse_tool_block(raw)
+    assert calls == []
+    assert cleaned == raw

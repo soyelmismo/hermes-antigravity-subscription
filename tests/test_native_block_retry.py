@@ -89,7 +89,7 @@ class NativeBlockRetryTests(unittest.TestCase):
         prompt = _sent(procs[0])[0]
         self.assertTrue(prompt.endswith(_NATIVE_BLOCK_NOTE), prompt[-600:])
         example = json.loads(_NATIVE_BLOCK_NOTE.split("<tool_call>")[1].split("</tool_call>")[0])
-        self.assertEqual(json.loads(example["function"]["arguments"]), {"argument": "value"})
+        self.assertEqual(example["function"]["arguments"], {"argument": "value"})
         self.assertEqual(results[0].choices[0].message.content, "a.txt and b.txt")
         self.assertIsNone(client._native_block_note)
 
