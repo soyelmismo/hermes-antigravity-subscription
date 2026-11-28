@@ -147,6 +147,23 @@ class SetupStatusTest(unittest.TestCase):
             self.assertIn("gemini-4-neon", cat)
             self.assertEqual(mock_run.call_count, 1)
 
+    def test_parse_mismatch_updates_neither_cache(self):
+        # One stdout feeds both caches; a rows parse with an empty catalog parse
+        # must not leave a fresh catalog next to stale picker rows.
+        class Proc:
+            returncode = 0
+            stdout = AGY_MODELS
+
+        models._catalog_cache = None
+        models._rows_cache = None
+        self.addCleanup(setattr, models, "_catalog_cache", None)
+        self.addCleanup(setattr, models, "_rows_cache", None)
+        with patch("models.subprocess.run", return_value=Proc()), patch.object(models, "parse_catalog", return_value={}):
+            self.assertEqual(models.load_catalog_rows(), [])
+            self.assertIsNone(models._catalog_cache)
+            assert models._rows_cache is not None
+            self.assertEqual(models._rows_cache[1], [])
+
 
 class AuxAndVisionTest(unittest.TestCase):
     def test_aux_prefers_flash_low_then_neon_low(self):
@@ -174,6 +191,28 @@ class AuxAndVisionTest(unittest.TestCase):
         rows = [{"id": "claude-opus-5-5", "label": "Claude Opus 5.5", "note": "high"}]
         with patch.object(models, "load_catalog_rows", return_value=rows):
             self.assertEqual(setup_hooks.resolve_aux_model(), "")
+
+    def test_aux_fallback_also_returns_an_effort_variant(self):
+        # The generic gemini-4-* fallback must respect effort-only models too.
+        rows = [{"id": "gemini-4-argon", "label": "Gemini 4 Argon", "note": "low, high"}]
+        with patch.object(models, "load_catalog_rows", return_value=rows):
+            self.assertEqual(setup_hooks.resolve_aux_model(), "gemini-4-argon-low")
+
+    def test_profile_hooks_forward_a_caller_timeout(self):
+        from providers import get_provider_profile
+
+        profile = get_provider_profile("antigravity-subscription-directsdk")
+        assert profile is not None
+        package = type(profile).__module__
+        prov_setup = importlib.import_module(f"{package}.setup_hooks")
+        with patch.object(prov_setup, "resolve_aux_model", return_value="m1") as aux, patch.object(
+            prov_setup, "default_vision_model", return_value="m2"
+        ) as vision:
+            self.assertEqual(profile.resolve_aux_model(timeout=3), "m1")
+            self.assertEqual(profile.default_vision_model(timeout=2), "m2")
+            self.assertEqual(profile.resolve_aux_model(vision=True, timeout=2), "m2")
+        self.assertEqual(aux.call_args_list[0].kwargs, {"timeout": 3.0})
+        self.assertEqual(vision.call_args_list[0].kwargs, {"timeout": 2.0})
 
     def test_profile_wires_hooks_and_handles_vision_flag(self):
         from providers import get_provider_profile

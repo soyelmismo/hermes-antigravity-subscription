@@ -217,17 +217,19 @@ def load_catalog(
             )
             raw_stdout = res.stdout
             catalog = parse_catalog(raw_stdout)
-            failure = "" if catalog else f"exit {res.returncode}, no model ids in output"
+            rows = parse_catalog_rows(raw_stdout)
+            failure = "" if catalog and rows else f"exit {res.returncode}, no model ids in output"
         except Exception as exc:
             catalog = {}
+            rows = []
             failure = str(exc) or type(exc).__name__
             logger.debug("Antigravity model catalog probe failed", exc_info=True)
         now = time.monotonic()
-        if catalog:
+        # Both caches come from the same stdout; update them together so a read
+        # cannot see a fresh catalog next to stale picker rows.
+        if catalog and rows:
             _catalog_cache = (now + _CATALOG_TTL_SECONDS, catalog, now)
-            rows = parse_catalog_rows(raw_stdout)
-            if rows:
-                _rows_cache = (now + _CATALOG_TTL_SECONDS, rows)
+            _rows_cache = (now + _CATALOG_TTL_SECONDS, rows)
             return catalog
         if now - _catalog_warned_at >= _CATALOG_FAILURE_TTL_SECONDS:
             _catalog_warned_at = now
@@ -308,11 +310,11 @@ def load_catalog_rows(timeout: float = 15.0) -> list[dict[str, str]]:
             logger.debug("Antigravity picker catalog unavailable: %s", exc)
             rows = []
         now = time.monotonic()
-        if rows:
+        catalog = parse_catalog(raw_stdout) if rows else {}
+        # Same rule as load_catalog: one stdout, both caches or neither.
+        if rows and catalog:
             _rows_cache = (now + _CATALOG_TTL_SECONDS, rows)
-            catalog = parse_catalog(raw_stdout)
-            if catalog:
-                _catalog_cache = (now + _CATALOG_TTL_SECONDS, catalog, now)
+            _catalog_cache = (now + _CATALOG_TTL_SECONDS, catalog, now)
             return [dict(r) for r in rows]
         kept = previous[1] if previous is not None and previous[1] else []
         _rows_cache = (now + _CATALOG_FAILURE_TTL_SECONDS, kept)

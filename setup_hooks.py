@@ -182,6 +182,18 @@ def discover_models(timeout: float = 15.0) -> Optional[list[dict[str, str]]]:
     return rows or None
 
 
+def _effort_variant(row: dict[str, str]) -> str:
+    """The row's cheapest callable id: its first effort variant, or the base id.
+
+    Rows list efforts cheapest first. A base model that is only sold as effort
+    variants (e.g. ``gemini-4-hydrogen``) rejects the bare id, so the bare id is
+    correct only when the row has no variants at all.
+    """
+    base = row["id"]
+    efforts = [e.strip() for e in (row.get("note") or "").split(",") if e.strip()]
+    return f"{base}-{efforts[0]}" if efforts else base
+
+
 def resolve_aux_model(timeout: float = 15.0) -> str:
     """Cheapest live model id for auxiliary work, or "" when unknown."""
     try:
@@ -195,17 +207,11 @@ def resolve_aux_model(timeout: float = 15.0) -> str:
     by_id = {row["id"]: row for row in rows}
     for base in ("gemini-3.8-flash", "gemini-4-neon", "gemini-4-hydrogen"):
         row = by_id.get(base)
-        if row is None:
-            continue
-        efforts = [e.strip() for e in (row.get("note") or "").split(",") if e.strip()]
-        if efforts:
-            # Rows list efforts cheapest first; a base model that is only sold
-            # as effort variants (e.g. gemini-4-hydrogen) rejects the bare id.
-            return f"{base}-{efforts[0]}"
-        return base
+        if row is not None:
+            return _effort_variant(row)
     for row in rows:
         if row["id"].startswith("gemini-4-"):
-            return row["id"]
+            return _effort_variant(row)
     return ""
 
 

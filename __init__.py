@@ -116,6 +116,18 @@ def resolve_context_length(model: str) -> int:
     return _DEFAULT_CONTEXT_LENGTH
 
 
+def _timeout_kwarg(kwargs: dict[str, Any]) -> dict[str, float]:
+    """The hook's ``timeout`` argument, when the caller supplied a usable one.
+
+    Only ``timeout`` is forwarded: the module hooks take no other keyword and a
+    stray kwarg would raise into the hook's failure path.
+    """
+    timeout = kwargs.get("timeout")
+    if isinstance(timeout, (int, float)) and not isinstance(timeout, bool) and timeout > 0:
+        return {"timeout": float(timeout)}
+    return {}
+
+
 def _full_send_splitting_enabled(model: str) -> bool:
     try:
         from .prompt import full_send_segment_budget
@@ -308,24 +320,24 @@ class AntigravitySubscriptionDirectSDKProfile(ProviderProfile):
     def resolve_aux_model(self, *, vision: bool = False, **kwargs: Any) -> str:
         """Cheapest live model id for auxiliary tasks, or ""."""
         if vision:
-            return self.default_vision_model() or ""
+            return self.default_vision_model(**kwargs) or ""
         try:
             try:
                 from .setup_hooks import resolve_aux_model as _resolve_aux_model
             except ImportError:
                 from setup_hooks import resolve_aux_model as _resolve_aux_model
-            return _resolve_aux_model()
+            return _resolve_aux_model(**_timeout_kwarg(kwargs))
         except Exception:
             return ""
 
-    def default_vision_model(self) -> str | None:
+    def default_vision_model(self, **kwargs: Any) -> str | None:
         """A model on this provider that accepts images natively."""
         try:
             try:
                 from .setup_hooks import default_vision_model as _default_vision_model
             except ImportError:
                 from setup_hooks import default_vision_model as _default_vision_model
-            return _default_vision_model()
+            return _default_vision_model(**_timeout_kwarg(kwargs))
         except Exception:
             return None
 
