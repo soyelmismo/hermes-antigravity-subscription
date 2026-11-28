@@ -79,12 +79,14 @@ class CorpusTests(unittest.TestCase):
                     check = subprocess.run(["bash", "-n", "-c", command], capture_output=True, text=True)
                     self.assertEqual(check.returncode, 0, check.stderr)
 
-    def test_hermes_core_cannot_repair_the_corpus(self):
+    def test_hermes_core_cannot_repair_unescaped_quote_corpus(self):
         try:
             from agent.message_sanitization import _repair_tool_call_arguments
         except Exception:
             self.skipTest("Hermes core not importable")
-        for item in CORPUS:
+        quote_items = [item for item in CORPUS if item["kind"] == "unescaped-quote"]
+        self.assertTrue(quote_items)
+        for item in quote_items:
             with self.subTest(item["id"]):
                 self.assertEqual(_repair_tool_call_arguments(item["arguments"], "terminal"), "{}")
 

@@ -567,8 +567,8 @@ _PROMPT_PREAMBLE = (
     "All tool executions and filesystem interactions are performed exclusively by Hermes Agent on the host side.",
     "IMPORTANT INSTRUCTIONS FOR TOOLS:",
     "- If you need to call a tool, emit ONLY <tool_call>{...}</tool_call> blocks in plain text output—NEVER use the native functionCall / tool_use channel.",
-    "- Each <tool_call> block must contain a single valid JSON object with 'id' (unique per call), 'type': 'function', and 'function': {'name': '...', 'arguments': '...'}." ,
-    "- 'arguments' must be a valid, properly JSON-escaped string encoding the function's arguments object.",
+    "- Each <tool_call> block must contain a single valid JSON object with 'id' (unique per call), 'type': 'function', and 'function': {'name': '...', 'arguments': {...}}." ,
+    "- 'arguments' should be a plain JSON object matching the tool's parameter schema (no double-JSON-escaping needed; a JSON-encoded string is also accepted).",
     "- Do NOT execute local shell commands or file operations directly; only output <tool_call> tags so Hermes can execute them safely.",
     "- NEVER simulate or hallucinate Tool Results (e.g. 'Tool Result (...):'). Hermes Agent executes tools externally and will supply real results in subsequent turns.",
     "- After emitting tool calls, STOP generating immediately. Do NOT generate results, execution output, or commentary after tool calls.",
@@ -831,14 +831,16 @@ class _MarkdownCodeState:
 def _find_unquoted_tool_call_open(
     text: str, state: _MarkdownCodeState | None = None
 ) -> int:
-    """Return index of first ``<tool_call`` in *text* outside CommonMark code, or -1."""
+    """Return index of first ``<tool_call`` in *text* outside CommonMark code or literal quotes, or -1."""
     if "<tool_call" not in text:
         return -1
     prefix = state._tail if state is not None else ""
     offset = len(prefix)
-    spans = _code_spans(prefix + text)
+    combined = prefix + text
+    spans = _code_spans(combined)
     span_idx = 0
     cursor = 0
+    open_len = len(_TOOL_CALL_OPEN)
     while True:
         idx = text.find("<tool_call", cursor)
         if idx == -1:
@@ -847,6 +849,16 @@ def _find_unquoted_tool_call_open(
         while span_idx < len(spans) and spans[span_idx][1] <= abs_pos:
             span_idx += 1
         if span_idx >= len(spans) or abs_pos < spans[span_idx][0]:
+            # Skip literal prose quotes like "<tool_call>" or '<tool_call>'.
+            if (
+                abs_pos > 0
+                and combined[abs_pos - 1] in ('"', "'")
+                and text.startswith(_TOOL_CALL_OPEN, idx)
+                and idx + open_len < len(text)
+                and text[idx + open_len] == combined[abs_pos - 1]
+            ):
+                cursor = idx + open_len + 1
+                continue
             return idx
         cursor = idx + len("<tool_call")
 
@@ -1078,6 +1090,42 @@ def _historical_tool_call_note(call_id: Any, name: Any, args: str, limit: int) -
     return note
 
 
+_TOOL_CALL_CONTRACT = (
+    "Available tools (OpenAI function schema). "
+    "When using a tool, emit ONLY <tool_call>{...}</tool_call> with one JSON object "
+    "containing id/type/function{name,arguments}. arguments should be a JSON object "
+    "(a JSON string is also accepted)."
+)
+
+
+def _render_tool_bridge_sections(
+    tools: list[dict[str, Any]] | None,
+    tool_choice: Any = None,
+) -> list[str]:
+    """Render OpenAI tool schemas and optional tool_choice hint without private core imports."""
+    specs: list[dict[str, Any]] = []
+    for tool in tools or []:
+        fn = tool.get("function") if isinstance(tool, dict) else None
+        if not isinstance(fn, dict):
+            continue
+        name = fn.get("name")
+        if not isinstance(name, str) or not name.strip():
+            continue
+        specs.append(
+            {
+                "name": name.strip(),
+                "description": fn.get("description", ""),
+                "parameters": fn.get("parameters", {}),
+            }
+        )
+    sections: list[str] = []
+    if specs:
+        sections.append(_TOOL_CALL_CONTRACT + "\n" + json.dumps(specs, ensure_ascii=False))
+    if tool_choice is not None:
+        sections.append(f"Tool choice hint: {json.dumps(tool_choice, ensure_ascii=False)}")
+    return sections
+
+
 def _assemble_full_prompt_parts(
     messages: list[dict[str, Any]],
     tools: list[dict[str, Any]] | None = None,
@@ -1085,16 +1133,7 @@ def _assemble_full_prompt_parts(
     media_sink: Optional[set] = None,
 ) -> _FullPromptParts:
     """Build the pieces of the full-send prompt (see _format_messages_as_prompt)."""
-    try:
-        from agent.acp_openai_bridge import render_tool_bridge_sections
-        tool_sections = render_tool_bridge_sections(tools, tool_choice)
-    except Exception:
-        tool_sections = []
-        if tools:
-            tool_sections.append(
-                "Available tools (OpenAI function schema):\n"
-                + json.dumps(tools, ensure_ascii=False)
-            )
+    tool_sections = _render_tool_bridge_sections(tools, tool_choice)
 
     sections: list[str] = [*_PROMPT_PREAMBLE, *tool_sections]
 
@@ -1180,7 +1219,7 @@ def _assemble_full_prompt_parts(
                             "type": "function",
                             "function": {
                                 "name": fn.get("name", ""),
-                                "arguments": args_str,
+                                "arguments": _arguments_for_prompt(raw_args),
                             }
                         }
                         frame = f"<tool_call>{json.dumps(call_obj, ensure_ascii=False)}</tool_call>"
@@ -1515,7 +1554,7 @@ def _format_delta_prompt(
                             "type": "function",
                             "function": {
                                 "name": fn.get("name", ""),
-                                "arguments": fn.get("arguments", "{}") if isinstance(fn.get("arguments"), str) else json.dumps(fn.get("arguments", {}), ensure_ascii=False)
+                                "arguments": _arguments_for_prompt(fn.get("arguments", "{}")),
                             }
                         }
                         subparts.append(f"<tool_call>{json.dumps(call_obj, ensure_ascii=False)}</tool_call>")
@@ -1530,7 +1569,7 @@ def _format_delta_prompt(
         parts.append(
             "Continue the conversation from the latest tool result. "
             "REMINDER: You are in HEADLESS INFERENCE MODE. Native function-calling and native tools are disabled. "
-            "If you need to call a tool, emit ONLY <tool_call>{...}</tool_call> blocks in plain text with valid JSON and a properly JSON-escaped 'arguments' string. "
+            "If you need to call a tool, emit ONLY <tool_call>{...}</tool_call> blocks in plain text with valid JSON and a JSON object for 'arguments'. "
             "Never invoke native tools or emit native functionCall blocks."
         )
         if pending_user_text:
@@ -1607,6 +1646,23 @@ def _has_unfinished_tool_call_frame(
         cursor = end
 
 
+def _arguments_for_prompt(raw_args: Any) -> Any:
+    """Render tool-call arguments as a plain JSON object in prompt transcripts
+    when they parse as one, so models imitate single-encoded JSON instead of
+    error-prone double-escaped JSON strings."""
+    if isinstance(raw_args, dict):
+        return raw_args
+    if isinstance(raw_args, str):
+        try:
+            parsed = json.loads(raw_args)
+            if isinstance(parsed, dict):
+                return parsed
+        except (ValueError, TypeError):
+            pass
+        return raw_args
+    return raw_args if raw_args is not None else {}
+
+
 _JSON_QUOTE_FIX_ERRORS = ("Expecting ',' delimiter", "Expecting ':' delimiter", "Extra data")
 _MAX_JSON_FIXES = 200
 # A quoted key right after the quote the decoder stopped at.
@@ -1640,11 +1696,10 @@ def _lenient_json_loads(text: str) -> tuple[Any, dict[str, int]]:
     """
     fixes = {"escape": 0, "quote": 0}
     s = text
-    # A slip is one character, so a body can carry at most len(text) of
-    # them; a generated grep pipeline runs to one every dozen. The budget
-    # bounds the quadratic loop (one decode attempt per fix) without
-    # refusing a long hand-escaped script for its number of slips.
-    budget = max(_MAX_JSON_FIXES, len(text) // 10)
+    # A slip is one character; dense HTML/SVG attributes can reach one quote
+    # every 4-5 characters. Scale with length while keeping a strict upper cap
+    # so pathological inputs stay fast.
+    budget = min(4_000, max(_MAX_JSON_FIXES, len(text) // 3))
     for _ in range(budget + 1):
         try:
             return json.loads(s, strict=False), fixes
@@ -1783,6 +1838,13 @@ def _tool_call_from_object(
         fn_args, arguments_error = _normalize_tool_arguments(fn_name, raw_args, tool_schemas)
         args_repaired = fn_args != raw_args
     else:
+        if frame_repaired and isinstance(raw_args, dict):
+            schema = (tool_schemas or {}).get(fn_name)
+            misfit = _arguments_fit_schema(raw_args, schema)
+            if misfit:
+                arguments_error = (
+                    f"arguments are not valid JSON; the repaired object does not fit the schema ({misfit})"
+                )
         fn_args = json.dumps(raw_args, ensure_ascii=False)
     return SimpleNamespace(
         id=call_id,
@@ -1827,16 +1889,178 @@ def _has_unparseable_tool_call_frame(
     return _has_closed_tool_call_frame(cleaned, state=state)
 
 
+_BROKEN_FRAME_FN_NAME_RE = re.compile(
+    r'"function"\s*:\s*\{[^{}]*?"name"\s*:\s*"([^"\s][^"]*)"',
+    re.DOTALL,
+)
+_BROKEN_FRAME_CALL_ID_RE = re.compile(r'"id"\s*:\s*"([^"\s][^"]*)"')
+
+
+def _rejected_call_from_broken_frame(
+    body: str,
+    error_detail: str,
+    ordinal: int,
+    tool_schemas: dict[str, Any] | None = None,
+) -> Any | None:
+    """Build a withheld placeholder call when a closed ``<tool_call>`` frame
+    clearly attempted a JSON tool call but could not be decoded.
+
+    Distinguishes real broken tool-call JSON (starts with ``{``, names a
+    function tool) from non-protocol markup in prose (``{}``, ``[]``, empty,
+    or blank function name) so broken tool calls trigger worker correction
+    instead of leaking raw ``<tool_call>`` XML into assistant text.
+    """
+    stripped = body.strip()
+    if not stripped.startswith("{"):
+        return None
+    match = _BROKEN_FRAME_FN_NAME_RE.search(stripped)
+    if match is None:
+        return None
+    fn_name = match.group(1).strip()
+    if not fn_name:
+        return None
+    if tool_schemas:
+        if fn_name not in tool_schemas:
+            return None
+    elif '"arguments"' not in stripped:
+        return None
+    id_match = _BROKEN_FRAME_CALL_ID_RE.search(stripped)
+    call_id = id_match.group(1).strip() if id_match else f"call_{ordinal}"
+    return SimpleNamespace(
+        id=call_id,
+        type="function",
+        function=SimpleNamespace(name=fn_name, arguments="{}"),
+        arguments_error=f"tool call JSON is not valid ({error_detail})",
+        protocol_mutated=True,
+    )
+
+
+def _split_adjacent_tool_call_bodies(body: str) -> list[str]:
+    """Split concatenated tool-call JSON objects inside one frame.
+
+    Handles the observed failure mode where a model emits parallel tool calls
+    but omits ``</tool_call>`` between them (``<tool_call>{...}<tool_call>{...}</tool_call>``),
+    or emits two JSON objects back-to-back inside a single frame.
+    """
+    pieces: list[str] = []
+    in_string = False
+    escape = False
+    depth = 0
+    seg_start = 0
+    i = 0
+    n = len(body)
+    open_len = len(_TOOL_CALL_OPEN)
+    close_len = len(_TOOL_CALL_CLOSE)
+    while i < n:
+        if not in_string and depth == 0:
+            if body.startswith(_TOOL_CALL_OPEN, i):
+                chunk = body[seg_start:i].strip()
+                if chunk:
+                    pieces.append(chunk)
+                i += open_len
+                seg_start = i
+                continue
+            if body.startswith(_TOOL_CALL_CLOSE, i):
+                chunk = body[seg_start:i].strip()
+                if chunk:
+                    pieces.append(chunk)
+                i += close_len
+                seg_start = i
+                continue
+        ch = body[i]
+        if in_string:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_string = False
+            i += 1
+            continue
+        if ch == '"':
+            in_string = True
+        elif ch == "{":
+            depth += 1
+        elif ch == "}" and depth > 0:
+            depth -= 1
+            if depth == 0:
+                chunk = body[seg_start : i + 1].strip()
+                if chunk:
+                    pieces.append(chunk)
+                seg_start = i + 1
+        i += 1
+    tail = body[seg_start:].strip()
+    if tail:
+        pieces.append(tail)
+    if len(pieces) > 1:
+        return pieces
+    # Fallback when an unescaped quote in call 1 inverted string parity before
+    # an unclosed adjacent <tool_call>{...}: split only if every piece looks
+    # like a JSON object.
+    if _TOOL_CALL_OPEN in body:
+        raw_parts = [p.strip() for p in body.split(_TOOL_CALL_OPEN) if p.strip()]
+        cleaned_parts = [
+            p[:-close_len].strip() if p.endswith(_TOOL_CALL_CLOSE) else p
+            for p in raw_parts
+        ]
+        if len(cleaned_parts) > 1 and all(p.startswith("{") for p in cleaned_parts):
+            return cleaned_parts
+    return pieces
+
+
+def _decode_single_tool_call_body(
+    body: str,
+    ordinal: int,
+    tool_schemas: dict[str, Any] | None = None,
+    *,
+    force_repaired: bool = False,
+) -> tuple[Any | None, str | None]:
+    """Decode one JSON tool-call body, applying lenient repair if needed.
+
+    Returns ``(call_or_none, decode_error_or_none)``.
+    """
+    parsed = None
+    frame_repaired = force_repaired
+    decode_error: str | None = None
+    try:
+        parsed = json.loads(body)
+    except Exception:
+        # Same escaping slips as in arguments (see _lenient_json_loads),
+        # one level up: an object-valued "arguments" carries the command.
+        try:
+            parsed, fixes = _lenient_json_loads(body)
+            frame_repaired = True
+            logger.warning(
+                "Repaired <tool_call> frame JSON: %d invalid escape(s), %d unescaped quote(s)",
+                fixes["escape"],
+                fixes["quote"],
+            )
+        except ValueError as exc:
+            parsed = None
+            decode_error = str(exc)
+    call = _tool_call_from_object(
+        parsed, ordinal, tool_schemas, frame_repaired=frame_repaired
+    )
+    return call, decode_error
+
+
 def _extract_tagged_tool_calls(
-    block: str, state: _MarkdownCodeState | None = None, tool_schemas: dict[str, Any] | None = None
+    block: str,
+    state: _MarkdownCodeState | None = None,
+    tool_schemas: dict[str, Any] | None = None,
+    *,
+    allow_raw_close: bool = False,
 ) -> tuple[list[Any], str]:
     """Extract ``<tool_call>{...}</tool_call>`` frames using the shared scanner.
 
     The frame boundary is :func:`_find_tool_call_close`, so a literal closing
-    tag inside a JSON string does not terminate the block. Text outside valid
-    frames, and a frame whose body is not a valid call, are returned as
-    ``cleaned_text``. Tags inside markdown code spans or fenced code blocks
-    are left untouched as ordinary text.
+    tag inside a JSON string does not terminate the block. When *allow_raw_close*
+    is True (end-of-turn recovery), a closing tag masked by an odd number of
+    unescaped quotes inside the body is still recovered via ``rfind``.
+    Adjacent calls missing an intermediate ``</tool_call>`` are split and
+    parsed individually. Text outside valid frames, and non-protocol frames,
+    are returned as ``cleaned_text``. Tags inside markdown code spans or fenced
+    code blocks are left untouched as ordinary text.
     """
     calls: list[Any] = []
     text_parts: list[str] = []
@@ -1855,37 +2079,60 @@ def _extract_tagged_tool_calls(
             continue
         text_parts.append(block[cursor:start])
         cur.advance(block[cursor:start])
-        close = _find_tool_call_close(block, start + len(_TOOL_CALL_OPEN))
+        body_start = start + len(_TOOL_CALL_OPEN)
+        close = _find_tool_call_close(block, body_start)
+        if close == -1 and allow_raw_close:
+            raw_close = block.rfind(_TOOL_CALL_CLOSE, body_start)
+            if raw_close != -1:
+                close = raw_close
         if close == -1:
             text_parts.append(block[start:])
             break
         end = close + len(_TOOL_CALL_CLOSE)
-        body = block[start + len(_TOOL_CALL_OPEN):close].strip()
-        parsed = None
-        frame_repaired = False
-        try:
-            parsed = json.loads(body)
-        except Exception:
-            # Same escaping slips as in arguments (see _lenient_json_loads),
-            # one level up: an object-valued "arguments" carries the command.
-            try:
-                parsed, fixes = _lenient_json_loads(body)
-                frame_repaired = True
-                logger.warning(
-                    "Repaired <tool_call> frame JSON: %d invalid escape(s), %d unescaped quote(s)",
-                    fixes["escape"],
-                    fixes["quote"],
-                )
-            except ValueError:
-                parsed = None
-        call = _tool_call_from_object(
-            parsed, len(calls) + 1, tool_schemas, frame_repaired=frame_repaired
+        body = block[body_start:close].strip()
+        call, decode_error = _decode_single_tool_call_body(
+            body, len(calls) + 1, tool_schemas
         )
-        if call is None:
-            text_parts.append(block[start:end])
-            cur.advance(block[start:end])
-        else:
+        if call is not None:
             calls.append(call)
+        else:
+            sub_bodies = _split_adjacent_tool_call_bodies(body) if decode_error else []
+            if len(sub_bodies) > 1:
+                recovered: list[Any] = []
+                for sub in sub_bodies:
+                    sub_call, sub_err = _decode_single_tool_call_body(
+                        sub, len(calls) + len(recovered) + 1, tool_schemas, force_repaired=True
+                    )
+                    if sub_call is not None:
+                        recovered.append(sub_call)
+                    elif sub_err:
+                        rejected = _rejected_call_from_broken_frame(
+                            sub, sub_err, len(calls) + len(recovered) + 1, tool_schemas
+                        )
+                        if rejected is not None:
+                            recovered.append(rejected)
+                if recovered:
+                    logger.warning(
+                        "Recovered %d tool call(s) from adjacent unclosed <tool_call> block",
+                        len(recovered),
+                    )
+                    calls.extend(recovered)
+                else:
+                    text_parts.append(block[start:end])
+                    cur.advance(block[start:end])
+            else:
+                rejected = (
+                    _rejected_call_from_broken_frame(
+                        body, decode_error, len(calls) + 1, tool_schemas
+                    )
+                    if decode_error
+                    else None
+                )
+                if rejected is not None:
+                    calls.append(rejected)
+                else:
+                    text_parts.append(block[start:end])
+                    cur.advance(block[start:end])
         cursor = end
     if not calls:
         # No frame was consumed: hand the input back untouched. Joining the
@@ -1895,8 +2142,106 @@ def _extract_tagged_tool_calls(
     return calls, "\n".join(part.strip() for part in text_parts if part and part.strip()).strip()
 
 
+_TOOL_CALL_JSON_START_RE = re.compile(
+    r"\{\s*\"id\"\s*:\s*\"[^\"]+\"\s*,\s*\"type\"\s*:\s*\"function\"\s*,\s*\"function\"\s*:\s*\{",
+    re.DOTALL,
+)
+
+
+def _find_balanced_json_object_end(text: str, start: int) -> int:
+    """Return end index (exclusive) of the JSON object starting at ``start``, or -1
+    if unbalanced. String-aware so braces inside string values do not confuse depth."""
+    depth = 0
+    in_string = False
+    escape = False
+    for i in range(start, len(text)):
+        ch = text[i]
+        if in_string:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+        elif ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return i + 1
+    return -1
+
+
+def _extract_bare_json_tool_calls(
+    block: str, tool_schemas: dict[str, Any] | None = None
+) -> tuple[list[Any], str]:
+    """Fallback extractor for untagged bare-JSON tool call objects.
+
+    Uses string-aware brace balancing so plain JSON object ``arguments`` (and
+    nested objects) parse cleanly even when running against older Hermes versions
+    whose ``acp_openai_bridge.TOOL_CALL_JSON_RE`` assumes string-only arguments.
+    """
+    if not isinstance(block, str) or not block.strip():
+        return [], ""
+    calls: list[Any] = []
+    consumed_spans: list[tuple[int, int]] = []
+    cursor = 0
+    while True:
+        m = _TOOL_CALL_JSON_START_RE.search(block, cursor)
+        if m is None:
+            break
+        end = _find_balanced_json_object_end(block, m.start())
+        if end == -1:
+            cursor = m.end()
+            continue
+        body = block[m.start():end]
+        parsed = None
+        frame_repaired = False
+        try:
+            parsed = json.loads(body)
+        except Exception:
+            try:
+                parsed, fixes = _lenient_json_loads(body)
+                frame_repaired = True
+                logger.warning(
+                    "Repaired bare JSON tool call: %d invalid escape(s), %d unescaped quote(s)",
+                    fixes["escape"],
+                    fixes["quote"],
+                )
+            except ValueError:
+                parsed = None
+        call = _tool_call_from_object(
+            parsed, len(calls) + 1, tool_schemas, frame_repaired=frame_repaired
+        )
+        if call is not None:
+            calls.append(call)
+            consumed_spans.append((m.start(), end))
+            cursor = end
+        else:
+            cursor = m.start() + 1
+    if not consumed_spans:
+        return [], block.strip()
+    parts: list[str] = []
+    pos = 0
+    for start, end in consumed_spans:
+        if pos < start:
+            parts.append(block[pos:start])
+        pos = max(pos, end)
+    if pos < len(block):
+        parts.append(block[pos:])
+    cleaned = "\n".join(p.strip() for p in parts if p and p.strip()).strip()
+    return calls, cleaned
+
+
 def _parse_tool_block(
-    block: str, state: _MarkdownCodeState | None = None, tool_schemas: dict[str, Any] | None = None
+    block: str,
+    state: _MarkdownCodeState | None = None,
+    tool_schemas: dict[str, Any] | None = None,
+    *,
+    allow_raw_close: bool = False,
 ) -> tuple[list[Any], str]:
     """Parse tool call blocks, returning (tool_call_deltas, cleaned_text).
 
@@ -1906,13 +2251,11 @@ def _parse_tool_block(
     calls: list[Any] = []
     cleaned_text = ""
     if _TOOL_CALL_OPEN in block:
-        calls, cleaned_text = _extract_tagged_tool_calls(block, state=state, tool_schemas=tool_schemas)
+        calls, cleaned_text = _extract_tagged_tool_calls(
+            block, state=state, tool_schemas=tool_schemas, allow_raw_close=allow_raw_close
+        )
     else:
-        try:
-            from agent.acp_openai_bridge import extract_tool_calls_from_text
-            calls, cleaned_text = extract_tool_calls_from_text(block)
-        except Exception:
-            cleaned_text = block
+        calls, cleaned_text = _extract_bare_json_tool_calls(block, tool_schemas=tool_schemas)
 
     deltas = []
     for i, call in enumerate(calls):

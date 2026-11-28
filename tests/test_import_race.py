@@ -17,16 +17,14 @@ PLUGIN_DIR = Path(__file__).resolve().parent.parent
 class TestClientWarmsOpenAITypes(unittest.TestCase):
     def test_client_import_loads_openai_chat_types(self):
         try:
-            import agent.acp_openai_bridge  # noqa: F401
             import openai.types.chat  # noqa: F401
         except Exception:
-            self.skipTest("openai or agent.acp_openai_bridge not installed in test runner environment")
+            self.skipTest("openai not installed in test runner environment")
 
         code = (
             "import sys\n"
             "assert 'openai.types.chat' not in sys.modules\n"
             "import client\n"
-            "assert 'agent.acp_openai_bridge' in sys.modules\n"
             "assert 'openai.types.chat' in sys.modules\n"
             "print('ok')\n"
         )

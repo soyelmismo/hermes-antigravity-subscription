@@ -22,12 +22,10 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
-# prompt.py imports agent.acp_openai_bridge lazily during the first turn, while Hermes
-# starts the title-generation thread in parallel. Two threads first-importing
-# openai.types.chat race and the loser sees a partially initialized module, so the
-# session title is lost. Importing the bridge here runs that import on the loading thread.
+# Warm openai.types.chat on the loading thread so parallel title-generation
+# threads do not race on first import.
 with contextlib.suppress(Exception):
-    import agent.acp_openai_bridge  # noqa: E402,F401
+    import openai.types.chat  # noqa: E402,F401
 
 try:
     from .models import (
@@ -134,7 +132,7 @@ _NATIVE_BLOCK_NOTE = (
     "[HOST] A native tool attempt was blocked. Never use the native functionCall channel, "
     "even for a Hermes tool name. If a tool is needed, emit a plain-text block in this format "
     "(replace the example name, id and arguments):\n"
-    r'<tool_call>{"id":"call_example","type":"function","function":{"name":"HOST_TOOL_NAME","arguments":"{\"argument\":\"value\"}"}}</tool_call>'
+    r'<tool_call>{"id":"call_example","type":"function","function":{"name":"HOST_TOOL_NAME","arguments":{"argument":"value"}}}</tool_call>'
     "\nUse only a tool in the Hermes schema. Do not execute it in agy or invent a tool result."
 )
 
