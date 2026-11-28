@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import importlib
 import sys
 import unittest
 from pathlib import Path
@@ -41,6 +42,10 @@ class CatalogRowsTest(unittest.TestCase):
 
     def test_empty_catalog(self):
         self.assertEqual(models.parse_catalog_rows(""), [])
+
+    def test_label_keeps_non_effort_parenthetical_text(self):
+        rows = models.parse_catalog_rows("gemini-4-neon-high\tGemini 4 Neon (Preview) (High)\n")
+        self.assertEqual(rows[0]["label"], "Gemini 4 Neon (Preview)")
 
 
 class SetupStatusTest(unittest.TestCase):
@@ -106,6 +111,24 @@ class SetupStatusTest(unittest.TestCase):
         self.assertFalse(status["logged_in"])
         self.assertEqual(status["detail"], setup_hooks.LOGIN_HINT)
 
+    def test_slow_auth_probe_is_bounded_and_usage_snapshot_still_answers(self):
+        import time
+
+        def slow_probe():
+            time.sleep(2.0)
+            return True
+
+        with patch.object(setup_hooks, "_helpers", return_value=(lambda: "/usr/bin/agy", slow_probe)), patch.object(
+            setup_hooks, "_is_executable_command", return_value=True
+        ), patch.object(setup_hooks, "_AUTH_PROBE_DEADLINE", 0.2), patch.object(
+            setup_hooks, "_usage_snapshot", return_value=None
+        ):
+            started = time.monotonic()
+            status = setup_hooks.setup_status()
+            elapsed = time.monotonic() - started
+        self.assertLess(elapsed, 1.5)
+        self.assertFalse(status["logged_in"])
+
     def test_catalog_rows_cache_returns_copies_and_shares_probe_with_load_catalog(self):
         class Proc:
             returncode = 0
@@ -140,6 +163,18 @@ class AuxAndVisionTest(unittest.TestCase):
         with patch.object(models, "load_catalog_rows", return_value=rows):
             self.assertEqual(setup_hooks.default_vision_model(), "gemini-4-neon")
 
+    def test_aux_uses_an_available_effort_instead_of_a_bare_base_id(self):
+        # Models sold only as effort variants reject the bare id, so a base
+        # without a "low" row must still resolve to one of its real variants.
+        rows = [{"id": "gemini-3.8-flash", "label": "Gemini 3.8 Flash", "note": "medium, high"}]
+        with patch.object(models, "load_catalog_rows", return_value=rows):
+            self.assertEqual(setup_hooks.resolve_aux_model(), "gemini-3.8-flash-medium")
+
+    def test_aux_returns_empty_when_no_preferred_gemini_model_exists(self):
+        rows = [{"id": "claude-opus-5-5", "label": "Claude Opus 5.5", "note": "high"}]
+        with patch.object(models, "load_catalog_rows", return_value=rows):
+            self.assertEqual(setup_hooks.resolve_aux_model(), "")
+
     def test_profile_wires_hooks_and_handles_vision_flag(self):
         from providers import get_provider_profile
 
@@ -154,6 +189,31 @@ class AuxAndVisionTest(unittest.TestCase):
             self.assertEqual(profile.resolve_aux_model(vision=True), "gemini-4-neon")
             self.assertEqual(profile.default_vision_model(), "gemini-4-neon")
             self.assertEqual(profile.discover_models(), rows)
+
+    def test_profile_setup_status_hides_exception_text(self):
+        from providers import get_provider_profile
+
+        profile = get_provider_profile("antigravity-subscription-directsdk")
+        assert profile is not None
+        # The conftest loads the plugin under a package name, so the profile's
+        # hooks resolve inside that package and need patching there.
+        package = type(profile).__module__
+        prov_setup = importlib.import_module(f"{package}.setup_hooks")
+        prov_process = importlib.import_module(f"{package}.process")
+        with patch.object(
+            prov_setup,
+            "setup_status",
+            side_effect=RuntimeError("INTERNAL-PROBE-DETAIL"),
+        ), patch.object(
+            prov_setup, "_is_executable_command", return_value=True
+        ), patch.object(
+            prov_process, "resolve_agy_command", return_value="/usr/bin/agy"
+        ):
+            status = profile.setup_status()
+        assert status is not None
+        self.assertFalse(status["logged_in"])
+        self.assertNotIn("INTERNAL-PROBE-DETAIL", status["detail"])
+        self.assertIn("Setup check failed", status["detail"])
 
 
 if __name__ == "__main__":

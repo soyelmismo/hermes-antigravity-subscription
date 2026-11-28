@@ -16,12 +16,16 @@ from __future__ import annotations
 import logging
 import os
 import shutil
+import threading
 from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
 
 INSTALL_HINT = "Install the Antigravity CLI (`agy`) and sign in once to use this provider."
 LOGIN_HINT = "Run `agy` once in a terminal and finish the Google sign-in, then retry."
+
+# setup_status is a UI read: never let the uncached keyring probe dominate it.
+_AUTH_PROBE_DEADLINE = 8.0
 
 
 def _helpers():
@@ -45,6 +49,29 @@ def _is_executable_command(command: Any, env: Optional[dict[str, str]] = None) -
         return os.path.isfile(cmd) and (os.name == "nt" or os.access(cmd, os.X_OK))
     search_path = env.get("PATH") if isinstance(env, dict) and "PATH" in env else None
     return bool(shutil.which(cmd, path=search_path))
+
+
+def _bounded_authenticated(probe, deadline: float) -> bool:
+    """Run ``is_authenticated()`` with a deadline, reporting False if it overruns.
+
+    That probe is uncached and its documented ceiling is ~20 s (secret-tool 5 s,
+    then up to three scripted interpreters at 5 s each). A per-request cost that
+    size is invisible next to an agy spawn, but ``setup_status`` is a UI read
+    where it looks like a hang. A timed-out probe falls through to the cached
+    ``/usage`` snapshot, which needs the same sign-in and answers for it.
+    """
+    verdict: list[bool] = []
+
+    def _run() -> None:
+        try:
+            verdict.append(bool(probe()))
+        except Exception:
+            verdict.append(False)
+
+    worker = threading.Thread(target=_run, name="agy-auth-probe", daemon=True)
+    worker.start()
+    worker.join(max(0.1, float(deadline)))
+    return bool(verdict[0]) if verdict else False
 
 
 def _usage_snapshot(timeout: float, *, command: Any = None, env: Optional[dict[str, str]] = None):
@@ -110,7 +137,9 @@ def setup_status(command: Any = None, env: Optional[dict[str, str]] = None, time
     # is_authenticated() checks both a non-empty OAuth token file (>10 bytes)
     # and OS keyring backends (Linux Secret Service, macOS Keychain, Windows).
     try:
-        logged_in = bool(is_authenticated())
+        logged_in = _bounded_authenticated(
+            is_authenticated, min(_AUTH_PROBE_DEADLINE, float(timeout or _AUTH_PROBE_DEADLINE))
+        )
     except Exception:
         logged_in = False
     snapshot = _usage_snapshot(
@@ -134,7 +163,13 @@ def setup_status(command: Any = None, env: Optional[dict[str, str]] = None, time
 
 
 def discover_models(timeout: float = 15.0) -> Optional[list[dict[str, str]]]:
-    """The account's live picker as ``[{id, label, note}]``, or None."""
+    """The account's live picker as ``[{id, label, note}]``, or None.
+
+    None covers both a failed probe and an unparseable empty catalog on purpose:
+    Hermes' catalog cache treats a plain list as authoritative, and an empty
+    parse is far likelier a transient ``agy models`` failure than an account
+    that owns no models.
+    """
     try:
         from .models import load_catalog_rows
     except ImportError:
@@ -163,8 +198,10 @@ def resolve_aux_model(timeout: float = 15.0) -> str:
         if row is None:
             continue
         efforts = [e.strip() for e in (row.get("note") or "").split(",") if e.strip()]
-        if "low" in efforts:
-            return f"{base}-low"
+        if efforts:
+            # Rows list efforts cheapest first; a base model that is only sold
+            # as effort variants (e.g. gemini-4-hydrogen) rejects the bare id.
+            return f"{base}-{efforts[0]}"
         return base
     for row in rows:
         if row["id"].startswith("gemini-4-"):

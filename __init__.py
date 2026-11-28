@@ -288,7 +288,8 @@ class AntigravitySubscriptionDirectSDKProfile(ProviderProfile):
                 "available": available,
                 "logged_in": False,
                 "plan": "",
-                "detail": str(exc),
+                # Exception text can carry local paths; the debug log above has it.
+                "detail": "Setup check failed. See the Hermes debug log for details.",
                 "login_command": None,
             }
 
